@@ -466,20 +466,20 @@ function Invoke-ComplexityProbe {
   }
 }
 
-function Get-MinBpppfForComplexity($bucket, $mode) {
+function Get-ReferenceBpppfForComplexity($bucket, $mode) {
   $base = switch ($bucket) {
-    "VeryLow"  { 0.014 }
-    "Low"      { 0.018 }
-    "Medium"   { 0.024 }
-    "High"     { 0.032 }
-    "VeryHigh" { 0.042 }
-    default    { 0.024 }
+    "VeryLow"  { 0.0185 }
+    "Low"      { 0.0155 }
+    "Medium"   { 0.0115 }
+    "High"     { 0.0095 }
+    "VeryHigh" { 0.0080 }
+    default    { 0.0115 }
   }
 
   switch ($mode) {
-    "Fast"         { return ($base + 0.004) }
+    "Fast"         { return ($base - 0.0010) }
     "Balanced"     { return $base }
-    "ExtraQuality" { return ($base - 0.002) }
+    "ExtraQuality" { return ($base + 0.0008) }
   }
 }
 
@@ -493,39 +493,48 @@ function Get-WidthPlanCandidates {
   )
 
   $widths = Get-ResolutionCandidates -srcWidth $Info.Width | Sort-Object -Descending
-  $minBpppf = Get-MinBpppfForComplexity -bucket $Probe.Bucket -mode $Mode
+  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.Bucket -mode $Mode
+  $targetPixels = [double]$VideoKbps * 1000.0 / ([double]$TargetFps * $targetBpppf)
+  $expectedWidth = [int][math]::Round([math]::Sqrt($targetPixels * ([double]$Info.Width / [double]$Info.Height)))
+  $expectedWidth = [int][math]::Max(320, [math]::Min($Info.Width, $expectedWidth))
   $scored = New-Object System.Collections.Generic.List[object]
 
   foreach ($w in $widths) {
     $h = Get-AspectHeight -srcWidth $Info.Width -srcHeight $Info.Height -targetWidth $w
     $bpppf = Get-Bpppf -videoKbps $VideoKbps -width $w -height $h -fps $TargetFps
-
-    $fitPenalty = if ($bpppf -ge $minBpppf) { 0 } else { ($minBpppf - $bpppf) * 1000.0 }
-    $score = ($w / 100.0) - $fitPenalty
+    $widthRatio = [double]$w / [double]$expectedWidth
+    $distancePenalty = [math]::Abs([math]::Log($widthRatio)) * 140.0
+    $overshootPenalty = if ($widthRatio -gt 1.0) { ($widthRatio - 1.0) * 120.0 } else { 0.0 }
+    $undershootPenalty = if ($widthRatio -lt 0.80) { (0.80 - $widthRatio) * 30.0 } else { 0.0 }
+    $bpppfPenalty = if ($bpppf -lt $targetBpppf) { ($targetBpppf - $bpppf) * 5000.0 } else { 0.0 }
+    $score = 1000.0 - $distancePenalty - $overshootPenalty - $undershootPenalty - $bpppfPenalty
 
     $scored.Add([PSCustomObject]@{
-        Width      = $w
-        Height     = $h
-        Bpppf      = $bpppf
-        Score      = $score
-        MeetsFloor = ($bpppf -ge $minBpppf)
+        Width         = $w
+        Height        = $h
+        Bpppf         = $bpppf
+        Score         = $score
+        TargetBpppf   = $targetBpppf
+        ExpectedWidth = $expectedWidth
+        WidthRatio    = $widthRatio
+        NearTarget    = ($widthRatio -ge 0.82 -and $widthRatio -le 1.18)
       })
   }
 
   $keepers = @()
-  $bestMeeting = $scored | Where-Object { $_.MeetsFloor } | Sort-Object Width -Descending | Select-Object -First 1
+  $bestNearTarget = $scored | Where-Object { $_.NearTarget } | Sort-Object Score -Descending | Select-Object -First 1
 
-  if ($bestMeeting) {
-    $keepers += $bestMeeting
+  if ($bestNearTarget) {
+    $keepers += $bestNearTarget
 
-    $justBelow = $scored | Where-Object { $_.Width -lt $bestMeeting.Width } | Sort-Object Width -Descending | Select-Object -First 1
+    $justBelow = $scored | Where-Object { $_.Width -lt $bestNearTarget.Width } | Sort-Object Width -Descending | Select-Object -First 1
     if ($justBelow) { $keepers += $justBelow }
 
-    $justAbove = $scored | Where-Object { $_.Width -gt $bestMeeting.Width } | Sort-Object Width | Select-Object -First 1
+    $justAbove = $scored | Where-Object { $_.Width -gt $bestNearTarget.Width } | Sort-Object Width | Select-Object -First 1
     if ($justAbove) { $keepers += $justAbove }
   }
   else {
-    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 2)
+    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 3)
   }
 
   if ($Mode -eq "ExtraQuality") {
@@ -572,6 +581,13 @@ function New-EncodePlan {
   $vf = Build-Vf -srcWidth $Info.Width -targetWidth $Width -srcFps $Info.Fps -targetFps $Fps
   $bpppf = Get-Bpppf -videoKbps $videoKbps -width $Width -height $Height -fps $Fps
   $totalBudgetKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
+  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.Bucket -mode $Mode
+  $targetPixels = [double]$videoKbps * 1000.0 / ([double]$Fps * $targetBpppf)
+  $expectedWidth = [int][math]::Round([math]::Sqrt($targetPixels * ([double]$Info.Width / [double]$Info.Height)))
+  $expectedWidth = [int][math]::Max(320, [math]::Min($Info.Width, $expectedWidth))
+  $widthRatio = [double]$Width / [double]$expectedWidth
+  $widthFitPenalty = [int]([math]::Abs([math]::Log($widthRatio)) * 5000.0)
+  $overshootPenalty = if ($widthRatio -gt 1.0) { [int](($widthRatio - 1.0) * 4500.0) } else { 0 }
   $highFpsRetentionBoost = 0
   if (
     $Mode -eq "Balanced" -and
@@ -583,13 +599,14 @@ function New-EncodePlan {
   ) {
     $highFpsRetentionBoost = $Fps * 300
   }
+  $bpppfDeficitPenalty = if ($bpppf -lt $targetBpppf) { [int](($targetBpppf - $bpppf) * 200000) } else { 0 }
 
   $score = switch ($Mode) {
     "Fast" {
       ($Width * 1000) + ($Fps * 35) + ($AudioPlan.Rank * 2)
     }
     "Balanced" {
-      ($Width * 25) + ($Fps * 10) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 50000)) + $highFpsRetentionBoost
+      50000 + ($Fps * 8) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 70000)) + $highFpsRetentionBoost - $bpppfDeficitPenalty - $widthFitPenalty - $overshootPenalty
     }
     "ExtraQuality" {
       ($Width * 300) + ($Fps * 100) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 12000))
@@ -607,6 +624,9 @@ function New-EncodePlan {
     Preset      = $Preset
     Mode        = $Mode
     Bpppf       = $bpppf
+    TargetBpppf = $targetBpppf
+    ExpectedWidth = $expectedWidth
+    WidthRatio    = $widthRatio
     ProbeBucket = $Probe.Bucket
     Score       = $score
   }
