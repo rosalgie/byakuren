@@ -99,7 +99,7 @@ function Get-ProbeInfo($path) {
 function Get-DefaultPresetForMode($mode) {
   switch ($mode) {
     "Fast"         { return "veryfast" }
-    "Balanced"     { return "fast" }
+    "Balanced"     { return "medium" }
     "ExtraQuality" { return "medium" }
   }
 }
@@ -135,7 +135,7 @@ function Build-Vf($srcWidth, $targetWidth, $srcFps, $targetFps) {
   return ($parts -join ",")
 }
 
-function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps) {
+function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBucket) {
   $roundedSrc = [int][math]::Max(1, [math]::Round($srcFps))
   $list = New-Object System.Collections.Generic.List[int]
 
@@ -157,10 +157,19 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps) {
 
     "Balanced" {
       if ($srcFps -gt 50) {
+        if (
+          (($probeBucket -in @("VeryLow", "Low")) -and $totalKbps -ge 650) -or
+          (($probeBucket -eq "Medium") -and $duration -le 90 -and $totalKbps -ge 1600)
+        ) {
+          $list.Add($roundedSrc)
+        }
         $list.Add(30)
         if ($totalKbps -lt 330) { $list.Add(24) }
       }
       elseif ($srcFps -gt 30.5) {
+        if (($probeBucket -in @("VeryLow", "Low")) -and $duration -le 90 -and $totalKbps -ge 1200) {
+          $list.Add($roundedSrc)
+        }
         $list.Add(30)
         if ($totalKbps -lt 300) { $list.Add(24) }
       }
@@ -287,6 +296,10 @@ function Get-AudioPlanCandidates {
 
   if (-not $isStereo) {
     $baseList = $baseList | ForEach-Object { [math]::Max($_, 96) } | Select-Object -Unique
+  }
+
+  if ($Mode -eq "Balanced" -and $isStereo -and $Duration -le 90 -and $TotalKbps -ge 950) {
+    $baseList = @(128) + $baseList
   }
 
   if ($channels -ge 6) {
@@ -519,7 +532,7 @@ function Get-WidthPlanCandidates {
     $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 4)
   }
   elseif ($Mode -eq "Balanced") {
-    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 3)
+    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 5)
   }
   else {
     $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 2)
@@ -558,13 +571,25 @@ function New-EncodePlan {
 
   $vf = Build-Vf -srcWidth $Info.Width -targetWidth $Width -srcFps $Info.Fps -targetFps $Fps
   $bpppf = Get-Bpppf -videoKbps $videoKbps -width $Width -height $Height -fps $Fps
+  $totalBudgetKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
+  $highFpsRetentionBoost = 0
+  if (
+    $Mode -eq "Balanced" -and
+    $Info.Fps -gt 50 -and
+    $Fps -gt 30 -and
+    $Info.Duration -le 90 -and
+    $Probe.Bucket -in @("VeryLow", "Low", "Medium") -and
+    $totalBudgetKbps -ge 900
+  ) {
+    $highFpsRetentionBoost = $Fps * 300
+  }
 
   $score = switch ($Mode) {
     "Fast" {
       ($Width * 1000) + ($Fps * 35) + ($AudioPlan.Rank * 2)
     }
     "Balanced" {
-      ($Width * 100) + ($Fps * 150) + ($AudioPlan.Rank * 8) + ([int]($bpppf * 10000))
+      ($Width * 25) + ($Fps * 10) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 50000)) + $highFpsRetentionBoost
     }
     "ExtraQuality" {
       ($Width * 300) + ($Fps * 100) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 12000))
@@ -760,7 +785,7 @@ function Get-PlanList {
   )
 
   $totalKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
-  $fpsCandidates = Get-TargetFpsCandidates -srcFps $Info.Fps -mode $Mode -duration $Info.Duration -totalKbps $totalKbps
+  $fpsCandidates = Get-TargetFpsCandidates -srcFps $Info.Fps -mode $Mode -duration $Info.Duration -totalKbps $totalKbps -probeBucket $Probe.Bucket
   $audioCandidates = Get-AudioPlanCandidates -Info $Info -Mode $Mode -TotalKbps $totalKbps -Duration $Info.Duration -ProbeBucket $Probe.Bucket
 
   $plans = New-Object System.Collections.Generic.List[object]
@@ -821,10 +846,11 @@ function Get-PlanPreferenceTuple {
 
     "Balanced" {
       return @(
+        [int]$plan.Score,
+        [int]$plan.Width,
         [int]$plan.Fps,
         [int]$audioRank,
-        [double]([math]::Round($Result.Ratio * 1000)),
-        [int]$plan.Width
+        [int](1000 - [math]::Abs([math]::Round((1.0 - $Result.Ratio) * 1000)))
       )
     }
 
@@ -877,7 +903,7 @@ function Get-BestResult {
 
   $maxPlans = switch ($Mode) {
     "Fast"         { 3 }
-    "Balanced"     { 3 }
+    "Balanced"     { 6 }
     "ExtraQuality" { 7 }
   }
 
