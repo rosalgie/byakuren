@@ -915,6 +915,14 @@ function Test-IsBetterPlanAttempt {
   return ($Candidate.Plan.VideoKbps -gt $Current.Plan.VideoKbps)
 }
 
+function Get-CloseEnoughRatioForMode($mode) {
+  switch ($mode) {
+    "Fast"         { return 0.985 }
+    "Balanced"     { return 0.995 }
+    "ExtraQuality" { return 0.998 }
+  }
+}
+
 function Get-NextVideoKbpsGuess {
   param(
     [Parameter(Mandatory = $true)][string]$Mode,
@@ -1014,6 +1022,7 @@ function Try-PlanWithAdjustments {
   $lowerBound = $null
   $upperBound = $null
   $seenRates = New-Object System.Collections.Generic.HashSet[int]
+  $closeEnoughRatio = Get-CloseEnoughRatioForMode -mode $workingPlan.Mode
 
   for ($i = 1; $i -le $tries; $i++) {
     if (-not $seenRates.Add([int]$workingPlan.VideoKbps)) {
@@ -1052,11 +1061,7 @@ function Try-PlanWithAdjustments {
         }
       }
 
-      $isCloseEnough = switch ($workingPlan.Mode) {
-        "Fast"         { $ratio -ge 0.985 }
-        "Balanced"     { $ratio -ge 0.996 }
-        "ExtraQuality" { $ratio -ge 0.998 }
-      }
+      $isCloseEnough = ($ratio -ge $closeEnoughRatio)
 
       $isBracketTight = ($lowerBound -and $upperBound -and (([int]$upperBound.VideoKbps - [int]$lowerBound.VideoKbps) -le 8))
 
