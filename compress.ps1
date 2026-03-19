@@ -145,12 +145,29 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBu
   switch ($mode) {
     "Fast" {
       if ($srcFps -gt 50) {
-        $list.Add(30)
-        if ($totalKbps -lt 500) { $list.Add(24) }
+        if ($probeBucket -in @("VeryLow", "Low")) {
+          $list.Add(30)
+          if (($probeBucket -eq "Low") -and $duration -le 60 -and $totalKbps -ge 1400) {
+            $list.Add($roundedSrc)
+          }
+          if ($totalKbps -lt 500) { $list.Add(24) }
+        }
+        else {
+          $list.Add($roundedSrc)
+          if ($totalKbps -lt 900) { $list.Add(30) }
+          if ($totalKbps -lt 500) { $list.Add(24) }
+        }
       }
       elseif ($srcFps -gt 30.5) {
-        $list.Add(30)
-        if ($totalKbps -lt 450) { $list.Add(24) }
+        if ($probeBucket -eq "VeryLow") {
+          $list.Add(30)
+          if ($totalKbps -lt 450) { $list.Add(24) }
+        }
+        else {
+          $list.Add($roundedSrc)
+          if ($totalKbps -lt 650) { $list.Add(30) }
+          if ($totalKbps -lt 450) { $list.Add(24) }
+        }
       }
       else {
         $list.Add($roundedSrc)
@@ -392,7 +409,7 @@ function Invoke-ComplexityProbe {
   }
 
   $probePreset = switch ($Mode) {
-    "Fast"         { "ultrafast" }
+    "Fast"         { "superfast" }
     "Balanced"     { "veryfast" }
     "ExtraQuality" { "fast" }
   }
@@ -470,6 +487,18 @@ function Invoke-ComplexityProbe {
 }
 
 function Get-ReferenceBpppfForComplexity($bucket, $mode) {
+  if ($mode -eq "Fast") {
+    $fastBase = switch ($bucket) {
+        "VeryLow"  { 0.0100 }
+        "Low"      { 0.0125 }
+        "Medium"   { 0.0160 }
+        "High"     { 0.0200 }
+        "VeryHigh" { 0.0240 }
+        default    { 0.0160 }
+      }
+    return $fastBase
+  }
+
   $base = switch ($bucket) {
     "VeryLow"  { 0.0185 }
     "Low"      { 0.0155 }
@@ -480,7 +509,6 @@ function Get-ReferenceBpppfForComplexity($bucket, $mode) {
   }
 
   switch ($mode) {
-    "Fast"         { return ($base - 0.0010) }
     "Balanced"     { return $base }
     "ExtraQuality" { return ($base + 0.0008) }
   }
@@ -606,7 +634,7 @@ function New-EncodePlan {
 
   $score = switch ($Mode) {
     "Fast" {
-      ($Width * 1000) + ($Fps * 35) + ($AudioPlan.Rank * 2)
+      40000 + ($Fps * 220) + ($AudioPlan.Rank * 2) + ([int]($bpppf * 40000)) - ($widthFitPenalty * 2) - ($overshootPenalty * 2)
     }
     "Balanced" {
       50000 + ($Fps * 8) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 70000)) + $highFpsRetentionBoost - $bpppfDeficitPenalty - $widthFitPenalty - $overshootPenalty
@@ -862,10 +890,11 @@ function Get-PlanPreferenceTuple {
   switch ($plan.Mode) {
     "Fast" {
       return @(
-        [int]$plan.Width,
+        [int]$plan.Score,
         [int]$plan.Fps,
+        [int](1000 - [math]::Min(999, [math]::Round([math]::Abs(1.0 - $plan.WidthRatio) * 1000))),
         [int]$audioRank,
-        [double]$Result.Ratio
+        [int](1000 - [math]::Abs([math]::Round((1.0 - $Result.Ratio) * 1000)))
       )
     }
 
@@ -959,9 +988,6 @@ function Get-BestResult {
         }
       }
 
-      if ($Mode -eq "Fast") {
-        break
-      }
     }
   }
 
