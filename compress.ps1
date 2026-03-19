@@ -101,9 +101,9 @@ function Get-ProbeInfo($path) {
 
 function Get-DefaultPresetForMode($mode) {
   switch ($mode) {
-    "Fast"         { return "veryfast" }
+    "Fast"         { return "superfast" }
     "Balanced"     { return "medium" }
-    "ExtraQuality" { return "medium" }
+    "ExtraQuality" { return "slow" }
   }
 }
 
@@ -184,12 +184,12 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBu
 
     "ExtraQuality" {
       if ($srcFps -gt 50) {
-        if ($totalKbps -ge 2200) { $list.Add($roundedSrc) }
+        if ($totalKbps -ge 1600) { $list.Add($roundedSrc) }
         $list.Add(30)
         if ($totalKbps -lt 420) { $list.Add(24) }
       }
       elseif ($srcFps -gt 30.5) {
-        if ($totalKbps -ge 1500) { $list.Add($roundedSrc) }
+        if ($totalKbps -ge 1000) { $list.Add($roundedSrc) }
         $list.Add(30)
         if ($totalKbps -lt 360) { $list.Add(24) }
       }
@@ -394,7 +394,7 @@ function Invoke-ComplexityProbe {
   $probePreset = switch ($Mode) {
     "Fast"         { "ultrafast" }
     "Balanced"     { "veryfast" }
-    "ExtraQuality" { "veryfast" }
+    "ExtraQuality" { "fast" }
   }
 
   $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
@@ -541,7 +541,7 @@ function Get-WidthPlanCandidates {
   }
 
   if ($Mode -eq "ExtraQuality") {
-    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 4)
+    $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 6)
   }
   elseif ($Mode -eq "Balanced") {
     $keepers += ($scored | Sort-Object Score -Descending | Select-Object -First 5)
@@ -715,7 +715,7 @@ function Try-PlanWithAdjustments {
   $tries = switch ($Plan.Mode) {
     "Fast"         { 2 }
     "Balanced"     { 5 }
-    "ExtraQuality" { 6 }
+    "ExtraQuality" { 7 }
   }
 
   $workingPlan = $Plan.PSObject.Copy()
@@ -927,9 +927,9 @@ function Get-BestResult {
   }
 
   $maxPlans = switch ($Mode) {
-    "Fast"         { 3 }
+    "Fast"         { 2 }
     "Balanced"     { 6 }
-    "ExtraQuality" { 7 }
+    "ExtraQuality" { 10 }
   }
 
   $bestUnder = $null
