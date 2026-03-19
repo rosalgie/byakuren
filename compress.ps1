@@ -6,6 +6,9 @@ param(
   [Parameter(Mandatory = $true)]
   [int]$TargetMB,
 
+  [ValidateSet("BinaryMiB", "DecimalMB")]
+  [string]$TargetUnit = "BinaryMiB",
+
   [ValidateSet("Fast", "Balanced", "ExtraQuality")]
   [string]$Mode = "Balanced",
 
@@ -13,7 +16,7 @@ param(
 
   [string]$Preset = "",
 
-  [double]$SafetyMarginPercent = 0.985,
+  [double]$SafetyMarginPercent = 0.995,
 
   [int]$ProbeSampleSeconds = 6,
 
@@ -552,9 +555,9 @@ function Get-WidthPlanCandidates {
 
 function Get-MuxReserveBytes($targetBytes, $mode) {
   switch ($mode) {
-    "Fast"         { return [long][math]::Floor($targetBytes * 0.018) }
-    "Balanced"     { return [long][math]::Floor($targetBytes * 0.015) }
-    "ExtraQuality" { return [long][math]::Floor($targetBytes * 0.012) }
+    "Fast"         { return [long][math]::Floor($targetBytes * 0.012) }
+    "Balanced"     { return [long][math]::Floor($targetBytes * 0.006) }
+    "ExtraQuality" { return [long][math]::Floor($targetBytes * 0.005) }
   }
 }
 
@@ -711,8 +714,8 @@ function Try-PlanWithAdjustments {
   $twoPass = ($Plan.Mode -ne "Fast")
   $tries = switch ($Plan.Mode) {
     "Fast"         { 2 }
-    "Balanced"     { 3 }
-    "ExtraQuality" { 4 }
+    "Balanced"     { 5 }
+    "ExtraQuality" { 6 }
   }
 
   $workingPlan = $Plan.PSObject.Copy()
@@ -725,7 +728,8 @@ function Try-PlanWithAdjustments {
     Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
 
     if ($size -le $workingPlan.TargetBytes) {
-      $canRefill = ($i -lt $tries) -and ($workingPlan.Mode -ne "Fast") -and ($ratio -lt 0.96)
+      $isCloseEnough = ($ratio -ge 0.992)
+      $canRefill = ($i -lt $tries) -and ($workingPlan.Mode -ne "Fast") -and (-not $isCloseEnough)
 
       if ($canRefill) {
         $refilled = $false
@@ -746,12 +750,9 @@ function Try-PlanWithAdjustments {
         }
 
         if (-not $refilled) {
-          $bumpFactor = switch ($workingPlan.Mode) {
-            "Balanced"     { 1.08 }
-            "ExtraQuality" { 1.10 }
-            default        { 1.00 }
-          }
-
+          $targetFillBytes = [math]::Floor($workingPlan.TargetBytes * 0.997)
+          $bumpFactor = [double]$targetFillBytes / [double]$size
+          $bumpFactor = [math]::Max(1.01, [math]::Min(1.15, $bumpFactor))
           $bumped = [int][math]::Floor($workingPlan.VideoKbps * $bumpFactor)
           if ($bumped -gt $workingPlan.VideoKbps) {
             Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
@@ -765,18 +766,22 @@ function Try-PlanWithAdjustments {
         }
       }
 
-      return [PSCustomObject]@{
-        Success   = $true
-        SizeBytes = $size
-        Path      = $tempOut
-        Plan      = $workingPlan
-        Ratio     = $ratio
+      if ($isCloseEnough -or -not $canRefill) {
+        return [PSCustomObject]@{
+          Success   = $true
+          SizeBytes = $size
+          Path      = $tempOut
+          Plan      = $workingPlan
+          Ratio     = $ratio
+        }
       }
     }
 
     Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
 
-    $shrinkFactor = if ($ratio -gt 1.25) { 0.86 } elseif ($ratio -gt 1.10) { 0.91 } else { 0.96 }
+    $targetShrinkBytes = [math]::Floor($workingPlan.TargetBytes * 0.995)
+    $shrinkFactor = [double]$targetShrinkBytes / [double]$size
+    $shrinkFactor = [math]::Max(0.80, [math]::Min(0.99, $shrinkFactor))
     $newRate = [int][math]::Floor($workingPlan.VideoKbps * $shrinkFactor)
 
     if ($newRate -ge $workingPlan.VideoKbps -or $newRate -lt 35) {
@@ -983,7 +988,11 @@ if ([string]::IsNullOrWhiteSpace($Preset)) {
   $Preset = Get-DefaultPresetForMode -mode $Mode
 }
 
-$targetBytes = [long][math]::Floor($TargetMB * 1000 * 1000 * $SafetyMarginPercent)
+$targetBaseBytes = switch ($TargetUnit) {
+  "BinaryMiB" { [double]($TargetMB * 1MB) }
+  "DecimalMB" { [double]($TargetMB * 1000 * 1000) }
+}
+$targetBytes = [long][math]::Floor($targetBaseBytes * $SafetyMarginPercent)
 $totalKbps = (($targetBytes * 8.0) / $info.Duration) / 1000.0
 
 Write-Host "Input:            $inputFull"
@@ -993,7 +1002,7 @@ Write-Host "Video codec:      $($info.VideoCodec)"
 Write-Host "Video bitrate:    $(if ($info.VideoBitrateKbps) { "$($info.VideoBitrateKbps) kbps" } else { 'unknown' })"
 Write-Host "Audio codec:      $(if ($info.HasAudio) { $info.AudioCodec } else { 'none' })"
 Write-Host "Audio bitrate:    $(if ($info.AudioBitrateKbps) { "$($info.AudioBitrateKbps) kbps" } else { 'unknown' })"
-Write-Host "Target size:      $TargetMB MB"
+Write-Host "Target size:      $TargetMB $TargetUnit"
 Write-Host "Usable bytes:     $targetBytes"
 Write-Host "Total budget:     $([math]::Round($totalKbps)) kbps"
 Write-Host "Mode:             $Mode"
