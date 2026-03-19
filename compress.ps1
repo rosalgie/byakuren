@@ -3,8 +3,11 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$InputFile,
 
-  [Parameter(Mandatory = $true)]
+  [Parameter(Mandatory = $true, ParameterSetName = "ByMB")]
   [int]$TargetMB,
+
+  [Parameter(Mandatory = $true, ParameterSetName = "ByBytes")]
+  [long]$TargetBytes,
 
   [ValidateSet("BinaryMiB", "DecimalMB")]
   [string]$TargetUnit = "BinaryMiB",
@@ -107,6 +110,22 @@ function Get-DefaultPresetForMode($mode) {
   }
 }
 
+function Get-X264PresetRank($preset) {
+  switch ($preset) {
+    "ultrafast" { return 1 }
+    "superfast" { return 2 }
+    "veryfast"  { return 3 }
+    "faster"    { return 4 }
+    "fast"      { return 5 }
+    "medium"    { return 6 }
+    "slow"      { return 7 }
+    "slower"    { return 8 }
+    "veryslow"  { return 9 }
+    "placebo"   { return 10 }
+    default     { return 0 }
+  }
+}
+
 function Get-AspectHeight($srcWidth, $srcHeight, $targetWidth) {
   $raw = [double]$targetWidth * [double]$srcHeight / [double]$srcWidth
   $even = [int]([math]::Round($raw / 2.0) * 2)
@@ -138,16 +157,19 @@ function Build-Vf($srcWidth, $targetWidth, $srcFps, $targetFps) {
   return ($parts -join ",")
 }
 
-function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBucket) {
+function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $motionBucket, $detailBucket) {
   $roundedSrc = [int][math]::Max(1, [math]::Round($srcFps))
   $list = New-Object System.Collections.Generic.List[int]
+  $motionVeryLow = ($motionBucket -eq "VeryLow")
+  $motionLowish = ($motionBucket -in @("VeryLow", "Low"))
+  $detailLowish = ($detailBucket -in @("VeryLow", "Low"))
 
   switch ($mode) {
     "Fast" {
       if ($srcFps -gt 50) {
-        if ($probeBucket -in @("VeryLow", "Low")) {
+        if ($motionVeryLow) {
           $list.Add(30)
-          if (($probeBucket -eq "Low") -and $duration -le 60 -and $totalKbps -ge 1400) {
+          if ($detailLowish -and $duration -le 45 -and $totalKbps -ge 1500) {
             $list.Add($roundedSrc)
           }
           if ($totalKbps -lt 500) { $list.Add(24) }
@@ -159,7 +181,7 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBu
         }
       }
       elseif ($srcFps -gt 30.5) {
-        if ($probeBucket -eq "VeryLow") {
+        if ($motionVeryLow -and $totalKbps -lt 700) {
           $list.Add(30)
           if ($totalKbps -lt 450) { $list.Add(24) }
         }
@@ -177,17 +199,14 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBu
 
     "Balanced" {
       if ($srcFps -gt 50) {
-        if (
-          (($probeBucket -in @("VeryLow", "Low")) -and $totalKbps -ge 650) -or
-          (($probeBucket -eq "Medium") -and $duration -le 90 -and $totalKbps -ge 1600)
-        ) {
+        if (-not $motionVeryLow -or $totalKbps -ge 1250 -or ($detailLowish -and $duration -le 45 -and $totalKbps -ge 950)) {
           $list.Add($roundedSrc)
         }
         $list.Add(30)
         if ($totalKbps -lt 330) { $list.Add(24) }
       }
       elseif ($srcFps -gt 30.5) {
-        if (($probeBucket -in @("VeryLow", "Low")) -and $duration -le 90 -and $totalKbps -ge 1200) {
+        if (-not $motionVeryLow -or ($duration -le 90 -and $totalKbps -ge 900)) {
           $list.Add($roundedSrc)
         }
         $list.Add(30)
@@ -201,12 +220,12 @@ function Get-TargetFpsCandidates($srcFps, $mode, $duration, $totalKbps, $probeBu
 
     "ExtraQuality" {
       if ($srcFps -gt 50) {
-        if ($totalKbps -ge 1600) { $list.Add($roundedSrc) }
+        if (-not $motionLowish -or $totalKbps -ge 1100) { $list.Add($roundedSrc) }
         $list.Add(30)
         if ($totalKbps -lt 420) { $list.Add(24) }
       }
       elseif ($srcFps -gt 30.5) {
-        if ($totalKbps -ge 1000) { $list.Add($roundedSrc) }
+        if (-not $motionVeryLow -or $totalKbps -ge 850) { $list.Add($roundedSrc) }
         $list.Add(30)
         if ($totalKbps -lt 360) { $list.Add(24) }
       }
@@ -389,42 +408,29 @@ function Get-SampleOffsets($duration, $sampleLength, $maxSamples) {
   return $offsets | Select-Object -Unique
 }
 
-function Invoke-ComplexityProbe {
+function Invoke-CrfProbeSeries {
   param(
     [Parameter(Mandatory = $true)]$Info,
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)][string]$TempDir,
-    [Parameter(Mandatory = $true)][string]$Mode,
-    [int]$SampleSeconds = 6,
-    [int]$MaxSamples = 3
+    [Parameter(Mandatory = $true)][double[]]$Offsets,
+    [Parameter(Mandatory = $true)][int]$SampleSeconds,
+    [Parameter(Mandatory = $true)][int]$ProbeWidth,
+    [Parameter(Mandatory = $true)][int]$ProbeFps,
+    [Parameter(Mandatory = $true)][int]$ProbeCrf,
+    [Parameter(Mandatory = $true)][string]$ProbePreset,
+    [Parameter(Mandatory = $true)][string]$Name
   )
-
-  $probeWidth = if ($Info.Width -ge 1280) { 480 } elseif ($Info.Width -ge 854) { 426 } else { [math]::Min($Info.Width, 360) }
-  $probeFps = if ($Info.Fps -gt 30.5) { 24 } else { [int][math]::Max(12, [math]::Round($Info.Fps)) }
-
-  $probeCrf = switch ($Mode) {
-    "Fast"         { 32 }
-    "Balanced"     { 30 }
-    "ExtraQuality" { 28 }
-  }
-
-  $probePreset = switch ($Mode) {
-    "Fast"         { "superfast" }
-    "Balanced"     { "veryfast" }
-    "ExtraQuality" { "fast" }
-  }
-
-  $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
   $results = New-Object System.Collections.Generic.List[object]
   $idx = 0
 
-  foreach ($offset in $offsets) {
+  foreach ($offset in $Offsets) {
     $idx++
-    $outPath = Join-Path $TempDir ("probe_{0}.mp4" -f $idx)
+    $outPath = Join-Path $TempDir ("probe_{0}_{1}.mp4" -f $Name, $idx)
 
     $vf = @()
-    if ($probeFps -gt 0 -and $Info.Fps -gt ($probeFps + 0.01)) { $vf += ("fps={0}" -f $probeFps) }
-    if ($probeWidth -lt $Info.Width) { $vf += ("scale={0}:-2:flags=bicubic" -f $probeWidth) }
+    if ($ProbeFps -gt 0 -and $Info.Fps -gt ($ProbeFps + 0.01)) { $vf += ("fps={0}" -f $ProbeFps) }
+    if ($ProbeWidth -lt $Info.Width) { $vf += ("scale={0}:-2:flags=bicubic" -f $ProbeWidth) }
     $vfArg = ($vf -join ",")
 
     $args = @("-y", "-ss", "$offset", "-t", "$SampleSeconds", "-i", $InputPath)
@@ -432,8 +438,8 @@ function Invoke-ComplexityProbe {
     $args += @(
       "-an",
       "-c:v", "libx264",
-      "-preset", $probePreset,
-      "-crf", "$probeCrf",
+      "-preset", $ProbePreset,
+      "-crf", "$ProbeCrf",
       "-movflags", "+faststart",
       $outPath
     )
@@ -459,30 +465,203 @@ function Invoke-ComplexityProbe {
   $maxKbps = ($results | Measure-Object -Property Kbps -Maximum).Maximum
   $p95ish = ($avgKbps * 0.65) + ($maxKbps * 0.35)
 
-  $bucket = if ($p95ish -lt 120) {
+  return [PSCustomObject]@{
+    Name         = $Name
+    ProbeWidth   = $ProbeWidth
+    ProbeFps     = $ProbeFps
+    ProbeCrf     = $ProbeCrf
+    ProbePreset  = $ProbePreset
+    AvgKbps      = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $avgKbps)), [Globalization.CultureInfo]::InvariantCulture)
+    PeakishKbps  = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $p95ish)), [Globalization.CultureInfo]::InvariantCulture)
+    BitsPerFrame = if ($ProbeFps -gt 0) {
+      [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", (($avgKbps * 1000.0) / $ProbeFps))), [Globalization.CultureInfo]::InvariantCulture)
+    }
+    else {
+      0.0
+    }
+    Samples      = $results
+  }
+}
+
+function Get-ContentBucketRank($bucket) {
+  switch ($bucket) {
+    "VeryLow"  { return 1 }
+    "Low"      { return 2 }
+    "Medium"   { return 3 }
+    "High"     { return 4 }
+    "VeryHigh" { return 5 }
+    default    { return 0 }
+  }
+}
+
+function Get-DetailBucket {
+  param(
+    [Parameter(Mandatory = $true)][double]$PeakishKbps
+  )
+
+  $bucket = if ($PeakishKbps -lt 120) {
     "VeryLow"
   }
-  elseif ($p95ish -lt 190) {
+  elseif ($PeakishKbps -lt 190) {
     "Low"
   }
-  elseif ($p95ish -lt 300) {
+  elseif ($PeakishKbps -lt 300) {
     "Medium"
   }
-  elseif ($p95ish -lt 430) {
+  elseif ($PeakishKbps -lt 430) {
     "High"
   }
   else {
     "VeryHigh"
   }
 
+  return $bucket
+}
+
+function Get-MotionBucket {
+  param(
+    [Parameter(Mandatory = $true)][double]$MotionRatio,
+    [Parameter(Mandatory = $true)][double]$NormalizedMotion,
+    [Parameter(Mandatory = $true)][double]$SourceFps,
+    [Parameter(Mandatory = $true)][string]$FallbackBucket
+  )
+
+  if ($SourceFps -le 30.5) {
+    return $FallbackBucket
+  }
+
+  $bucket = if ($SourceFps -gt 50) {
+    if ($MotionRatio -lt 1.10) {
+      "VeryLow"
+    }
+    elseif ($MotionRatio -lt 1.22) {
+      "Low"
+    }
+    elseif ($MotionRatio -lt 1.40) {
+      "Medium"
+    }
+    elseif ($MotionRatio -lt 1.62) {
+      "High"
+    }
+    else {
+      "VeryHigh"
+    }
+  }
+  else {
+    if ($MotionRatio -lt 1.04) {
+      "VeryLow"
+    }
+    elseif ($MotionRatio -lt 1.12) {
+      "Low"
+    }
+    elseif ($MotionRatio -lt 1.22) {
+      "Medium"
+    }
+    elseif ($MotionRatio -lt 1.35) {
+      "High"
+    }
+    else {
+      "VeryHigh"
+    }
+  }
+
+  if ($NormalizedMotion -lt 0.46 -and $bucket -notin @("VeryLow", "Low")) {
+    return "VeryLow"
+  }
+
+  return $bucket
+}
+
+function Invoke-ComplexityProbe {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][string]$Mode,
+    [int]$SampleSeconds = 6,
+    [int]$MaxSamples = 3
+  )
+
+  $detailProbeWidth = if ($Info.Width -ge 1280) { 480 } elseif ($Info.Width -ge 854) { 426 } else { [math]::Min($Info.Width, 360) }
+  $detailProbeFps = if ($Info.Fps -gt 30.5) { 24 } else { [int][math]::Max(12, [math]::Round($Info.Fps)) }
+
+  $probeCrf = switch ($Mode) {
+    "Fast"         { 32 }
+    "Balanced"     { 30 }
+    "ExtraQuality" { 28 }
+  }
+
+  $probePreset = switch ($Mode) {
+    "Fast"         { "superfast" }
+    "Balanced"     { "veryfast" }
+    "ExtraQuality" { "fast" }
+  }
+
+  $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
+
+  $detailProbe = Invoke-CrfProbeSeries `
+    -Info $Info `
+    -InputPath $InputPath `
+    -TempDir $TempDir `
+    -Offsets $offsets `
+    -SampleSeconds $SampleSeconds `
+    -ProbeWidth $detailProbeWidth `
+    -ProbeFps $detailProbeFps `
+    -ProbeCrf $probeCrf `
+    -ProbePreset $probePreset `
+    -Name "detail"
+
+  $detailBucket = Get-DetailBucket -PeakishKbps $detailProbe.PeakishKbps
+
+  $motionProbe = $null
+  $motionNormalized = 0.0
+  $motionRatio = 1.0
+
+  if ($Info.Fps -gt ($detailProbeFps + 0.5)) {
+    $motionProbeFps = [int][math]::Min(60, [math]::Round($Info.Fps))
+    $motionProbe = Invoke-CrfProbeSeries `
+      -Info $Info `
+      -InputPath $InputPath `
+      -TempDir $TempDir `
+      -Offsets $offsets `
+      -SampleSeconds $SampleSeconds `
+      -ProbeWidth $detailProbeWidth `
+      -ProbeFps $motionProbeFps `
+      -ProbeCrf $probeCrf `
+      -ProbePreset $probePreset `
+      -Name "motion"
+
+    $motionRatio = $motionProbe.AvgKbps / [math]::Max(1.0, $detailProbe.AvgKbps)
+    $fpsRatio = [double]$motionProbeFps / [double][math]::Max(1, $detailProbeFps)
+    $motionNormalized = $motionRatio / [math]::Max(1.0, $fpsRatio)
+  }
+  else {
+    $motionProbe = $detailProbe
+    $motionNormalized = 0.75
+  }
+
+  $motionBucket = Get-MotionBucket -MotionRatio $motionRatio -NormalizedMotion $motionNormalized -SourceFps $Info.Fps -FallbackBucket $detailBucket
+  $overallBucket = if ((Get-ContentBucketRank -bucket $motionBucket) -gt (Get-ContentBucketRank -bucket $detailBucket)) {
+    $motionBucket
+  }
+  else {
+    $detailBucket
+  }
+
   return [PSCustomObject]@{
-    ProbeWidth  = $probeWidth
-    ProbeFps    = $probeFps
-    ProbeCrf    = $probeCrf
-    AvgKbps     = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $avgKbps)), [Globalization.CultureInfo]::InvariantCulture)
-    PeakishKbps = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $p95ish)), [Globalization.CultureInfo]::InvariantCulture)
-    Bucket      = $bucket
-    Samples     = $results
+    ProbeWidth        = $detailProbe.ProbeWidth
+    ProbeFps          = $detailProbe.ProbeFps
+    ProbeCrf          = $detailProbe.ProbeCrf
+    AvgKbps           = $detailProbe.AvgKbps
+    PeakishKbps       = $detailProbe.PeakishKbps
+    Bucket            = $overallBucket
+    DetailProbe       = $detailProbe
+    MotionProbe       = $motionProbe
+    DetailBucket      = $detailBucket
+    MotionBucket      = $motionBucket
+    MotionRatio       = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $motionRatio)), [Globalization.CultureInfo]::InvariantCulture)
+    MotionNormalized  = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $motionNormalized)), [Globalization.CultureInfo]::InvariantCulture)
+    Samples           = $detailProbe.Samples
   }
 }
 
@@ -524,7 +703,7 @@ function Get-WidthPlanCandidates {
   )
 
   $widths = Get-ResolutionCandidates -srcWidth $Info.Width | Sort-Object -Descending
-  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.Bucket -mode $Mode
+  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.DetailBucket -mode $Mode
   $targetPixels = [double]$VideoKbps * 1000.0 / ([double]$TargetFps * $targetBpppf)
   $expectedWidth = [int][math]::Round([math]::Sqrt($targetPixels * ([double]$Info.Width / [double]$Info.Height)))
   $expectedWidth = [int][math]::Max(320, [math]::Min($Info.Width, $expectedWidth))
@@ -612,7 +791,7 @@ function New-EncodePlan {
   $vf = Build-Vf -srcWidth $Info.Width -targetWidth $Width -srcFps $Info.Fps -targetFps $Fps
   $bpppf = Get-Bpppf -videoKbps $videoKbps -width $Width -height $Height -fps $Fps
   $totalBudgetKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
-  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.Bucket -mode $Mode
+  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.DetailBucket -mode $Mode
   $targetPixels = [double]$videoKbps * 1000.0 / ([double]$Fps * $targetBpppf)
   $expectedWidth = [int][math]::Round([math]::Sqrt($targetPixels * ([double]$Info.Width / [double]$Info.Height)))
   $expectedWidth = [int][math]::Max(320, [math]::Min($Info.Width, $expectedWidth))
@@ -625,7 +804,7 @@ function New-EncodePlan {
     $Info.Fps -gt 50 -and
     $Fps -gt 30 -and
     $Info.Duration -le 90 -and
-    $Probe.Bucket -in @("VeryLow", "Low", "Medium") -and
+    $Probe.MotionBucket -notin @("VeryLow", "Low") -and
     $totalBudgetKbps -ge 900
   ) {
     $highFpsRetentionBoost = $Fps * 300
@@ -640,7 +819,7 @@ function New-EncodePlan {
       50000 + ($Fps * 8) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 70000)) + $highFpsRetentionBoost - $bpppfDeficitPenalty - $widthFitPenalty - $overshootPenalty
     }
     "ExtraQuality" {
-      ($Width * 300) + ($Fps * 100) + ($AudioPlan.Rank * 6) + ([int]($bpppf * 12000))
+      56000 + ($Fps * 16) + ($AudioPlan.Rank * 8) + ([int]($bpppf * 90000)) - [int]($widthFitPenalty * 0.8) - [int]($overshootPenalty * 0.8)
     }
   }
 
@@ -658,7 +837,8 @@ function New-EncodePlan {
     TargetBpppf = $targetBpppf
     ExpectedWidth = $expectedWidth
     WidthRatio    = $widthRatio
-    ProbeBucket = $Probe.Bucket
+    DetailBucket = $Probe.DetailBucket
+    MotionBucket = $Probe.MotionBucket
     Score       = $score
   }
 }
@@ -715,20 +895,103 @@ function Encode-Plan {
   return $size
 }
 
-function Get-NextHigherAudioPlan {
+function Test-IsBetterPlanAttempt {
   param(
-    [Parameter(Mandatory = $true)]$CurrentPlan,
-    [Parameter(Mandatory = $true)]$AllAudioPlans
+    [Parameter(Mandatory = $true)]$Candidate,
+    $Current
   )
 
-  if ($CurrentPlan.Mode -ne "aac") { return $null }
+  if ($null -eq $Current) { return $true }
 
-  $higher = $AllAudioPlans |
-    Where-Object { $_.Mode -eq "aac" -and $_.Kbps -gt $CurrentPlan.Kbps } |
-    Sort-Object Kbps |
-    Select-Object -First 1
+  if ($Candidate.SizeBytes -gt $Current.SizeBytes) { return $true }
+  if ($Candidate.SizeBytes -lt $Current.SizeBytes) { return $false }
 
-  return $higher
+  $candAudioRank = if ($Candidate.Plan.AudioPlan -and $Candidate.Plan.AudioPlan.Rank) { [int]$Candidate.Plan.AudioPlan.Rank } else { 0 }
+  $currAudioRank = if ($Current.Plan.AudioPlan -and $Current.Plan.AudioPlan.Rank) { [int]$Current.Plan.AudioPlan.Rank } else { 0 }
+
+  if ($candAudioRank -gt $currAudioRank) { return $true }
+  if ($candAudioRank -lt $currAudioRank) { return $false }
+
+  return ($Candidate.Plan.VideoKbps -gt $Current.Plan.VideoKbps)
+}
+
+function Get-NextVideoKbpsGuess {
+  param(
+    [Parameter(Mandatory = $true)][string]$Mode,
+    [Parameter(Mandatory = $true)][long]$TargetBytes,
+    [Parameter(Mandatory = $true)][int]$CurrentVideoKbps,
+    [Parameter(Mandatory = $true)][long]$CurrentSizeBytes,
+    $LowerBound,
+    $UpperBound
+  )
+
+  $minRate = 35
+  $minStep = switch ($Mode) {
+    "Fast"         { 12 }
+    "Balanced"     { 8 }
+    "ExtraQuality" { 5 }
+  }
+
+  if ($LowerBound -and $UpperBound) {
+    $gap = [int]$UpperBound.VideoKbps - [int]$LowerBound.VideoKbps
+    if ($gap -le $minStep) { return 0 }
+
+    $spanBytes = [double]$UpperBound.SizeBytes - [double]$LowerBound.SizeBytes
+    if ($spanBytes -gt 1.0) {
+      $guess = [double]$LowerBound.VideoKbps + (([double]$TargetBytes - [double]$LowerBound.SizeBytes) / $spanBytes) * ([double]$UpperBound.VideoKbps - [double]$LowerBound.VideoKbps)
+    }
+    else {
+      $guess = ([double]$LowerBound.VideoKbps + [double]$UpperBound.VideoKbps) / 2.0
+    }
+
+    $next = [int][math]::Round($guess)
+    $next = [int][math]::Max([int]$LowerBound.VideoKbps + $minStep, [math]::Min([int]$UpperBound.VideoKbps - $minStep, $next))
+
+    if ($next -eq $CurrentVideoKbps) {
+      $next = [int][math]::Floor(([double]$LowerBound.VideoKbps + [double]$UpperBound.VideoKbps) / 2.0)
+    }
+
+    return [int][math]::Max($minRate, $next)
+  }
+
+  if ($CurrentSizeBytes -lt $TargetBytes) {
+    $desiredFillBytes = switch ($Mode) {
+      "Fast"         { [math]::Floor($TargetBytes * 0.992) }
+      "Balanced"     { [math]::Floor($TargetBytes * 0.9985) }
+      "ExtraQuality" { [math]::Floor($TargetBytes * 0.9990) }
+    }
+    $factor = [double]$desiredFillBytes / [double][math]::Max(1, $CurrentSizeBytes)
+    $factor = switch ($Mode) {
+      "Fast"         { [math]::Max(1.01, [math]::Min(1.08, $factor)) }
+      "Balanced"     { [math]::Max(1.01, [math]::Min(1.12, $factor)) }
+      "ExtraQuality" { [math]::Max(1.01, [math]::Min(1.10, $factor)) }
+    }
+  }
+  else {
+    $desiredShrinkBytes = switch ($Mode) {
+      "Fast"         { [math]::Floor($TargetBytes * 0.992) }
+      "Balanced"     { [math]::Floor($TargetBytes * 0.9975) }
+      "ExtraQuality" { [math]::Floor($TargetBytes * 0.9985) }
+    }
+    $factor = [double]$desiredShrinkBytes / [double][math]::Max(1, $CurrentSizeBytes)
+    $factor = switch ($Mode) {
+      "Fast"         { [math]::Max(0.80, [math]::Min(0.99, $factor)) }
+      "Balanced"     { [math]::Max(0.85, [math]::Min(0.985, $factor)) }
+      "ExtraQuality" { [math]::Max(0.88, [math]::Min(0.988, $factor)) }
+    }
+  }
+
+  $nextGuess = [int][math]::Floor($CurrentVideoKbps * $factor)
+  if ($nextGuess -eq $CurrentVideoKbps) {
+    if ($CurrentSizeBytes -lt $TargetBytes) {
+      $nextGuess++
+    }
+    else {
+      $nextGuess--
+    }
+  }
+
+  return [int][math]::Max($minRate, $nextGuess)
 }
 
 function Try-PlanWithAdjustments {
@@ -747,8 +1010,16 @@ function Try-PlanWithAdjustments {
   }
 
   $workingPlan = $Plan.PSObject.Copy()
+  $bestUnder = $null
+  $lowerBound = $null
+  $upperBound = $null
+  $seenRates = New-Object System.Collections.Generic.HashSet[int]
 
   for ($i = 1; $i -le $tries; $i++) {
+    if (-not $seenRates.Add([int]$workingPlan.VideoKbps)) {
+      break
+    }
+
     $tempOut = Join-Path $TempDir ("candidate_{0}_{1}_{2}_{3}.mp4" -f $workingPlan.Width, $workingPlan.Fps, $workingPlan.VideoKbps, $i)
     $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass $twoPass
 
@@ -756,67 +1027,86 @@ function Try-PlanWithAdjustments {
     Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
 
     if ($size -le $workingPlan.TargetBytes) {
-      $isCloseEnough = ($ratio -ge 0.992)
-      $canRefill = ($i -lt $tries) -and ($workingPlan.Mode -ne "Fast") -and (-not $isCloseEnough)
+      $candidate = [PSCustomObject]@{
+        Success   = $true
+        SizeBytes = $size
+        Path      = $tempOut
+        Plan      = $workingPlan.PSObject.Copy()
+        Ratio     = $ratio
+      }
 
-      if ($canRefill) {
-        $refilled = $false
-
-        if ($workingPlan.ProbeBucket -in @("VeryLow", "Low")) {
-          $higherAudio = Get-NextHigherAudioPlan -CurrentPlan $workingPlan.AudioPlan -AllAudioPlans $AllAudioPlans
-          if ($higherAudio) {
-            $currentAudioKbps = if ($workingPlan.AudioPlan.Kbps) { [int]$workingPlan.AudioPlan.Kbps } else { 0 }
-            $audioDelta = [int]$higherAudio.Kbps - $currentAudioKbps
-
-            if ($audioDelta -gt 0 -and ($workingPlan.VideoKbps - $audioDelta) -ge 80) {
-              Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-              $workingPlan.AudioPlan = $higherAudio
-              $workingPlan.VideoKbps = [int]($workingPlan.VideoKbps - $audioDelta)
-              $refilled = $true
-            }
-          }
+      if (Test-IsBetterPlanAttempt -Candidate $candidate -Current $bestUnder) {
+        if ($bestUnder -and $bestUnder.Path -and (Test-Path $bestUnder.Path)) {
+          Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
         }
+        $bestUnder = $candidate
+      }
+      else {
+        Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
+      }
 
-        if (-not $refilled) {
-          $targetFillBytes = [math]::Floor($workingPlan.TargetBytes * 0.997)
-          $bumpFactor = [double]$targetFillBytes / [double]$size
-          $bumpFactor = [math]::Max(1.01, [math]::Min(1.15, $bumpFactor))
-          $bumped = [int][math]::Floor($workingPlan.VideoKbps * $bumpFactor)
-          if ($bumped -gt $workingPlan.VideoKbps) {
-            Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-            $workingPlan.VideoKbps = $bumped
-            $refilled = $true
-          }
-        }
-
-        if ($refilled) {
-          continue
+      if (($null -eq $lowerBound) -or ($size -gt $lowerBound.SizeBytes)) {
+        $lowerBound = [PSCustomObject]@{
+          VideoKbps = [int]$workingPlan.VideoKbps
+          SizeBytes = [long]$size
         }
       }
 
-      if ($isCloseEnough -or -not $canRefill) {
-        return [PSCustomObject]@{
-          Success   = $true
-          SizeBytes = $size
-          Path      = $tempOut
-          Plan      = $workingPlan
-          Ratio     = $ratio
+      $isCloseEnough = switch ($workingPlan.Mode) {
+        "Fast"         { $ratio -ge 0.985 }
+        "Balanced"     { $ratio -ge 0.996 }
+        "ExtraQuality" { $ratio -ge 0.998 }
+      }
+
+      $isBracketTight = ($lowerBound -and $upperBound -and (([int]$upperBound.VideoKbps - [int]$lowerBound.VideoKbps) -le 8))
+
+      if ($isCloseEnough -or $isBracketTight) {
+        break
+      }
+    }
+    else {
+      if ($tempOut -and (Test-Path $tempOut)) {
+        Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
+      }
+
+      if (($null -eq $upperBound) -or ($size -lt $upperBound.SizeBytes)) {
+        $upperBound = [PSCustomObject]@{
+          VideoKbps = [int]$workingPlan.VideoKbps
+          SizeBytes = [long]$size
         }
       }
     }
 
-    Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
+    if ($i -ge $tries) { break }
 
-    $targetShrinkBytes = [math]::Floor($workingPlan.TargetBytes * 0.995)
-    $shrinkFactor = [double]$targetShrinkBytes / [double]$size
-    $shrinkFactor = [math]::Max(0.80, [math]::Min(0.99, $shrinkFactor))
-    $newRate = [int][math]::Floor($workingPlan.VideoKbps * $shrinkFactor)
+    $newRate = Get-NextVideoKbpsGuess `
+      -Mode $workingPlan.Mode `
+      -TargetBytes $workingPlan.TargetBytes `
+      -CurrentVideoKbps $workingPlan.VideoKbps `
+      -CurrentSizeBytes $size `
+      -LowerBound $lowerBound `
+      -UpperBound $upperBound
 
-    if ($newRate -ge $workingPlan.VideoKbps -or $newRate -lt 35) {
+    if ($newRate -lt 35 -or $newRate -eq $workingPlan.VideoKbps) {
+      break
+    }
+
+    if ($lowerBound -and $newRate -le [int]$lowerBound.VideoKbps) {
+      $newRate = [int]$lowerBound.VideoKbps + 1
+    }
+    if ($upperBound -and $newRate -ge [int]$upperBound.VideoKbps) {
+      $newRate = [int]$upperBound.VideoKbps - 1
+    }
+
+    if ($newRate -lt 35 -or $seenRates.Contains($newRate)) {
       break
     }
 
     $workingPlan.VideoKbps = $newRate
+  }
+
+  if ($bestUnder) {
+    return $bestUnder
   }
 
   return [PSCustomObject]@{
@@ -825,6 +1115,36 @@ function Try-PlanWithAdjustments {
     Path      = $null
     Plan      = $workingPlan
     Ratio     = 0.0
+  }
+}
+
+function Get-PresetCandidatesForPlan {
+  param(
+    [Parameter(Mandatory = $true)][string]$Mode,
+    [Parameter(Mandatory = $true)][string]$BasePreset,
+    [Parameter(Mandatory = $true)][bool]$PresetWasExplicit,
+    [Parameter(Mandatory = $true)][int]$PlanIndex
+  )
+
+  if ($PresetWasExplicit) {
+    return @($BasePreset)
+  }
+
+  switch ($Mode) {
+    "ExtraQuality" {
+      $candidates = @()
+
+      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slower")) {
+        $candidates += "slower"
+      }
+
+      $candidates += $BasePreset
+      return $candidates | Select-Object -Unique
+    }
+
+    default {
+      return @($BasePreset)
+    }
   }
 }
 
@@ -838,8 +1158,8 @@ function Get-PlanList {
   )
 
   $totalKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
-  $fpsCandidates = Get-TargetFpsCandidates -srcFps $Info.Fps -mode $Mode -duration $Info.Duration -totalKbps $totalKbps -probeBucket $Probe.Bucket
-  $audioCandidates = Get-AudioPlanCandidates -Info $Info -Mode $Mode -TotalKbps $totalKbps -Duration $Info.Duration -ProbeBucket $Probe.Bucket
+  $fpsCandidates = Get-TargetFpsCandidates -srcFps $Info.Fps -mode $Mode -duration $Info.Duration -totalKbps $totalKbps -motionBucket $Probe.MotionBucket -detailBucket $Probe.DetailBucket
+  $audioCandidates = Get-AudioPlanCandidates -Info $Info -Mode $Mode -TotalKbps $totalKbps -Duration $Info.Duration -ProbeBucket $Probe.DetailBucket
 
   $plans = New-Object System.Collections.Generic.List[object]
 
@@ -886,34 +1206,42 @@ function Get-PlanPreferenceTuple {
 
   $plan = $Result.Plan
   $audioRank = if ($plan.AudioPlan -and $plan.AudioPlan.Rank) { [int]$plan.AudioPlan.Rank } else { 0 }
+  $fillScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs(1.0 - $Result.Ratio) * 1000)))
+  $widthFitScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs([math]::Log([math]::Max(0.001, $plan.WidthRatio))) * 1000)))
 
   switch ($plan.Mode) {
     "Fast" {
       return @(
         [int]$plan.Score,
         [int]$plan.Fps,
-        [int](1000 - [math]::Min(999, [math]::Round([math]::Abs(1.0 - $plan.WidthRatio) * 1000))),
+        $widthFitScore,
+        $fillScore,
         [int]$audioRank,
-        [int](1000 - [math]::Abs([math]::Round((1.0 - $Result.Ratio) * 1000)))
+        [int]$plan.VideoKbps
       )
     }
 
     "Balanced" {
       return @(
         [int]$plan.Score,
-        [int]$plan.Width,
-        [int]$plan.Fps,
+        $fillScore,
         [int]$audioRank,
-        [int](1000 - [math]::Abs([math]::Round((1.0 - $Result.Ratio) * 1000)))
+        [int]$plan.Fps,
+        $widthFitScore,
+        [int]$plan.VideoKbps
       )
     }
 
     "ExtraQuality" {
+      $presetRank = Get-X264PresetRank -preset $plan.Preset
       return @(
-        [int]$plan.Width,
-        [int]$plan.Fps,
+        [int]$plan.Score,
+        [int]$presetRank,
+        $fillScore,
         [int]$audioRank,
-        [double]([math]::Round($Result.Ratio * 1000))
+        [int]$plan.Fps,
+        $widthFitScore,
+        [int]$plan.VideoKbps
       )
     }
   }
@@ -944,7 +1272,8 @@ function Get-BestResult {
     [Parameter(Mandatory = $true)][string]$TempDir,
     [Parameter(Mandatory = $true)][long]$TargetBytes,
     [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$Preset
+    [Parameter(Mandatory = $true)][string]$Preset,
+    [Parameter(Mandatory = $true)][bool]$PresetWasExplicit
   )
 
   $planBundle = Get-PlanList -Info $Info -Probe $Probe -TargetBytes $TargetBytes -Mode $Mode -Preset $Preset
@@ -966,28 +1295,34 @@ function Get-BestResult {
 
   foreach ($plan in ($plans | Select-Object -First $maxPlans)) {
     $tested++
-    Write-Host ("Testing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | probe={7} | bpppf={8:N4}" -f $tested, $maxPlans, $plan.Width, $plan.Height, $plan.Fps, $plan.VideoKbps, $plan.AudioPlan.Label, $plan.ProbeBucket, $plan.Bpppf)
+    $presetCandidates = Get-PresetCandidatesForPlan -Mode $Mode -BasePreset $Preset -PresetWasExplicit $PresetWasExplicit -PlanIndex $tested
 
-    $result = Try-PlanWithAdjustments -InputPath $InputPath -Plan $plan -TempDir $TempDir -AllAudioPlans $audioCandidates
+    foreach ($presetCandidate in $presetCandidates) {
+      $planForPreset = $plan.PSObject.Copy()
+      $planForPreset.Preset = $presetCandidate
 
-    if ($result.Success) {
-      if ($null -eq $bestUnder) {
-        $bestUnder = $result
-      }
-      else {
-        if (Test-IsBetterResult -Candidate $result -Current $bestUnder) {
-          if ($bestUnder.Path -and (Test-Path $bestUnder.Path)) {
-            Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
-          }
+      Write-Host ("Testing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | detail={7} | motion={8} | bpppf={9:N4} | preset={10}" -f $tested, $maxPlans, $planForPreset.Width, $planForPreset.Height, $planForPreset.Fps, $planForPreset.VideoKbps, $planForPreset.AudioPlan.Label, $planForPreset.DetailBucket, $planForPreset.MotionBucket, $planForPreset.Bpppf, $planForPreset.Preset)
+
+      $result = Try-PlanWithAdjustments -InputPath $InputPath -Plan $planForPreset -TempDir $TempDir -AllAudioPlans $audioCandidates
+
+      if ($result.Success) {
+        if ($null -eq $bestUnder) {
           $bestUnder = $result
         }
         else {
-          if ($result.Path -and (Test-Path $result.Path)) {
-            Remove-Item $result.Path -Force -ErrorAction SilentlyContinue
+          if (Test-IsBetterResult -Candidate $result -Current $bestUnder) {
+            if ($bestUnder.Path -and (Test-Path $bestUnder.Path)) {
+              Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
+            }
+            $bestUnder = $result
+          }
+          else {
+            if ($result.Path -and (Test-Path $result.Path)) {
+              Remove-Item $result.Path -Force -ErrorAction SilentlyContinue
+            }
           }
         }
       }
-
     }
   }
 
@@ -1007,19 +1342,30 @@ $info = Get-ProbeInfo -path $inputFull
 if ([string]::IsNullOrWhiteSpace($OutputFile)) {
   $dir = Split-Path $inputFull -Parent
   $base = [System.IO.Path]::GetFileNameWithoutExtension($inputFull)
-  $OutputFile = Join-Path $dir ("{0}_{1}mb.mp4" -f $base, $TargetMB)
+  if ($PSCmdlet.ParameterSetName -eq "ByBytes") {
+    $OutputFile = Join-Path $dir ("{0}_{1}bytes.mp4" -f $base, $TargetBytes)
+  }
+  else {
+    $OutputFile = Join-Path $dir ("{0}_{1}mb.mp4" -f $base, $TargetMB)
+  }
 }
 
+$presetWasExplicit = -not [string]::IsNullOrWhiteSpace($Preset)
 if ([string]::IsNullOrWhiteSpace($Preset)) {
   $Preset = Get-DefaultPresetForMode -mode $Mode
 }
 
-$targetBaseBytes = switch ($TargetUnit) {
-  "BinaryMiB" { [double]($TargetMB * 1MB) }
-  "DecimalMB" { [double]($TargetMB * 1000 * 1000) }
+$targetRequestBytes = if ($PSCmdlet.ParameterSetName -eq "ByBytes") {
+  [double]$TargetBytes
 }
-$targetBytes = [long][math]::Floor($targetBaseBytes * $SafetyMarginPercent)
-$totalKbps = (($targetBytes * 8.0) / $info.Duration) / 1000.0
+else {
+  switch ($TargetUnit) {
+    "BinaryMiB" { [double]($TargetMB * 1MB) }
+    "DecimalMB" { [double]($TargetMB * 1000 * 1000) }
+  }
+}
+$usableTargetBytes = [long][math]::Floor($targetRequestBytes * $SafetyMarginPercent)
+$totalKbps = (($usableTargetBytes * 8.0) / $info.Duration) / 1000.0
 
 Write-Host "Input:            $inputFull"
 Write-Host "Duration:         $([math]::Round($info.Duration, 2)) s"
@@ -1028,8 +1374,13 @@ Write-Host "Video codec:      $($info.VideoCodec)"
 Write-Host "Video bitrate:    $(if ($info.VideoBitrateKbps) { "$($info.VideoBitrateKbps) kbps" } else { 'unknown' })"
 Write-Host "Audio codec:      $(if ($info.HasAudio) { $info.AudioCodec } else { 'none' })"
 Write-Host "Audio bitrate:    $(if ($info.AudioBitrateKbps) { "$($info.AudioBitrateKbps) kbps" } else { 'unknown' })"
-Write-Host "Target size:      $TargetMB $TargetUnit"
-Write-Host "Usable bytes:     $targetBytes"
+if ($PSCmdlet.ParameterSetName -eq "ByBytes") {
+  Write-Host "Target size:      $TargetBytes bytes"
+}
+else {
+  Write-Host "Target size:      $TargetMB $TargetUnit"
+}
+Write-Host "Usable bytes:     $usableTargetBytes"
 Write-Host "Total budget:     $([math]::Round($totalKbps)) kbps"
 Write-Host "Mode:             $Mode"
 Write-Host "Preset:           $Preset"
@@ -1047,11 +1398,17 @@ try {
     -SampleSeconds $ProbeSampleSeconds `
     -MaxSamples $MaxProbeSamples
 
-  Write-Host "Probe width/fps:  $($probe.ProbeWidth)p @ $($probe.ProbeFps) fps"
+  Write-Host "Detail probe:     $($probe.DetailProbe.ProbeWidth)p @ $($probe.DetailProbe.ProbeFps) fps"
+  if ($probe.MotionProbe) {
+    Write-Host "Motion probe:     $($probe.MotionProbe.ProbeWidth)p @ $($probe.MotionProbe.ProbeFps) fps"
+  }
   Write-Host "Probe CRF:        $($probe.ProbeCrf)"
-  Write-Host "Probe avg kbps:   $($probe.AvgKbps)"
-  Write-Host "Probe peak-ish:   $($probe.PeakishKbps)"
-  Write-Host "Complexity:       $($probe.Bucket)"
+  Write-Host "Detail avg kbps:  $($probe.DetailProbe.AvgKbps)"
+  Write-Host "Detail peak-ish:  $($probe.DetailProbe.PeakishKbps)"
+  Write-Host "Detail bucket:    $($probe.DetailBucket)"
+  Write-Host "Motion ratio:     $($probe.MotionRatio)"
+  Write-Host "Motion norm:      $($probe.MotionNormalized)"
+  Write-Host "Motion bucket:    $($probe.MotionBucket)"
   Write-Host ""
 
   $winner = Get-BestResult `
@@ -1059,9 +1416,10 @@ try {
     -Probe $probe `
     -InputPath $inputFull `
     -TempDir $tempDir `
-    -TargetBytes $targetBytes `
+    -TargetBytes $usableTargetBytes `
     -Mode $Mode `
-    -Preset $Preset
+    -Preset $Preset `
+    -PresetWasExplicit $presetWasExplicit
 
   if (-not $winner -or -not $winner.Success) {
     throw "Could not get under target size with the current probe + bitrate-targeting plan."
@@ -1078,7 +1436,8 @@ try {
   Write-Host "Chosen fps:       $($winner.Plan.Fps)"
   Write-Host "Video bitrate:    $($winner.Plan.VideoKbps) kbps"
   Write-Host "Chosen audio:     $($winner.Plan.AudioPlan.Label)"
-  Write-Host "Probe bucket:     $($winner.Plan.ProbeBucket)"
+  Write-Host "Detail bucket:    $($winner.Plan.DetailBucket)"
+  Write-Host "Motion bucket:    $($winner.Plan.MotionBucket)"
   Write-Host "Predicted bpppf:  $('{0:N4}' -f $winner.Plan.Bpppf)"
   Write-Host "Video filter:     $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VFilter)) { '(none)' } else { $winner.Plan.VFilter })"
 }
