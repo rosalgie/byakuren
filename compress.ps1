@@ -1325,10 +1325,10 @@ function Get-PreviewStrategyForMode($mode, $duration) {
     "ExtraQuality" {
       return [PSCustomObject]@{
         Enabled       = $true
-        SampleSeconds = 6
-        MaxSamples    = 3
-        PreviewPreset = "fast"
-        Finalists     = if ($duration -ge 180) { 4 } else { 5 }
+        SampleSeconds = if ($duration -le 45) { 4 } else { 5 }
+        MaxSamples    = 2
+        PreviewPreset = "veryfast"
+        Finalists     = if ($duration -ge 60) { 2 } else { 3 }
       }
     }
   }
@@ -1407,7 +1407,7 @@ function Get-CloseEnoughRatioForMode($mode) {
   switch ($mode) {
     "Fast"         { return 0.985 }
     "Balanced"     { return 0.992 }
-    "ExtraQuality" { return 0.998 }
+    "ExtraQuality" { return 0.994 }
   }
 }
 
@@ -1812,11 +1812,11 @@ function Get-PresetCandidatesForPlan {
     "ExtraQuality" {
       $candidates = @()
 
-      if ($PlanIndex -le 3 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slower")) {
-        $candidates += "slower"
+      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -gt (Get-X264PresetRank "medium")) {
+        $candidates += "medium"
       }
 
-      if ($PlanIndex -le 3 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")) {
+      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")) {
         $candidates += "slow"
       }
 
@@ -1983,14 +1983,14 @@ function Get-PlanPreferenceTuple {
     "ExtraQuality" {
       $presetRank = Get-X264PresetRank -preset $plan.Preset
       return @(
-        [int]$presetRank,
         $previewRankScore,
         $fillScore,
         [int]$audioRank,
         $widthFitScore,
         [int]$plan.Fps,
         [int]$plan.Width,
-        [int]$plan.VideoKbps
+        [int]$plan.VideoKbps,
+        [int]$presetRank
       )
     }
   }
@@ -2033,14 +2033,14 @@ function Get-PreviewPreferenceTuple {
     "ExtraQuality" {
       $presetRank = Get-X264PresetRank -preset $plan.Preset
       return @(
-        [int]$presetRank,
         $fillScore,
         [int]$audioRank,
         $widthFitScore,
         [int]$plan.Fps,
         [int]$plan.Width,
         [int]$plan.VideoKbps,
-        [int]$plan.Score
+        [int]$plan.Score,
+        [int]$presetRank
       )
     }
   }
@@ -2104,7 +2104,7 @@ function Get-BestResult {
   $maxPlans = switch ($Mode) {
     "Fast"         { 2 }
     "Balanced"     { 4 }
-    "ExtraQuality" { 10 }
+    "ExtraQuality" { 6 }
   }
 
   $candidatePlans = @($plans | Select-Object -First $maxPlans)
