@@ -1156,6 +1156,7 @@ function New-EncodePlan {
     WidthRatio    = $widthRatio
     DetailBucket = $Probe.DetailBucket
     MotionBucket = $Probe.MotionBucket
+    DurationSeconds = $Info.Duration
     Score       = $score
     TotalBudgetKbps = $totalBudgetKbps
     WidthOrigin = $WidthOrigin
@@ -1317,7 +1318,7 @@ function Get-PreviewStrategyForMode($mode, $duration) {
         SampleSeconds = if ($duration -le 45) { 4 } else { 5 }
         MaxSamples    = 2
         PreviewPreset = "veryfast"
-        Finalists     = if ($duration -ge 60) { 2 } else { 3 }
+        Finalists     = 2
       }
     }
 
@@ -1405,7 +1406,15 @@ function Get-TopResultsByPreference {
 function Get-CloseEnoughRatioForMode($mode) {
   switch ($mode) {
     "Fast"         { return 0.985 }
-    "Balanced"     { return 0.994 }
+    "Balanced"     { return 0.992 }
+    "ExtraQuality" { return 0.998 }
+  }
+}
+
+function Get-EarlyAcceptRatioForMode($mode) {
+  switch ($mode) {
+    "Fast"         { return 0.985 }
+    "Balanced"     { return 0.992 }
     "ExtraQuality" { return 0.998 }
   }
 }
@@ -1773,7 +1782,7 @@ function Try-PlanWithAdjustments {
 
 function Get-PresetCandidatesForPlan {
   param(
-    [Parameter(Mandatory = $true)][string]$Mode,
+    [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)][string]$BasePreset,
     [Parameter(Mandatory = $true)][bool]$PresetWasExplicit,
     [Parameter(Mandatory = $true)][int]$PlanIndex
@@ -1783,16 +1792,21 @@ function Get-PresetCandidatesForPlan {
     return @($BasePreset)
   }
 
-  switch ($Mode) {
+  switch ($Plan.Mode) {
     "Balanced" {
-      $candidates = @()
+      $previewRank = [int](Get-ObjectPropertyValue -Object $Plan -Name "PreviewRank" -DefaultValue $PlanIndex)
+      $shouldUseSlow = (
+        $previewRank -eq 1 -and
+        $PlanIndex -eq 1 -and
+        $Plan.DurationSeconds -le 60 -and
+        (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")
+      )
 
-      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")) {
-        $candidates += "slow"
+      if ($shouldUseSlow) {
+        return @("slow")
       }
 
-      $candidates += $BasePreset
-      return $candidates | Select-Object -Unique
+      return @($BasePreset)
     }
 
     "ExtraQuality" {
@@ -2089,7 +2103,7 @@ function Get-BestResult {
 
   $maxPlans = switch ($Mode) {
     "Fast"         { 2 }
-    "Balanced"     { 6 }
+    "Balanced"     { 4 }
     "ExtraQuality" { 10 }
   }
 
@@ -2101,7 +2115,7 @@ function Get-BestResult {
 
   foreach ($plan in $finalists) {
     $tested++
-    $presetCandidates = Get-PresetCandidatesForPlan -Mode $Mode -BasePreset $Preset -PresetWasExplicit $PresetWasExplicit -PlanIndex $tested
+    $presetCandidates = Get-PresetCandidatesForPlan -Plan $plan -BasePreset $Preset -PresetWasExplicit $PresetWasExplicit -PlanIndex $tested
 
     foreach ($presetCandidate in $presetCandidates) {
       $planForPreset = $plan.PSObject.Copy()
@@ -2127,6 +2141,11 @@ function Get-BestResult {
               Remove-Item $result.Path -Force -ErrorAction SilentlyContinue
             }
           }
+        }
+
+        $earlyAcceptRatio = Get-EarlyAcceptRatioForMode -mode $Mode
+        if ($Mode -eq "Balanced" -and $tested -eq 1 -and $bestUnder -and $bestUnder.Ratio -ge $earlyAcceptRatio) {
+          return $bestUnder
         }
       }
     }
