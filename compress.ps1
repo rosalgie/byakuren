@@ -915,6 +915,82 @@ function Test-IsBetterPlanAttempt {
   return ($Candidate.Plan.VideoKbps -gt $Current.Plan.VideoKbps)
 }
 
+function Get-PreviewStrategyForMode($mode, $duration) {
+  switch ($mode) {
+    "Fast" {
+      return [PSCustomObject]@{
+        Enabled       = $false
+        SampleSeconds = 0
+        MaxSamples    = 0
+        PreviewPreset = ""
+        Finalists     = 0
+      }
+    }
+
+    "Balanced" {
+      return [PSCustomObject]@{
+        Enabled       = $true
+        SampleSeconds = if ($duration -le 45) { 4 } else { 5 }
+        MaxSamples    = 2
+        PreviewPreset = "veryfast"
+        Finalists     = 3
+      }
+    }
+
+    "ExtraQuality" {
+      return [PSCustomObject]@{
+        Enabled       = $true
+        SampleSeconds = 6
+        MaxSamples    = 3
+        PreviewPreset = "fast"
+        Finalists     = 5
+      }
+    }
+  }
+}
+
+function Get-PlanKey($Plan) {
+  $audioKey = switch ($Plan.AudioPlan.Mode) {
+    "aac"  { "aac:$($Plan.AudioPlan.Kbps)" }
+    "copy" { "copy" }
+    "mute" { "mute" }
+    default { [string]$Plan.AudioPlan.Mode }
+  }
+
+  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset)
+}
+
+function Get-TopResultsByPreference {
+  param(
+    [Parameter(Mandatory = $true)]$Results,
+    [Parameter(Mandatory = $true)][int]$Count
+  )
+
+  $ordered = New-Object System.Collections.ArrayList
+
+  foreach ($result in $Results) {
+    $inserted = $false
+
+    for ($i = 0; $i -lt $ordered.Count; $i++) {
+      if (Test-IsBetterResult -Candidate $result -Current $ordered[$i]) {
+        [void]$ordered.Insert($i, $result)
+        $inserted = $true
+        break
+      }
+    }
+
+    if (-not $inserted) {
+      [void]$ordered.Add($result)
+    }
+
+    while ($ordered.Count -gt $Count) {
+      $ordered.RemoveAt($ordered.Count - 1)
+    }
+  }
+
+  return @($ordered)
+}
+
 function Get-CloseEnoughRatioForMode($mode) {
   switch ($mode) {
     "Fast"         { return 0.985 }
@@ -1000,6 +1076,130 @@ function Get-NextVideoKbpsGuess {
   }
 
   return [int][math]::Max($minRate, $nextGuess)
+}
+
+function Get-PlanPreviewResult {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)][string]$PreviewPreset,
+    [Parameter(Mandatory = $true)][int]$SampleSeconds,
+    [Parameter(Mandatory = $true)][int]$MaxSamples
+  )
+
+  $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
+  if (-not $offsets -or $offsets.Count -eq 0) {
+    return $null
+  }
+
+  $segmentBytes = New-Object System.Collections.Generic.List[double]
+  $idx = 0
+  $videoRate = ("{0}k" -f $Plan.VideoKbps)
+  $bufSize = ("{0}k" -f ([int][math]::Max($Plan.VideoKbps * 2, 100)))
+
+  foreach ($offset in $offsets) {
+    $idx++
+    $outPath = Join-Path $TempDir ("preview_{0}_{1}_{2}_{3}.mp4" -f $Plan.Width, $Plan.Fps, $Plan.VideoKbps, $idx)
+    $args = @("-y", "-ss", "$offset", "-t", "$SampleSeconds", "-i", $InputPath)
+
+    if (-not [string]::IsNullOrWhiteSpace($Plan.VFilter)) {
+      $args += @("-vf", $Plan.VFilter)
+    }
+
+    $args += @(
+      "-an",
+      "-c:v", "libx264",
+      "-preset", $PreviewPreset,
+      "-b:v", $videoRate,
+      "-maxrate", $videoRate,
+      "-bufsize", $bufSize,
+      $outPath
+    )
+
+    [void](Invoke-Tool -Exe "ffmpeg" -Args $args)
+    $segmentBytes.Add([double](Get-Item $outPath).Length)
+    Remove-Item $outPath -Force -ErrorAction SilentlyContinue
+  }
+
+  $avgSegmentBytes = ($segmentBytes | Measure-Object -Average).Average
+  $predictedVideoBytes = [double]$avgSegmentBytes * ([double]$Info.Duration / [double]$SampleSeconds)
+  $predictedTotalBytes = [long][math]::Floor($predictedVideoBytes + [double]$Plan.AudioPlan.EstimatedBytes + [double](Get-MuxReserveBytes -targetBytes $Plan.TargetBytes -mode $Plan.Mode))
+  $predictedRatio = $predictedTotalBytes / [double]$Plan.TargetBytes
+
+  return [PSCustomObject]@{
+    Success   = ($predictedTotalBytes -gt 0)
+    SizeBytes = $predictedTotalBytes
+    Path      = $null
+    Plan      = $Plan.PSObject.Copy()
+    Ratio     = $predictedRatio
+  }
+}
+
+function Get-PlanFinalists {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][string]$Mode
+  )
+
+  $strategy = Get-PreviewStrategyForMode -mode $Mode -duration $Info.Duration
+  $candidatePlans = @($Plans)
+
+  if (-not $strategy.Enabled -or $candidatePlans.Count -le $strategy.Finalists) {
+    return $candidatePlans
+  }
+
+  $previewResults = New-Object System.Collections.Generic.List[object]
+  $previewed = 0
+  foreach ($plan in $candidatePlans) {
+    $previewed++
+    Write-Host ("Previewing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | preview preset={7}" -f $previewed, $candidatePlans.Count, $plan.Width, $plan.Height, $plan.Fps, $plan.VideoKbps, $plan.AudioPlan.Label, $strategy.PreviewPreset)
+    $preview = Get-PlanPreviewResult `
+      -Info $Info `
+      -InputPath $InputPath `
+      -TempDir $TempDir `
+      -Plan $plan `
+      -PreviewPreset $strategy.PreviewPreset `
+      -SampleSeconds $strategy.SampleSeconds `
+      -MaxSamples $strategy.MaxSamples
+
+    if ($preview -and $preview.Success) {
+      [void]$previewResults.Add($preview)
+    }
+  }
+
+  if ($previewResults.Count -eq 0) {
+    return $candidatePlans
+  }
+
+  $topPreview = Get-TopResultsByPreference -Results $previewResults -Count $strategy.Finalists
+  $selectedPlans = New-Object System.Collections.Generic.List[object]
+  $seenKeys = New-Object System.Collections.Generic.HashSet[string]
+
+  foreach ($seedPlan in ($candidatePlans | Select-Object -First 1)) {
+    $seedKey = Get-PlanKey -Plan $seedPlan
+    if ($seenKeys.Add($seedKey)) {
+      [void]$selectedPlans.Add($seedPlan)
+    }
+  }
+
+  foreach ($preview in $topPreview) {
+    $key = Get-PlanKey -Plan $preview.Plan
+    if ($seenKeys.Add($key)) {
+      [void]$selectedPlans.Add($preview.Plan)
+    }
+  }
+
+  $selectedSummary = $selectedPlans | ForEach-Object {
+    "{0}x{1}@{2}" -f $_.Width, $_.Height, $_.Fps
+  }
+  Write-Host ("Finalists:        {0}" -f ($selectedSummary -join ", "))
+
+  return @($selectedPlans.ToArray())
 }
 
 function Try-PlanWithAdjustments {
@@ -1295,10 +1495,13 @@ function Get-BestResult {
     "ExtraQuality" { 10 }
   }
 
+  $candidatePlans = @($plans | Select-Object -First $maxPlans)
+  $finalists = Get-PlanFinalists -Info $Info -Plans $candidatePlans -InputPath $InputPath -TempDir $TempDir -Mode $Mode
+
   $bestUnder = $null
   $tested = 0
 
-  foreach ($plan in ($plans | Select-Object -First $maxPlans)) {
+  foreach ($plan in $finalists) {
     $tested++
     $presetCandidates = Get-PresetCandidatesForPlan -Mode $Mode -BasePreset $Preset -PresetWasExplicit $PresetWasExplicit -PlanIndex $tested
 
@@ -1306,7 +1509,7 @@ function Get-BestResult {
       $planForPreset = $plan.PSObject.Copy()
       $planForPreset.Preset = $presetCandidate
 
-      Write-Host ("Testing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | detail={7} | motion={8} | bpppf={9:N4} | preset={10}" -f $tested, $maxPlans, $planForPreset.Width, $planForPreset.Height, $planForPreset.Fps, $planForPreset.VideoKbps, $planForPreset.AudioPlan.Label, $planForPreset.DetailBucket, $planForPreset.MotionBucket, $planForPreset.Bpppf, $planForPreset.Preset)
+      Write-Host ("Testing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | detail={7} | motion={8} | bpppf={9:N4} | preset={10}" -f $tested, $finalists.Count, $planForPreset.Width, $planForPreset.Height, $planForPreset.Fps, $planForPreset.VideoKbps, $planForPreset.AudioPlan.Label, $planForPreset.DetailBucket, $planForPreset.MotionBucket, $planForPreset.Bpppf, $planForPreset.Preset)
 
       $result = Try-PlanWithAdjustments -InputPath $InputPath -Plan $planForPreset -TempDir $TempDir -AllAudioPlans $audioCandidates
 
