@@ -843,16 +843,51 @@ function New-EncodePlan {
   }
 }
 
+function Remove-PassLogFiles {
+  param(
+    [Parameter(Mandatory = $true)][string]$PassLogPath
+  )
+
+  if (-not [string]::IsNullOrWhiteSpace($PassLogPath)) {
+    Get-ChildItem -Path ($PassLogPath + "*") -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  }
+}
+
+function Invoke-EncodePassOne {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)][string]$PassLogPath
+  )
+
+  $videoRate = ("{0}k" -f $Plan.VideoKbps)
+  $bufSize = ("{0}k" -f ([int][math]::Max($Plan.VideoKbps * 2, 100)))
+  $maxRate = $videoRate
+
+  $commonVideo = @("-c:v", "libx264", "-preset", $Plan.Preset, "-b:v", $videoRate, "-maxrate", $maxRate, "-bufsize", $bufSize)
+  if (-not [string]::IsNullOrWhiteSpace($Plan.VFilter)) { $commonVideo = @("-vf", $Plan.VFilter) + $commonVideo }
+
+  $pass1 = @("-y", "-i", $InputPath) + $commonVideo + @("-pass", "1", "-passlogfile", $PassLogPath, "-an", "-f", "mp4", "NUL")
+  [void](Invoke-Tool -Exe "ffmpeg" -Args $pass1)
+}
+
 function Encode-Plan {
   param(
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)][string]$OutputPath,
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)][string]$TempDir,
-    [Parameter(Mandatory = $true)][bool]$TwoPass
+    [Parameter(Mandatory = $true)][bool]$TwoPass,
+    [string]$PassLogPath = ""
   )
 
-  $passlog = Join-Path $TempDir ("ffpass_{0}" -f ([guid]::NewGuid().ToString("N")))
+  $passlog = if ([string]::IsNullOrWhiteSpace($PassLogPath)) {
+    Join-Path $TempDir ("ffpass_{0}" -f ([guid]::NewGuid().ToString("N")))
+  }
+  else {
+    $PassLogPath
+  }
+  $ownsPassLog = [string]::IsNullOrWhiteSpace($PassLogPath)
   $videoRate = ("{0}k" -f $Plan.VideoKbps)
   $bufSize = ("{0}k" -f ([int][math]::Max($Plan.VideoKbps * 2, 100)))
   $maxRate = $videoRate
@@ -861,8 +896,9 @@ function Encode-Plan {
   if (-not [string]::IsNullOrWhiteSpace($Plan.VFilter)) { $commonVideo = @("-vf", $Plan.VFilter) + $commonVideo }
 
   if ($TwoPass) {
-    $pass1 = @("-y", "-i", $InputPath) + $commonVideo + @("-pass", "1", "-passlogfile", $passlog, "-an", "-f", "mp4", "NUL")
-    [void](Invoke-Tool -Exe "ffmpeg" -Args $pass1)
+    if ($ownsPassLog) {
+      Invoke-EncodePassOne -InputPath $InputPath -Plan $Plan -PassLogPath $passlog
+    }
 
     $pass2 = @("-y", "-i", $InputPath) + $commonVideo + @("-pass", "2", "-passlogfile", $passlog, "-movflags", "+faststart")
 
@@ -891,7 +927,9 @@ function Encode-Plan {
   }
 
   $size = (Get-Item $OutputPath).Length
-  Get-ChildItem -Path ($passlog + "*") -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
+  if ($ownsPassLog) {
+    Remove-PassLogFiles -PassLogPath $passlog
+  }
   return $size
 }
 
@@ -1223,91 +1261,104 @@ function Try-PlanWithAdjustments {
   $upperBound = $null
   $seenRates = New-Object System.Collections.Generic.HashSet[int]
   $closeEnoughRatio = Get-CloseEnoughRatioForMode -mode $workingPlan.Mode
+  $sharedPassLog = $null
 
-  for ($i = 1; $i -le $tries; $i++) {
-    if (-not $seenRates.Add([int]$workingPlan.VideoKbps)) {
-      break
+  try {
+    if ($twoPass) {
+      $sharedPassLog = Join-Path $TempDir ("ffpass_shared_{0}" -f ([guid]::NewGuid().ToString("N")))
+      Invoke-EncodePassOne -InputPath $InputPath -Plan $workingPlan -PassLogPath $sharedPassLog
     }
 
-    $tempOut = Join-Path $TempDir ("candidate_{0}_{1}_{2}_{3}.mp4" -f $workingPlan.Width, $workingPlan.Fps, $workingPlan.VideoKbps, $i)
-    $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass $twoPass
-
-    $ratio = $size / [double]$workingPlan.TargetBytes
-    Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
-
-    if ($size -le $workingPlan.TargetBytes) {
-      $candidate = [PSCustomObject]@{
-        Success   = $true
-        SizeBytes = $size
-        Path      = $tempOut
-        Plan      = $workingPlan.PSObject.Copy()
-        Ratio     = $ratio
-      }
-
-      if (Test-IsBetterPlanAttempt -Candidate $candidate -Current $bestUnder) {
-        if ($bestUnder -and $bestUnder.Path -and (Test-Path $bestUnder.Path)) {
-          Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
-        }
-        $bestUnder = $candidate
-      }
-      else {
-        Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-      }
-
-      if (($null -eq $lowerBound) -or ($size -gt $lowerBound.SizeBytes)) {
-        $lowerBound = [PSCustomObject]@{
-          VideoKbps = [int]$workingPlan.VideoKbps
-          SizeBytes = [long]$size
-        }
-      }
-
-      $isCloseEnough = ($ratio -ge $closeEnoughRatio)
-
-      $isBracketTight = ($lowerBound -and $upperBound -and (([int]$upperBound.VideoKbps - [int]$lowerBound.VideoKbps) -le 8))
-
-      if ($isCloseEnough -or $isBracketTight) {
+    for ($i = 1; $i -le $tries; $i++) {
+      if (-not $seenRates.Add([int]$workingPlan.VideoKbps)) {
         break
       }
-    }
-    else {
-      if ($tempOut -and (Test-Path $tempOut)) {
-        Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-      }
 
-      if (($null -eq $upperBound) -or ($size -lt $upperBound.SizeBytes)) {
-        $upperBound = [PSCustomObject]@{
-          VideoKbps = [int]$workingPlan.VideoKbps
-          SizeBytes = [long]$size
+      $tempOut = Join-Path $TempDir ("candidate_{0}_{1}_{2}_{3}.mp4" -f $workingPlan.Width, $workingPlan.Fps, $workingPlan.VideoKbps, $i)
+      $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass $twoPass -PassLogPath $sharedPassLog
+
+      $ratio = $size / [double]$workingPlan.TargetBytes
+      Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
+
+      if ($size -le $workingPlan.TargetBytes) {
+        $candidate = [PSCustomObject]@{
+          Success   = $true
+          SizeBytes = $size
+          Path      = $tempOut
+          Plan      = $workingPlan.PSObject.Copy()
+          Ratio     = $ratio
+        }
+
+        if (Test-IsBetterPlanAttempt -Candidate $candidate -Current $bestUnder) {
+          if ($bestUnder -and $bestUnder.Path -and (Test-Path $bestUnder.Path)) {
+            Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
+          }
+          $bestUnder = $candidate
+        }
+        else {
+          Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
+        }
+
+        if (($null -eq $lowerBound) -or ($size -gt $lowerBound.SizeBytes)) {
+          $lowerBound = [PSCustomObject]@{
+            VideoKbps = [int]$workingPlan.VideoKbps
+            SizeBytes = [long]$size
+          }
+        }
+
+        $isCloseEnough = ($ratio -ge $closeEnoughRatio)
+
+        $isBracketTight = ($lowerBound -and $upperBound -and (([int]$upperBound.VideoKbps - [int]$lowerBound.VideoKbps) -le 8))
+
+        if ($isCloseEnough -or $isBracketTight) {
+          break
         }
       }
+      else {
+        if ($tempOut -and (Test-Path $tempOut)) {
+          Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
+        }
+
+        if (($null -eq $upperBound) -or ($size -lt $upperBound.SizeBytes)) {
+          $upperBound = [PSCustomObject]@{
+            VideoKbps = [int]$workingPlan.VideoKbps
+            SizeBytes = [long]$size
+          }
+        }
+      }
+
+      if ($i -ge $tries) { break }
+
+      $newRate = Get-NextVideoKbpsGuess `
+        -Mode $workingPlan.Mode `
+        -TargetBytes $workingPlan.TargetBytes `
+        -CurrentVideoKbps $workingPlan.VideoKbps `
+        -CurrentSizeBytes $size `
+        -LowerBound $lowerBound `
+        -UpperBound $upperBound
+
+      if ($newRate -lt 35 -or $newRate -eq $workingPlan.VideoKbps) {
+        break
+      }
+
+      if ($lowerBound -and $newRate -le [int]$lowerBound.VideoKbps) {
+        $newRate = [int]$lowerBound.VideoKbps + 1
+      }
+      if ($upperBound -and $newRate -ge [int]$upperBound.VideoKbps) {
+        $newRate = [int]$upperBound.VideoKbps - 1
+      }
+
+      if ($newRate -lt 35 -or $seenRates.Contains($newRate)) {
+        break
+      }
+
+      $workingPlan.VideoKbps = $newRate
     }
-
-    if ($i -ge $tries) { break }
-
-    $newRate = Get-NextVideoKbpsGuess `
-      -Mode $workingPlan.Mode `
-      -TargetBytes $workingPlan.TargetBytes `
-      -CurrentVideoKbps $workingPlan.VideoKbps `
-      -CurrentSizeBytes $size `
-      -LowerBound $lowerBound `
-      -UpperBound $upperBound
-
-    if ($newRate -lt 35 -or $newRate -eq $workingPlan.VideoKbps) {
-      break
+  }
+  finally {
+    if ($sharedPassLog) {
+      Remove-PassLogFiles -PassLogPath $sharedPassLog
     }
-
-    if ($lowerBound -and $newRate -le [int]$lowerBound.VideoKbps) {
-      $newRate = [int]$lowerBound.VideoKbps + 1
-    }
-    if ($upperBound -and $newRate -ge [int]$upperBound.VideoKbps) {
-      $newRate = [int]$upperBound.VideoKbps - 1
-    }
-
-    if ($newRate -lt 35 -or $seenRates.Contains($newRate)) {
-      break
-    }
-
-    $workingPlan.VideoKbps = $newRate
   }
 
   if ($bestUnder) {
