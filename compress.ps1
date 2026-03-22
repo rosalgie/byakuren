@@ -1353,6 +1353,74 @@ function Get-ReferenceBpppfForComplexity($bucket, $mode) {
   }
 }
 
+function Get-SourceToProbeComplexityRatio {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$Probe
+  )
+
+  $sourceVideoKbps = [double](Get-ObjectPropertyValue -Object $Info -Name "VideoBitrateKbps" -DefaultValue 0)
+  $probeAvgKbps = [double](Get-ObjectPropertyValue -Object $Probe.DetailProbe -Name "AvgKbps" -DefaultValue 0.0)
+
+  if ($sourceVideoKbps -le 0 -or $probeAvgKbps -le 0.0) {
+    return 0.0
+  }
+
+  return ($sourceVideoKbps / $probeAvgKbps)
+}
+
+function Get-ResolutionPlanningProfile {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$Probe,
+    [Parameter(Mandatory = $true)][string]$Mode
+  )
+
+  $baseTargetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.DetailBucket -mode $Mode
+  $planningWidth = Get-PlanningWidth -Info $Info
+  $sourceToProbeRatio = Get-SourceToProbeComplexityRatio -Info $Info -Probe $Probe
+  $detailPeakishKbps = [double](Get-ObjectPropertyValue -Object $Probe.DetailProbe -Name "PeakishKbps" -DefaultValue 0.0)
+
+  # Preserve more spatial detail on extremely compressible, edge-sensitive 60 fps captures.
+  $preferResolutionRetention = (
+    $Mode -ne "Fast" -and
+    $planningWidth -ge 960 -and
+    $Info.Fps -gt 50 -and
+    $Probe.DetailBucket -eq "VeryLow" -and
+    $detailPeakishKbps -le 70.0 -and
+    $Probe.MotionNormalized -le 0.55 -and
+    (
+      $sourceToProbeRatio -ge 80.0 -or
+      (
+        [double](Get-ObjectPropertyValue -Object $Info -Name "VideoBitrateKbps" -DefaultValue 0) -ge 6000.0 -and
+        $detailPeakishKbps -le 55.0
+      )
+    )
+  )
+
+  $retentionFactor = if ($preferResolutionRetention) {
+    switch ($Mode) {
+      "Balanced"     { 0.42 }
+      "ExtraQuality" { 0.38 }
+      default        { 1.0 }
+    }
+  }
+  else {
+    1.0
+  }
+
+  $targetBpppf = $baseTargetBpppf * $retentionFactor
+
+  return [PSCustomObject]@{
+    BaseTargetBpppf           = [double]$baseTargetBpppf
+    TargetBpppf               = [double]$targetBpppf
+    PreferResolutionRetention = [bool]$preferResolutionRetention
+    RetentionFactor           = [double]$retentionFactor
+    SourceToProbeRatio        = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F2}", $sourceToProbeRatio)), [Globalization.CultureInfo]::InvariantCulture)
+    BiasLabel                 = if ($preferResolutionRetention) { "retain-resolution" } else { "standard" }
+  }
+}
+
 function Get-WidthPlanCandidates {
   param(
     [Parameter(Mandatory = $true)]$Info,
@@ -1364,7 +1432,8 @@ function Get-WidthPlanCandidates {
 
   $planningWidth = Get-PlanningWidth -Info $Info
   $planningHeight = Get-PlanningHeight -Info $Info
-  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.DetailBucket -mode $Mode
+  $resolutionProfile = Get-ResolutionPlanningProfile -Info $Info -Probe $Probe -Mode $Mode
+  $targetBpppf = $resolutionProfile.TargetBpppf
   $expectedWidth = Get-ExpectedWidth -srcWidth $planningWidth -srcHeight $planningHeight -videoKbps $VideoKbps -targetFps $TargetFps -targetBpppf $targetBpppf
   $ladderWidths = Get-ResolutionCandidates -srcWidth $planningWidth | Sort-Object -Descending
   $closestLadder = $ladderWidths | Sort-Object { [math]::Abs($_ - $expectedWidth) } | Select-Object -First 1
@@ -1482,7 +1551,8 @@ function New-EncodePlan {
   $effectiveVideoKbps = [double]$videoKbps / [double][math]::Max(0.001, $codecEfficiency)
   $bpppf = Get-Bpppf -videoKbps $effectiveVideoKbps -width $Width -height $Height -fps $Fps
   $totalBudgetKbps = (($TargetBytes * 8.0) / $Info.Duration) / 1000.0
-  $targetBpppf = Get-ReferenceBpppfForComplexity -bucket $Probe.DetailBucket -mode $Mode
+  $resolutionProfile = Get-ResolutionPlanningProfile -Info $Info -Probe $Probe -Mode $Mode
+  $targetBpppf = $resolutionProfile.TargetBpppf
   $planningWidth = Get-PlanningWidth -Info $Info
   $planningHeight = Get-PlanningHeight -Info $Info
   $expectedWidth = Get-ExpectedWidth -srcWidth $planningWidth -srcHeight $planningHeight -videoKbps $effectiveVideoKbps -targetFps $Fps -targetBpppf $targetBpppf
@@ -1543,6 +1613,7 @@ function New-EncodePlan {
     Score       = $score
     TotalBudgetKbps = $totalBudgetKbps
     WidthOrigin = $WidthOrigin
+    ResolutionBiasLabel = $resolutionProfile.BiasLabel
     PreprocessLabel = $preprocessLabel
     UseDenoise = [bool]$UseDenoise
     CropApplied = [bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)
@@ -1569,6 +1640,7 @@ function New-SourcePreserveConstantQualityPlan {
   $vf = Build-Vf -Info $Info -TargetWidth $planningWidth -TargetFps $roundedSourceFps -UseDenoise:$useDenoise
   $crf = Get-RateControlSeedCrf -VideoCodec $CodecProfile.VideoCodec -Mode $Mode
   $videoPrivateArgs = if ($CodecProfile.VideoCodec -eq "x264") { Get-AutoX264Params -mode $Mode -totalBudgetKbps ([double][math]::Max(0, $Info.VideoBitrateKbps)) } else { "" }
+  $resolutionProfile = Get-ResolutionPlanningProfile -Info $Info -Probe $Probe -Mode $Mode
 
   return [PSCustomObject]@{
     Width            = $planningWidth
@@ -1596,6 +1668,7 @@ function New-SourcePreserveConstantQualityPlan {
     Score            = 1
     TotalBudgetKbps  = if ($Info.VideoBitrateKbps) { [double]$Info.VideoBitrateKbps } else { 0.0 }
     WidthOrigin      = "source"
+    ResolutionBiasLabel = $resolutionProfile.BiasLabel
     PreprocessLabel  = if ($useDenoise) { "mild-denoise" } else { "none" }
     UseDenoise       = [bool]$useDenoise
     CropApplied      = [bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)
@@ -2906,6 +2979,7 @@ try {
     -Mode $Mode `
     -SampleSeconds $ProbeSampleSeconds `
     -MaxSamples $MaxProbeSamples
+  $resolutionProfile = Get-ResolutionPlanningProfile -Info $info -Probe $probe -Mode $Mode
 
   Write-Host "Detail probe:     $($probe.DetailProbe.ProbeWidth)p @ $($probe.DetailProbe.ProbeFps) fps"
   if ($probe.MotionProbe) {
@@ -2918,6 +2992,7 @@ try {
   Write-Host "Motion ratio:     $($probe.MotionRatio)"
   Write-Host "Motion norm:      $($probe.MotionNormalized)"
   Write-Host "Motion bucket:    $($probe.MotionBucket)"
+  Write-Host "Resolution bias:  $($resolutionProfile.BiasLabel) (ratio=$($resolutionProfile.SourceToProbeRatio), bpppf=$('{0:N4}' -f $resolutionProfile.TargetBpppf))"
   Write-Host ""
 
   $winner = Get-BestResult `
@@ -2968,6 +3043,7 @@ try {
   Write-Host "Preprocess:       $($winner.Plan.PreprocessLabel)"
   Write-Host "Detail bucket:    $($winner.Plan.DetailBucket)"
   Write-Host "Motion bucket:    $($winner.Plan.MotionBucket)"
+  Write-Host "Resolution bias:  $($winner.Plan.ResolutionBiasLabel)"
   Write-Host "Predicted bpppf:  $('{0:N4}' -f $winner.Plan.Bpppf)"
   Write-Host "Video args:       $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VideoPrivateArgs)) { '(default)' } else { $winner.Plan.VideoPrivateArgs })"
   Write-Host "Video filter:     $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VFilter)) { '(none)' } else { $winner.Plan.VFilter })"
