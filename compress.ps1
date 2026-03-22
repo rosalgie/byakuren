@@ -158,20 +158,20 @@ function Get-CodecPresetRank($preset) {
   }
 }
 
-function Get-AomCpuUsedForPreset([string]$Preset) {
+function Get-SvtAv1PresetForPreset([string]$Preset) {
   switch ($Preset) {
-    "ultrafast" { return 8 }
-    "superfast" { return 8 }
-    "veryfast"  { return 7 }
-    "faster"    { return 6 }
-    "fast"      { return 5 }
-    "medium"    { return 4 }
-    "slow"      { return 3 }
-    "slower"    { return 2 }
-    "veryslow"  { return 1 }
+    "ultrafast" { return 12 }
+    "superfast" { return 11 }
+    "veryfast"  { return 10 }
+    "faster"    { return 9 }
+    "fast"      { return 8 }
+    "medium"    { return 6 }
+    "slow"      { return 4 }
+    "slower"    { return 3 }
+    "veryslow"  { return 2 }
     "placebo"   { return 0 }
     default {
-      throw "Unsupported preset '$Preset' for AV1. Use one of: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
+      throw "Unsupported preset '$Preset' for SVT-AV1. Use one of: ultrafast, superfast, veryfast, faster, fast, medium, slow, slower, veryslow, placebo."
     }
   }
 }
@@ -294,14 +294,14 @@ function Resolve-CodecProfile {
     "av1|webm" {
       return [PSCustomObject]@{
         VideoCodec           = "av1"
-        VideoEncoder         = "libaom-av1"
+        VideoEncoder         = "libsvtav1"
         Container            = "webm"
         Extension            = ".webm"
         DefaultAudioCodec    = "opus"
         DefaultAudioEncoder  = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs  = @("opus")
-        PresetKind           = "aom"
-        PreviewSpeedOverride = [PSCustomObject]@{ Kind = "cpu-used"; Value = 8; Label = "cpu-used=8" }
+        PresetKind           = "svtav1"
+        PreviewSpeedOverride = [PSCustomObject]@{ Kind = "preset"; Value = 12; Label = "preset=12" }
         FinalizeArgs         = @("-c", "copy")
       }
     }
@@ -1635,15 +1635,15 @@ function Get-CodecPresetArgs {
   )
 
   switch ($Plan.CodecProfile.PresetKind) {
-    "aom" {
-      $cpuUsed = if ($Preview) {
+    "svtav1" {
+      $presetValue = if ($Preview) {
         [int]$Plan.CodecProfile.PreviewSpeedOverride.Value
       }
       else {
-        Get-AomCpuUsedForPreset -Preset $Plan.Preset
+        Get-SvtAv1PresetForPreset -Preset $Plan.Preset
       }
 
-      return @("-usage", "good", "-cpu-used", "$cpuUsed", "-row-mt", "1")
+      return @("-preset", "$presetValue")
     }
 
     default {
@@ -1674,13 +1674,15 @@ function Get-CommonVideoEncodeArgs {
 
   switch ($Plan.RateControl) {
     "ExactSize" {
-      $args += @("-b:v", $videoRate, "-maxrate", $videoRate, "-bufsize", $bufSize)
-    }
-    "QualityCap" {
-      $args += @("-crf", "$($Plan.Crf)")
       if ($Plan.CodecProfile.VideoCodec -eq "av1") {
         $args += @("-b:v", $videoRate)
       }
+      else {
+        $args += @("-b:v", $videoRate, "-maxrate", $videoRate, "-bufsize", $bufSize)
+      }
+    }
+    "QualityCap" {
+      $args += @("-crf", "$($Plan.Crf)")
       $args += @("-maxrate", $videoRate, "-bufsize", $bufSize)
     }
     "ConstantQuality" {
