@@ -19,9 +19,6 @@ param(
   [AllowEmptyString()]
   [string]$Container = "",
 
-  [ValidateSet("ExactSize", "QualityCap", "ConstantQuality")]
-  [string]$RateControl = "ExactSize",
-
   [AllowEmptyString()]
   [string]$OutputFile = "",
 
@@ -31,8 +28,6 @@ param(
   [double]$SafetyMarginPercent = 0.995,
 
   [int]$ProbeSampleSeconds = 6,
-
-  [int]$MaxProbeSamples = 3,
 
   [ValidateSet("Off", "Auto", "Mild")]
   [string]$PreprocessProfile = "Auto",
@@ -211,25 +206,6 @@ function Get-RateControlSeedCrf([string]$VideoCodec, [string]$Mode) {
   }
 }
 
-function Get-CrfBounds([string]$VideoCodec) {
-  switch ($VideoCodec) {
-    "av1" {
-      return [PSCustomObject]@{
-        Min  = 0.0
-        Max  = 63.0
-        Step = 2.0
-      }
-    }
-    default {
-      return [PSCustomObject]@{
-        Min  = 0.0
-        Max  = 51.0
-        Step = 1.0
-      }
-    }
-  }
-}
-
 function Get-AudioCodecLabel([string]$AudioCodec) {
   switch ($AudioCodec) {
     "aac"  { return "AAC" }
@@ -335,8 +311,8 @@ function Assert-TargetArguments {
     throw "-TargetBytes must be greater than zero."
   }
 
-  if ($RateControl -in @("ExactSize", "QualityCap") -and -not (Test-HasExplicitTarget)) {
-    throw "$RateControl requires -TargetMB or -TargetBytes."
+  if (-not (Test-HasExplicitTarget)) {
+    throw "Specify -TargetMB or -TargetBytes."
   }
 }
 
@@ -388,20 +364,15 @@ function Get-TargetLabel {
 function Get-DefaultOutputPath {
   param(
     [Parameter(Mandatory = $true)][string]$InputPath,
-    [Parameter(Mandatory = $true)]$CodecProfile,
-    [Parameter(Mandatory = $true)][string]$RateControl
+    [Parameter(Mandatory = $true)]$CodecProfile
   )
 
   $dir = Split-Path $InputPath -Parent
   $base = [System.IO.Path]::GetFileNameWithoutExtension($InputPath)
   $targetLabel = Get-TargetLabel
 
-  if ($CodecProfile.VideoCodec -eq "x264" -and $CodecProfile.Container -eq "mp4" -and $RateControl -eq "ExactSize" -and (Test-HasExplicitTarget)) {
+  if ($CodecProfile.VideoCodec -eq "x264" -and $CodecProfile.Container -eq "mp4" -and (Test-HasExplicitTarget)) {
     return (Join-Path $dir ("{0}_{1}{2}" -f $base, $targetLabel, $CodecProfile.Extension))
-  }
-
-  if ($RateControl -eq "ConstantQuality" -and -not (Test-HasExplicitTarget)) {
-    return (Join-Path $dir ("{0}_{1}_constantquality{2}" -f $base, $CodecProfile.VideoCodec, $CodecProfile.Extension))
   }
 
   $parts = New-Object System.Collections.Generic.List[string]
@@ -409,7 +380,7 @@ function Get-DefaultOutputPath {
     [void]$parts.Add($targetLabel)
   }
   [void]$parts.Add($CodecProfile.VideoCodec)
-  [void]$parts.Add($RateControl.ToLowerInvariant())
+  [void]$parts.Add($Mode.ToLowerInvariant())
 
   return (Join-Path $dir ("{0}_{1}{2}" -f $base, ($parts -join "_"), $CodecProfile.Extension))
 }
@@ -473,6 +444,141 @@ function Get-DefaultPresetForMode($mode) {
     "Fast"         { return "superfast" }
     "Balanced"     { return "medium" }
     "ExtraQuality" { return "slow" }
+  }
+}
+
+function Get-ModeStrategy {
+  param(
+    [Parameter(Mandatory = $true)][string]$Mode,
+    [double]$Duration = 0
+  )
+
+  switch ($Mode) {
+    "Fast" {
+      return [PSCustomObject]@{
+        Mode                         = "Fast"
+        ProbeMaxSamples              = 2
+        ProbeEarlyStopSpreadThreshold = 0.14
+        PreviewMode                  = "none"
+        PreviewSampleSeconds         = 0
+        PreviewMaxSamples            = 0
+        PreviewTop                   = 0
+        Finalists                    = 1
+        ShortlistArchetypes          = 3
+        MaxFullEncodes               = 2
+        MaxSecondStageActions        = 1
+        AllowChallenger              = $false
+        AllowNeighborFallback        = $false
+        AllowPresetExploration       = $false
+        NearTieDelta                 = 0.04
+        ChallengerConfidenceThreshold = 0.72
+        CloseEnoughRatio             = 0.985
+        EarlyAcceptRatio             = 0.985
+        BadUnderfillRatio            = 0.955
+      }
+    }
+
+    "Balanced" {
+      return [PSCustomObject]@{
+        Mode                         = "Balanced"
+        ProbeMaxSamples              = 3
+        ProbeEarlyStopSpreadThreshold = 0.09
+        PreviewMode                  = "tiebreak"
+        PreviewSampleSeconds         = if ($Duration -le 60) { 3 } else { 4 }
+        PreviewMaxSamples            = 1
+        PreviewTop                   = 2
+        Finalists                    = 2
+        ShortlistArchetypes          = 5
+        MaxFullEncodes               = 2
+        MaxSecondStageActions        = 1
+        AllowChallenger              = $true
+        AllowNeighborFallback        = $true
+        AllowPresetExploration       = $false
+        NearTieDelta                 = 0.03
+        ChallengerConfidenceThreshold = 0.80
+        CloseEnoughRatio             = 0.992
+        EarlyAcceptRatio             = 0.992
+        BadUnderfillRatio            = 0.980
+      }
+    }
+
+    "ExtraQuality" {
+      return [PSCustomObject]@{
+        Mode                         = "ExtraQuality"
+        ProbeMaxSamples              = 4
+        ProbeEarlyStopSpreadThreshold = $null
+        PreviewMode                  = "broad"
+        PreviewSampleSeconds         = if ($Duration -le 60) { 4 } else { 5 }
+        PreviewMaxSamples            = 3
+        PreviewTop                   = 5
+        Finalists                    = 3
+        ShortlistArchetypes          = 9
+        MaxFullEncodes               = 4
+        MaxSecondStageActions        = 3
+        AllowChallenger              = $true
+        AllowNeighborFallback        = $true
+        AllowPresetExploration       = $true
+        NearTieDelta                 = 0.02
+        ChallengerConfidenceThreshold = 0.88
+        CloseEnoughRatio             = 0.994
+        EarlyAcceptRatio             = 0.998
+        BadUnderfillRatio            = 0.992
+      }
+    }
+  }
+}
+
+function Get-SpreadRatio {
+  param(
+    [Parameter(Mandatory = $true)]$Values
+  )
+
+  $list = @($Values | Where-Object { $null -ne $_ })
+  if ($list.Count -lt 2) { return 0.0 }
+
+  $sampleMin = ($list | Measure-Object -Minimum).Minimum
+  $sampleMax = ($list | Measure-Object -Maximum).Maximum
+  $sampleAvg = ($list | Measure-Object -Average).Average
+  return ([double]$sampleMax - [double]$sampleMin) / [double][math]::Max(1.0, $sampleAvg)
+}
+
+function Get-FpsTier {
+  param(
+    [Parameter(Mandatory = $true)][double]$SourceFps,
+    [Parameter(Mandatory = $true)][int]$TargetFps
+  )
+
+  $roundedSource = [int][math]::Round($SourceFps)
+  if ([math]::Abs($TargetFps - $roundedSource) -le 1) { return "source" }
+  if ($TargetFps -le 24) { return "24_or_lower" }
+  if ($TargetFps -le 30) { return "30" }
+  return "source"
+}
+
+function Get-WidthTier {
+  param(
+    [Parameter(Mandatory = $true)][double]$WidthRatio
+  )
+
+  if ($WidthRatio -gt 1.05) { return "aggressive" }
+  if ($WidthRatio -lt 0.95) { return "safe" }
+  return "near"
+}
+
+function Get-AudioTier {
+  param(
+    [Parameter(Mandatory = $true)]$AudioPlan
+  )
+
+  switch ($AudioPlan.Mode) {
+    "copy" { return "copy" }
+    "mute" { return "mute" }
+    default {
+      $kbps = [int](Get-ObjectPropertyValue -Object $AudioPlan -Name "Kbps" -DefaultValue 0)
+      if ($kbps -ge 128) { return "high" }
+      if ($kbps -ge 80) { return "mid" }
+      return "low"
+    }
   }
 }
 
@@ -830,82 +936,28 @@ function Get-AudioPlanCandidates {
   return $plans | Select-Object -Unique
 }
 
-function Get-ConstantQualityAudioPlan {
-  param(
-    [Parameter(Mandatory = $true)]$Info,
-    [Parameter(Mandatory = $true)]$CodecProfile,
-    [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][double]$Duration
-  )
-
-  if (-not $Info.HasAudio) {
-    return [PSCustomObject]@{
-      Mode           = "mute"
-      Kbps           = $null
-      Codec          = ""
-      Label          = "no audio"
-      EstimatedBytes = 0L
-      Rank           = 100
-    }
-  }
-
-  if ($Info.AudioCodec -in $CodecProfile.CopyableAudioCodecs) {
-    $estimatedBytes = if ($Info.AudioBitrateKbps) {
-      [long][math]::Floor(($Info.AudioBitrateKbps * 1000.0 / 8.0) * $Duration)
-    }
-    else {
-      0L
-    }
-
-    return [PSCustomObject]@{
-      Mode           = "copy"
-      Kbps           = $null
-      Codec          = $Info.AudioCodec
-      Label          = if ($Info.AudioBitrateKbps) { "copy original audio ($($Info.AudioBitrateKbps)k)" } else { "copy original audio" }
-      EstimatedBytes = $estimatedBytes
-      Rank           = 100
-    }
-  }
-
-  $targetKbps = switch ($Mode) {
-    "Fast"         { 64 }
-    "Balanced"     { 96 }
-    "ExtraQuality" { 128 }
-  }
-
-  if ($Info.AudioChannels -ge 6) {
-    $targetKbps = [math]::Max($targetKbps, 128)
-  }
-
-  $estimatedBytes = [long][math]::Floor(($targetKbps * 1000.0 / 8.0) * $Duration)
-  return [PSCustomObject]@{
-    Mode           = $CodecProfile.DefaultAudioCodec
-    Kbps           = $targetKbps
-    Codec          = $CodecProfile.DefaultAudioCodec
-    Label          = ("{0} {1}k" -f (Get-AudioCodecLabel -AudioCodec $CodecProfile.DefaultAudioCodec), $targetKbps)
-    EstimatedBytes = $estimatedBytes
-    Rank           = 90
-  }
-}
-
 function Get-SampleOffsets($duration, $sampleLength, $maxSamples) {
   if ($duration -le ($sampleLength + 2)) {
     return @(0.0)
   }
 
   $usableEnd = [math]::Max(0.0, $duration - $sampleLength - 0.5)
-  $fractions = switch ($maxSamples) {
-    1 { @(0.50) }
-    2 { @(0.30, 0.70) }
-    default { @(0.18, 0.50, 0.82) }
-  }
+  $fractions = @(
+    switch ($maxSamples) {
+      1 { 0.50 }
+      2 { 0.30; 0.70 }
+      3 { 0.18; 0.50; 0.82 }
+      4 { 0.12; 0.37; 0.63; 0.88 }
+      default { 0.18; 0.50; 0.82 }
+    }
+  )
 
-  $count = [math]::Min($fractions.Count, $maxSamples)
-  $offsets = foreach ($f in $fractions[0..($count - 1)]) {
+  $count = [math]::Min($fractions.Length, $maxSamples)
+  $offsets = foreach ($f in @($fractions[0..($count - 1)])) {
     [math]::Round($usableEnd * $f, 3)
   }
 
-  return $offsets | Select-Object -Unique
+  return @($offsets | Select-Object -Unique)
 }
 
 function Set-InfoPlanningContext {
@@ -930,6 +982,8 @@ function Set-InfoPlanningContext {
   $Info | Add-Member -NotePropertyName CropApplied -NotePropertyValue $cropApplied -Force
   $Info | Add-Member -NotePropertyName CropFilter -NotePropertyValue $cropFilter -Force
   $Info | Add-Member -NotePropertyName CropSummary -NotePropertyValue $cropSummary -Force
+  $Info | Add-Member -NotePropertyName CropAreaRemovedRatio -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $CropResult -Name "AreaRemovedRatio" -DefaultValue 0.0)) -Force
+  $Info | Add-Member -NotePropertyName CropSamples -NotePropertyValue @((Get-ObjectPropertyValue -Object $CropResult -Name "Samples" -DefaultValue @())) -Force
 
   return $Info
 }
@@ -1069,6 +1123,7 @@ function Invoke-CrfProbeSeries {
   )
   $results = New-Object System.Collections.Generic.List[object]
   $idx = 0
+  $strategy = Get-ModeStrategy -Mode $Mode -Duration $Info.Duration
 
   foreach ($offset in $Offsets) {
     $idx++
@@ -1095,17 +1150,9 @@ function Invoke-CrfProbeSeries {
         Kbps   = $kbps
       })
 
-    if ($results.Count -ge 2 -and $Mode -in @("Fast", "Balanced")) {
-      $sampleMin = ($results | Measure-Object -Property Kbps -Minimum).Minimum
-      $sampleMax = ($results | Measure-Object -Property Kbps -Maximum).Maximum
-      $sampleAvg = ($results | Measure-Object -Property Kbps -Average).Average
-      $spreadRatio = ([double]$sampleMax - [double]$sampleMin) / [double][math]::Max(1.0, $sampleAvg)
-      $spreadThreshold = switch ($Mode) {
-        "Fast"     { 0.14 }
-        "Balanced" { 0.09 }
-      }
-
-      if ($spreadRatio -le $spreadThreshold) {
+    if ($results.Count -ge 2 -and $null -ne $strategy.ProbeEarlyStopSpreadThreshold) {
+      $spreadRatio = Get-SpreadRatio -Values ($results | ForEach-Object { $_.Kbps })
+      if ($spreadRatio -le [double]$strategy.ProbeEarlyStopSpreadThreshold) {
         Remove-Item $outPath -Force -ErrorAction SilentlyContinue
         break
       }
@@ -1236,8 +1283,13 @@ function Invoke-ComplexityProbe {
     [Parameter(Mandatory = $true)][string]$TempDir,
     [Parameter(Mandatory = $true)][string]$Mode,
     [int]$SampleSeconds = 6,
-    [int]$MaxSamples = 3
+    [int]$MaxSamples = 0
   )
+
+  $strategy = Get-ModeStrategy -Mode $Mode -Duration $Info.Duration
+  if ($MaxSamples -le 0) {
+    $MaxSamples = [int]$strategy.ProbeMaxSamples
+  }
 
   $planningWidth = Get-PlanningWidth -Info $Info
   $detailProbeWidth = if ($planningWidth -ge 1280) { 480 } elseif ($planningWidth -ge 854) { 426 } else { [math]::Min($planningWidth, 360) }
@@ -1321,6 +1373,9 @@ function Invoke-ComplexityProbe {
     MotionBucket      = $motionBucket
     MotionRatio       = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $motionRatio)), [Globalization.CultureInfo]::InvariantCulture)
     MotionNormalized  = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $motionNormalized)), [Globalization.CultureInfo]::InvariantCulture)
+    DetailSpreadRatio = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", (Get-SpreadRatio -Values ($detailProbe.Samples | ForEach-Object { $_.Kbps })))), [Globalization.CultureInfo]::InvariantCulture)
+    MotionSpreadRatio = [double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", (Get-SpreadRatio -Values ($motionProbe.Samples | ForEach-Object { $_.Kbps })))), [Globalization.CultureInfo]::InvariantCulture)
+    ProbeSamplesUsed  = [int]$detailProbe.Samples.Count
     Samples           = $detailProbe.Samples
   }
 }
@@ -1528,7 +1583,6 @@ function New-EncodePlan {
     [Parameter(Mandatory = $true)]$Probe,
     [Parameter(Mandatory = $true)]$CodecProfile,
     [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$RateControl,
     [Parameter(Mandatory = $true)][long]$TargetBytes,
     [Parameter(Mandatory = $true)][string]$Preset,
     [Parameter(Mandatory = $true)][int]$Width,
@@ -1574,6 +1628,9 @@ function New-EncodePlan {
   $videoPrivateArgs = if ($CodecProfile.VideoCodec -eq "x264") { Get-AutoX264Params -mode $Mode -totalBudgetKbps $totalBudgetKbps } else { "" }
   $preprocessLabel = if ($UseDenoise) { "mild-denoise" } else { "none" }
   $crf = Get-RateControlSeedCrf -VideoCodec $CodecProfile.VideoCodec -Mode $Mode
+  $fpsTier = Get-FpsTier -SourceFps $Info.Fps -TargetFps $Fps
+  $widthTier = Get-WidthTier -WidthRatio $widthRatio
+  $audioTier = Get-AudioTier -AudioPlan $AudioPlan
 
   $score = switch ($Mode) {
     "Fast" {
@@ -1600,7 +1657,6 @@ function New-EncodePlan {
     TargetBytes = $TargetBytes
     Preset      = $Preset
     Mode        = $Mode
-    RateControl = $RateControl
     CodecProfile = $CodecProfile
     OutputExtension = $CodecProfile.Extension
     Bpppf       = $bpppf
@@ -1613,66 +1669,18 @@ function New-EncodePlan {
     Score       = $score
     TotalBudgetKbps = $totalBudgetKbps
     WidthOrigin = $WidthOrigin
+    FpsTier     = $fpsTier
+    WidthTier   = $widthTier
+    AudioTier   = $audioTier
+    PreprocessTier = $preprocessLabel
+    ArchetypeKey = ("{0}|{1}|{2}|{3}" -f $fpsTier, $widthTier, $audioTier, $preprocessLabel)
+    PredictedTotalBytes = [long]$TargetBytes
+    PredictedFillRatio  = 1.0
     ResolutionBiasLabel = $resolutionProfile.BiasLabel
     PreprocessLabel = $preprocessLabel
     UseDenoise = [bool]$UseDenoise
     CropApplied = [bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)
     CropSummary = Get-CropSummary -Info $Info
-    VideoPrivateArgs = $videoPrivateArgs
-  }
-}
-
-function New-SourcePreserveConstantQualityPlan {
-  param(
-    [Parameter(Mandatory = $true)]$Info,
-    [Parameter(Mandatory = $true)]$Probe,
-    [Parameter(Mandatory = $true)]$CodecProfile,
-    [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$Preset,
-    [Parameter(Mandatory = $true)]$AudioPlan,
-    [Parameter(Mandatory = $true)][string]$PreprocessProfile
-  )
-
-  $planningWidth = Get-PlanningWidth -Info $Info
-  $planningHeight = Get-PlanningHeight -Info $Info
-  $roundedSourceFps = [int][math]::Max(1, [math]::Round($Info.Fps))
-  $useDenoise = ($PreprocessProfile -eq "Mild")
-  $vf = Build-Vf -Info $Info -TargetWidth $planningWidth -TargetFps $roundedSourceFps -UseDenoise:$useDenoise
-  $crf = Get-RateControlSeedCrf -VideoCodec $CodecProfile.VideoCodec -Mode $Mode
-  $videoPrivateArgs = if ($CodecProfile.VideoCodec -eq "x264") { Get-AutoX264Params -mode $Mode -totalBudgetKbps ([double][math]::Max(0, $Info.VideoBitrateKbps)) } else { "" }
-  $resolutionProfile = Get-ResolutionPlanningProfile -Info $Info -Probe $Probe -Mode $Mode
-
-  return [PSCustomObject]@{
-    Width            = $planningWidth
-    Height           = $planningHeight
-    Fps              = $roundedSourceFps
-    VFilter          = $vf
-    VideoKbps        = if ($Info.VideoBitrateKbps) { [int]$Info.VideoBitrateKbps } else { 0 }
-    EffectiveVideoKbps = if ($Info.VideoBitrateKbps) { [double]$Info.VideoBitrateKbps } else { 0.0 }
-    Crf              = $crf
-    AudioPlan        = $AudioPlan
-    AudioCodec       = if ($AudioPlan.Codec) { $AudioPlan.Codec } else { $CodecProfile.DefaultAudioCodec }
-    TargetBytes      = 0L
-    Preset           = $Preset
-    Mode             = $Mode
-    RateControl      = "ConstantQuality"
-    CodecProfile     = $CodecProfile
-    OutputExtension  = $CodecProfile.Extension
-    Bpppf            = 0.0
-    TargetBpppf      = 0.0
-    ExpectedWidth    = $planningWidth
-    WidthRatio       = 1.0
-    DetailBucket     = $Probe.DetailBucket
-    MotionBucket     = $Probe.MotionBucket
-    DurationSeconds  = $Info.Duration
-    Score            = 1
-    TotalBudgetKbps  = if ($Info.VideoBitrateKbps) { [double]$Info.VideoBitrateKbps } else { 0.0 }
-    WidthOrigin      = "source"
-    ResolutionBiasLabel = $resolutionProfile.BiasLabel
-    PreprocessLabel  = if ($useDenoise) { "mild-denoise" } else { "none" }
-    UseDenoise       = [bool]$useDenoise
-    CropApplied      = [bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)
-    CropSummary      = Get-CropSummary -Info $Info
     VideoPrivateArgs = $videoPrivateArgs
   }
 }
@@ -1745,25 +1753,11 @@ function Get-CommonVideoEncodeArgs {
   $videoRate = ("{0}k" -f $Plan.VideoKbps)
   $bufSize = ("{0}k" -f ([int][math]::Max($Plan.VideoKbps * 2, 100)))
 
-  switch ($Plan.RateControl) {
-    "ExactSize" {
-      if ($Plan.CodecProfile.VideoCodec -eq "av1") {
-        $args += @("-b:v", $videoRate)
-      }
-      else {
-        $args += @("-b:v", $videoRate, "-maxrate", $videoRate, "-bufsize", $bufSize)
-      }
-    }
-    "QualityCap" {
-      $args += @("-crf", "$($Plan.Crf)")
-      $args += @("-maxrate", $videoRate, "-bufsize", $bufSize)
-    }
-    "ConstantQuality" {
-      $args += @("-crf", "$($Plan.Crf)")
-    }
-    default {
-      throw "Unknown rate control: $($Plan.RateControl)"
-    }
+  if ($Plan.CodecProfile.VideoCodec -eq "av1") {
+    $args += @("-b:v", $videoRate)
+  }
+  else {
+    $args += @("-b:v", $videoRate, "-maxrate", $videoRate, "-bufsize", $bufSize)
   }
 
   if ($Plan.CodecProfile.VideoCodec -eq "x264" -and -not [string]::IsNullOrWhiteSpace($Plan.VideoPrivateArgs)) {
@@ -1779,10 +1773,6 @@ function Invoke-EncodePassOne {
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)][string]$PassLogPath
   )
-
-  if ($Plan.RateControl -ne "ExactSize") {
-    throw "Pass-one encoding is only valid for ExactSize plans."
-  }
 
   $commonVideo = Get-CommonVideoEncodeArgs -Plan $Plan
   $pass1 = @("-y", "-i", $InputPath) + $commonVideo + @("-pass", "1", "-passlogfile", $PassLogPath, "-an", "-f", "null", "NUL")
@@ -1865,36 +1855,15 @@ function Test-IsBetterPlanAttempt {
 }
 
 function Get-PreviewStrategyForMode($mode, $duration) {
-  switch ($mode) {
-    "Fast" {
-      return [PSCustomObject]@{
-        Enabled       = $false
-        SampleSeconds = 0
-        MaxSamples    = 0
-        PreviewPreset = ""
-        Finalists     = 0
-      }
-    }
-
-    "Balanced" {
-      return [PSCustomObject]@{
-        Enabled       = $true
-        SampleSeconds = if ($duration -le 45) { 4 } else { 5 }
-        MaxSamples    = 2
-        PreviewPreset = "veryfast"
-        Finalists     = 2
-      }
-    }
-
-    "ExtraQuality" {
-      return [PSCustomObject]@{
-        Enabled       = $true
-        SampleSeconds = if ($duration -le 45) { 4 } else { 5 }
-        MaxSamples    = 2
-        PreviewPreset = "veryfast"
-        Finalists     = if ($duration -ge 60) { 2 } else { 3 }
-      }
-    }
+  $strategy = Get-ModeStrategy -Mode $mode -Duration $duration
+  return [PSCustomObject]@{
+    Enabled       = ($strategy.PreviewMode -ne "none")
+    Mode          = $strategy.PreviewMode
+    SampleSeconds = [int]$strategy.PreviewSampleSeconds
+    MaxSamples    = [int]$strategy.PreviewMaxSamples
+    PreviewTop    = [int](Get-ObjectPropertyValue -Object $strategy -Name "PreviewTop" -DefaultValue $strategy.Finalists)
+    PreviewPreset = "auto"
+    Finalists     = [int]$strategy.Finalists
   }
 }
 
@@ -1934,7 +1903,7 @@ function Get-PlanKey($Plan) {
     default { [string]$Plan.AudioPlan.Mode }
   }
 
-  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|rc={8}|codec={9}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.RateControl, $Plan.CodecProfile.VideoCodec)
+  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|codec={8}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.CodecProfile.VideoCodec)
 }
 
 function Get-TopResultsByPreference {
@@ -1969,19 +1938,11 @@ function Get-TopResultsByPreference {
 }
 
 function Get-CloseEnoughRatioForMode($mode) {
-  switch ($mode) {
-    "Fast"         { return 0.985 }
-    "Balanced"     { return 0.992 }
-    "ExtraQuality" { return 0.994 }
-  }
+  return [double](Get-ModeStrategy -Mode $mode).CloseEnoughRatio
 }
 
 function Get-EarlyAcceptRatioForMode($mode) {
-  switch ($mode) {
-    "Fast"         { return 0.985 }
-    "Balanced"     { return 0.992 }
-    "ExtraQuality" { return 0.998 }
-  }
+  return [double](Get-ModeStrategy -Mode $mode).EarlyAcceptRatio
 }
 
 function Set-PlanPreviewMetadata {
@@ -2081,50 +2042,6 @@ function Get-NextVideoKbpsGuess {
   return [int][math]::Max($minRate, $nextGuess)
 }
 
-function Get-NextCrfGuess {
-  param(
-    [Parameter(Mandatory = $true)][double]$CurrentCrf,
-    [Parameter(Mandatory = $true)][long]$TargetBytes,
-    [Parameter(Mandatory = $true)][long]$CurrentSizeBytes,
-    [Parameter(Mandatory = $true)]$Bounds,
-    $BestUnder,
-    $BestOver
-  )
-
-  $step = [double]$Bounds.Step
-
-  if ($BestUnder -and $BestOver) {
-    $gap = [double]$BestUnder.Crf - [double]$BestOver.Crf
-    if ($gap -le $step) { return $null }
-
-    $guess = [double]$BestOver.Crf + ($gap / 2.0)
-    $guess = [double]([math]::Round($guess / $step) * $step)
-
-    if ($guess -le [double]$BestOver.Crf) { $guess = [double]$BestOver.Crf + $step }
-    if ($guess -ge [double]$BestUnder.Crf) { $guess = [double]$BestUnder.Crf - $step }
-
-    if ($guess -lt [double]$Bounds.Min -or $guess -gt [double]$Bounds.Max) {
-      return $null
-    }
-
-    return $guess
-  }
-
-  if ($CurrentSizeBytes -le $TargetBytes) {
-    $fillRatio = [double]$CurrentSizeBytes / [double][math]::Max(1L, $TargetBytes)
-    $jumpSteps = if ($fillRatio -lt 0.25) { 8.0 } elseif ($fillRatio -lt 0.50) { 6.0 } elseif ($fillRatio -lt 0.75) { 4.0 } elseif ($fillRatio -lt 0.90) { 2.0 } else { 1.0 }
-    $next = $CurrentCrf - ($step * $jumpSteps)
-    if ($next -lt [double]$Bounds.Min) { return $null }
-    return $next
-  }
-
-  $overshootRatio = [double]$CurrentSizeBytes / [double][math]::Max(1L, $TargetBytes)
-  $jumpSteps = if ($overshootRatio -gt 1.50) { 4.0 } elseif ($overshootRatio -gt 1.20) { 2.0 } else { 1.0 }
-  $next = $CurrentCrf + ($step * $jumpSteps)
-  if ($next -gt [double]$Bounds.Max) { return $null }
-  return $next
-}
-
 function Get-PlanAttemptOutputPath {
   param(
     [Parameter(Mandatory = $true)]$Plan,
@@ -2147,12 +2064,15 @@ function Get-PlanPreviewResult {
     [Parameter(Mandatory = $true)][int]$MaxSamples
   )
 
-  $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
-  if (-not $offsets -or $offsets.Count -eq 0) {
+  $offsets = @(
+    Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
+  )
+  if (-not $offsets -or $offsets.Length -eq 0) {
     return $null
   }
 
-  $segmentBytes = New-Object System.Collections.Generic.List[double]
+  $strategy = Get-ModeStrategy -Mode $Plan.Mode -Duration $Info.Duration
+  $segmentBytes = @()
   $idx = 0
   $commonVideo = Get-CommonVideoEncodeArgs -Plan $Plan -Preview
 
@@ -2163,12 +2083,23 @@ function Get-PlanPreviewResult {
     $args += @("-an") + $commonVideo + @($outPath)
 
     [void](Invoke-Tool -Exe "ffmpeg" -Args $args)
-    $segmentBytes.Add([double](Get-Item $outPath).Length)
+    $segmentBytes += [double](Get-Item $outPath).Length
     Remove-Item $outPath -Force -ErrorAction SilentlyContinue
   }
 
+  if ($segmentBytes.Length -eq 0) {
+    return $null
+  }
+
   $avgSegmentBytes = ($segmentBytes | Measure-Object -Average).Average
-  $predictedVideoBytes = [double]$avgSegmentBytes * ([double]$Info.Duration / [double]$SampleSeconds)
+  $maxSegmentBytes = ($segmentBytes | Measure-Object -Maximum).Maximum
+  $weightedSegmentBytes = if ($strategy.Mode -eq "ExtraQuality") {
+    [double]$avgSegmentBytes + (([double]$maxSegmentBytes - [double]$avgSegmentBytes) * 0.35)
+  }
+  else {
+    [double]$avgSegmentBytes
+  }
+  $predictedVideoBytes = [double]$weightedSegmentBytes * ([double]$Info.Duration / [double]$SampleSeconds)
   $predictedTotalBytes = [long][math]::Floor($predictedVideoBytes + [double]$Plan.AudioPlan.EstimatedBytes + [double](Get-MuxReserveBytes -targetBytes $Plan.TargetBytes -mode $Plan.Mode))
   $predictedRatio = $predictedTotalBytes / [double]$Plan.TargetBytes
 
@@ -2176,6 +2107,9 @@ function Get-PlanPreviewResult {
     Success    = ($predictedTotalBytes -gt 0)
     SizeBytes  = $predictedTotalBytes
     VideoBytes = [long][math]::Floor($predictedVideoBytes)
+    MeanSegmentBytes = [long][math]::Floor($avgSegmentBytes)
+    MaxSegmentBytes  = [long][math]::Floor($maxSegmentBytes)
+    SampleCount = [int]$segmentBytes.Length
     Path       = $null
     Plan       = $Plan.PSObject.Copy()
     Ratio      = $predictedRatio
@@ -2191,363 +2125,504 @@ function Get-PlanFinalists {
     [Parameter(Mandatory = $true)][string]$Mode
   )
 
+  $modeStrategy = Get-ModeStrategy -Mode $Mode -Duration $Info.Duration
   $strategy = Get-PreviewStrategyForMode -mode $Mode -duration $Info.Duration
   $candidatePlans = @($Plans)
-
-  if (($candidatePlans | Where-Object { $_.RateControl -eq "ConstantQuality" }) -or -not $strategy.Enabled -or $candidatePlans.Count -le $strategy.Finalists) {
-    return @(Set-PlanPreviewMetadata -Plans $candidatePlans)
-  }
-
   $previewResults = New-Object System.Collections.Generic.List[object]
-  $previewed = 0
-  foreach ($plan in $candidatePlans) {
-    $previewed++
-    Write-Host ("Previewing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | width={7} | pp={8} | preview={9}" -f $previewed, $candidatePlans.Count, $plan.Width, $plan.Height, $plan.Fps, $plan.VideoKbps, $plan.AudioPlan.Label, $plan.WidthOrigin, $plan.PreprocessLabel, $plan.CodecProfile.PreviewSpeedOverride.Label)
-    $preview = Get-PlanPreviewResult `
-      -Info $Info `
-      -InputPath $InputPath `
-      -TempDir $TempDir `
-      -Plan $plan `
-      -SampleSeconds $strategy.SampleSeconds `
-      -MaxSamples $strategy.MaxSamples
+  $previewsRun = 0
 
-    if ($preview -and $preview.Success) {
-      [void]$previewResults.Add($preview)
+  switch ($Mode) {
+    "Fast" {
+      $primary = @($candidatePlans | Select-Object -First 1)[0]
+      $backup = Get-MeaningfulAlternativePlan -Primary $primary -Plans $candidatePlans
+      $selectedPlans = @($primary) + @($backup | Where-Object { $null -ne $_ })
+      $ranked = @(Set-PlanPreviewMetadata -Plans $selectedPlans)
+      return [PSCustomObject]@{
+        Plans       = $ranked
+        PreviewsRun = 0
+      }
+    }
+
+    "Balanced" {
+      $primary = @($candidatePlans | Select-Object -First 1)[0]
+      $selectedPlans = New-Object System.Collections.Generic.List[object]
+      [void]$selectedPlans.Add($primary)
+
+      $shouldChallenge = (
+        [double](Get-ObjectPropertyValue -Object $primary -Name "Confidence" -DefaultValue 1.0) -lt [double]$modeStrategy.ChallengerConfidenceThreshold -or
+        @((Get-ObjectPropertyValue -Object $primary -Name "RiskFlags" -DefaultValue @())).Count -ge 2
+      )
+
+      if ($shouldChallenge) {
+        $challenger = Get-MeaningfulAlternativePlan -Primary $primary -Plans $candidatePlans
+        if ($challenger) {
+          [void]$selectedPlans.Add($challenger)
+
+          $scoreGap = Get-RelativeScoreGap -PrimaryScore $primary.Score -SecondaryScore $challenger.Score
+          if ($scoreGap -le [double]$modeStrategy.NearTieDelta) {
+            foreach ($plan in @($primary, $challenger)) {
+              $previewsRun++
+              Write-Host ("Previewing plan {0}/2: {1}x{2} @{3}fps | v={4}k | a={5} | width={6} | pp={7}" -f $previewsRun, $plan.Width, $plan.Height, $plan.Fps, $plan.VideoKbps, $plan.AudioPlan.Label, $plan.WidthOrigin, $plan.PreprocessLabel)
+              $preview = Get-PlanPreviewResult `
+                -Info $Info `
+                -InputPath $InputPath `
+                -TempDir $TempDir `
+                -Plan $plan `
+                -SampleSeconds $strategy.SampleSeconds `
+                -MaxSamples $strategy.MaxSamples
+
+              if ($preview -and $preview.Success) {
+                [void]$previewResults.Add($preview)
+              }
+            }
+
+            if ($previewResults.Count -gt 0) {
+              $topPreview = Get-TopResultsByPreference -Results $previewResults -Count $selectedPlans.Count
+              $previewSelected = New-Object System.Collections.Generic.List[object]
+              $previewRank = 0
+              foreach ($preview in $topPreview) {
+                $previewRank++
+                $selectedPlan = $preview.Plan.PSObject.Copy()
+                $selectedPlan | Add-Member -NotePropertyName PreviewRank -NotePropertyValue $previewRank -Force
+                $selectedPlan | Add-Member -NotePropertyName PreviewRatio -NotePropertyValue ([double]$preview.Ratio) -Force
+                $selectedPlan | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long]$preview.SizeBytes) -Force
+                $selectedPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$preview.Ratio) -Force
+                [void]$previewSelected.Add($selectedPlan)
+              }
+
+              return [PSCustomObject]@{
+                Plans       = @($previewSelected.ToArray())
+                PreviewsRun = $previewsRun
+              }
+            }
+          }
+        }
+      }
+
+      return [PSCustomObject]@{
+        Plans       = @(Set-PlanPreviewMetadata -Plans @($selectedPlans.ToArray()))
+        PreviewsRun = $previewsRun
+      }
+    }
+
+    default {
+      $previewCandidates = @($candidatePlans | Select-Object -First $strategy.PreviewTop)
+      foreach ($plan in $previewCandidates) {
+        $previewsRun++
+        Write-Host ("Previewing plan {0}/{1}: {2}x{3} @{4}fps | v={5}k | a={6} | width={7} | pp={8}" -f $previewsRun, $previewCandidates.Count, $plan.Width, $plan.Height, $plan.Fps, $plan.VideoKbps, $plan.AudioPlan.Label, $plan.WidthOrigin, $plan.PreprocessLabel)
+        $preview = Get-PlanPreviewResult `
+          -Info $Info `
+          -InputPath $InputPath `
+          -TempDir $TempDir `
+          -Plan $plan `
+          -SampleSeconds $strategy.SampleSeconds `
+          -MaxSamples $strategy.MaxSamples
+
+        if ($preview -and $preview.Success) {
+          [void]$previewResults.Add($preview)
+        }
+      }
+
+      if ($previewResults.Count -eq 0) {
+        return [PSCustomObject]@{
+          Plans       = @(Set-PlanPreviewMetadata -Plans @($candidatePlans | Select-Object -First $strategy.Finalists))
+          PreviewsRun = $previewsRun
+        }
+      }
+
+      $topPreview = Get-TopResultsByPreference -Results $previewResults -Count $strategy.Finalists
+      $selectedPlans = New-Object System.Collections.Generic.List[object]
+      $seenKeys = New-Object System.Collections.Generic.HashSet[string]
+      $previewRank = 0
+
+      foreach ($preview in $topPreview) {
+        $key = Get-PlanKey -Plan $preview.Plan
+        if ($seenKeys.Add($key)) {
+          $previewRank++
+          $selectedPlan = $preview.Plan.PSObject.Copy()
+          $selectedPlan.VideoKbps = Get-PreviewSeedVideoKbps -Plan $selectedPlan -Preview $preview
+          $selectedPlan | Add-Member -NotePropertyName PreviewRank -NotePropertyValue $previewRank -Force
+          $selectedPlan | Add-Member -NotePropertyName PreviewRatio -NotePropertyValue ([double]$preview.Ratio) -Force
+          $selectedPlan | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long]$preview.SizeBytes) -Force
+          $selectedPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$preview.Ratio) -Force
+          [void]$selectedPlans.Add($selectedPlan)
+        }
+      }
+
+      $selectedSummary = $selectedPlans | ForEach-Object {
+        "{0}x{1}@{2} ({3}, {4})" -f $_.Width, $_.Height, $_.Fps, $_.WidthOrigin, $_.PreprocessLabel
+      }
+      Write-Host ("Finalists:        {0}" -f ($selectedSummary -join ", "))
+
+      return [PSCustomObject]@{
+        Plans       = @($selectedPlans.ToArray())
+        PreviewsRun = $previewsRun
+      }
     }
   }
-
-  if ($previewResults.Count -eq 0) {
-    return $candidatePlans
-  }
-
-  $topPreview = Get-TopResultsByPreference -Results $previewResults -Count $strategy.Finalists
-  $selectedPlans = New-Object System.Collections.Generic.List[object]
-  $seenKeys = New-Object System.Collections.Generic.HashSet[string]
-  $previewRank = 0
-
-  foreach ($preview in $topPreview) {
-    $key = Get-PlanKey -Plan $preview.Plan
-    if ($seenKeys.Add($key)) {
-      $previewRank++
-      $selectedPlan = $preview.Plan.PSObject.Copy()
-      $selectedPlan.VideoKbps = Get-PreviewSeedVideoKbps -Plan $selectedPlan -Preview $preview
-      $selectedPlan | Add-Member -NotePropertyName PreviewRank -NotePropertyValue $previewRank -Force
-      $selectedPlan | Add-Member -NotePropertyName PreviewRatio -NotePropertyValue ([double]$preview.Ratio) -Force
-      [void]$selectedPlans.Add($selectedPlan)
-    }
-  }
-
-  $selectedSummary = $selectedPlans | ForEach-Object {
-    "{0}x{1}@{2} ({3}, {4})" -f $_.Width, $_.Height, $_.Fps, $_.WidthOrigin, $_.PreprocessLabel
-  }
-  Write-Host ("Finalists:        {0}" -f ($selectedSummary -join ", "))
-
-  return @($selectedPlans.ToArray())
 }
 
-function Try-PlanWithAdjustments {
+function Get-AudioPlanIdentity {
+  param(
+    [Parameter(Mandatory = $true)]$AudioPlan
+  )
+
+  return ("{0}|{1}|{2}" -f $AudioPlan.Mode, (Get-ObjectPropertyValue -Object $AudioPlan -Name "Kbps" -DefaultValue ""), $AudioPlan.EstimatedBytes)
+}
+
+function Initialize-PlanPassLog {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)][string]$TempDir
+  )
+
+  if ($Plan.Mode -eq "Fast") { return $null }
+
+  $passLogPath = Join-Path $TempDir ("ffpass_shared_{0}" -f ([guid]::NewGuid().ToString("N")))
+  Invoke-EncodePassOne -InputPath $InputPath -Plan $Plan -PassLogPath $passLogPath
+  return $passLogPath
+}
+
+function Invoke-PlanAttempt {
   param(
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)][string]$TempDir,
-    [Parameter(Mandatory = $true)]$AllAudioPlans
+    [Parameter(Mandatory = $true)][int]$Attempt,
+    [string]$PassLogPath = ""
   )
 
-  $workingPlan = $Plan.PSObject.Copy()
-  switch ($workingPlan.RateControl) {
-    "ConstantQuality" {
-      $tempOut = Get-PlanAttemptOutputPath -Plan $workingPlan -TempDir $TempDir -Attempt 1
-      $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass:$false
-      $ratio = if ($workingPlan.TargetBytes -gt 0) { $size / [double]$workingPlan.TargetBytes } else { 0.0 }
+  $tempOut = Get-PlanAttemptOutputPath -Plan $Plan -TempDir $TempDir -Attempt $Attempt
+  $twoPass = ($Plan.Mode -ne "Fast")
+  $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $Plan -TempDir $TempDir -TwoPass $twoPass -PassLogPath $PassLogPath
+  $ratio = $size / [double]$Plan.TargetBytes
+  $predictedTotalBytes = [long](Get-ObjectPropertyValue -Object $Plan -Name "PredictedTotalBytes" -DefaultValue $Plan.TargetBytes)
+  $predictionBias = if ($predictedTotalBytes -gt 0) { [double]$size / [double]$predictedTotalBytes } else { $ratio }
 
-      Write-Host ("Plan try 1: {0}x{1} @{2}fps | crf={3} | a={4} | size={5} bytes{6}" -f $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.Crf, $workingPlan.AudioPlan.Label, $size, $(if ($workingPlan.TargetBytes -gt 0) { " ({0:P1})" -f $ratio } else { "" }))
+  Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $Attempt, $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $Plan.AudioPlan.Label, $size, $ratio)
 
-      return [PSCustomObject]@{
-        Success   = $true
-        SizeBytes = $size
-        Path      = $tempOut
-        Plan      = $workingPlan.PSObject.Copy()
-        Ratio     = $ratio
-      }
+  if ($size -gt $Plan.TargetBytes) {
+    if ($tempOut -and (Test-Path $tempOut)) {
+      Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
     }
+  }
 
-    "QualityCap" {
-      $tries = switch ($workingPlan.Mode) {
-        "Fast"         { 6 }
-        "Balanced"     { 8 }
-        "ExtraQuality" { 10 }
-      }
-
-      $bounds = Get-CrfBounds -VideoCodec $workingPlan.CodecProfile.VideoCodec
-      $bestUnderResult = $null
-      $underBound = $null
-      $overBound = $null
-      $seenCrfs = New-Object System.Collections.Generic.HashSet[string]
-
-      for ($i = 1; $i -le $tries; $i++) {
-        $crfKey = ("{0:F3}" -f [double]$workingPlan.Crf)
-        if (-not $seenCrfs.Add($crfKey)) {
-          break
-        }
-
-        $tempOut = Get-PlanAttemptOutputPath -Plan $workingPlan -TempDir $TempDir -Attempt $i
-        $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass:$false
-        $ratio = $size / [double]$workingPlan.TargetBytes
-
-        Write-Host ("Plan try {0}: {1}x{2} @{3}fps | crf={4} | cap={5}k | a={6} | size={7} bytes ({8:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.Crf, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
-
-        if ($size -le $workingPlan.TargetBytes) {
-          $candidate = [PSCustomObject]@{
-            Success   = $true
-            SizeBytes = $size
-            Path      = $tempOut
-            Plan      = $workingPlan.PSObject.Copy()
-            Ratio     = $ratio
-          }
-
-          if (Test-IsBetterPlanAttempt -Candidate $candidate -Current $bestUnderResult) {
-            if ($bestUnderResult -and $bestUnderResult.Path -and (Test-Path $bestUnderResult.Path)) {
-              Remove-Item $bestUnderResult.Path -Force -ErrorAction SilentlyContinue
-            }
-            $bestUnderResult = $candidate
-          }
-          else {
-            Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-          }
-
-          if (($null -eq $underBound) -or ([double]$workingPlan.Crf -lt [double]$underBound.Crf)) {
-            $underBound = [PSCustomObject]@{
-              Crf       = [double]$workingPlan.Crf
-              SizeBytes = [long]$size
-            }
-          }
-
-          if ($ratio -ge (Get-CloseEnoughRatioForMode -mode $workingPlan.Mode)) {
-            break
-          }
-        }
-        else {
-          if ($tempOut -and (Test-Path $tempOut)) {
-            Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-          }
-
-          if (($null -eq $overBound) -or ([double]$workingPlan.Crf -gt [double]$overBound.Crf)) {
-            $overBound = [PSCustomObject]@{
-              Crf       = [double]$workingPlan.Crf
-              SizeBytes = [long]$size
-            }
-          }
-        }
-
-        if ($i -ge $tries) { break }
-
-        $nextCrf = Get-NextCrfGuess `
-          -CurrentCrf ([double]$workingPlan.Crf) `
-          -TargetBytes $workingPlan.TargetBytes `
-          -CurrentSizeBytes $size `
-          -Bounds $bounds `
-          -BestUnder $underBound `
-          -BestOver $overBound
-
-        if ($null -eq $nextCrf) {
-          break
-        }
-
-        if ($nextCrf -lt [double]$bounds.Min -or $nextCrf -gt [double]$bounds.Max) {
-          break
-        }
-
-        $workingPlan.Crf = $nextCrf
-      }
-
-      if ($bestUnderResult) {
-        return $bestUnderResult
-      }
-
-      return [PSCustomObject]@{
-        Success   = $false
-        SizeBytes = 0
-        Path      = $null
-        Plan      = $workingPlan
-        Ratio     = 0.0
-      }
-    }
-
-    default {
-      $twoPass = ($workingPlan.RateControl -eq "ExactSize" -and $workingPlan.Mode -ne "Fast")
-      $tries = switch ($workingPlan.Mode) {
-        "Fast"         { 2 }
-        "Balanced"     { 5 }
-        "ExtraQuality" { 7 }
-      }
-
-      $bestUnder = $null
-      $lowerBound = $null
-      $upperBound = $null
-      $seenRates = New-Object System.Collections.Generic.HashSet[int]
-      $closeEnoughRatio = Get-CloseEnoughRatioForMode -mode $workingPlan.Mode
-      $sharedPassLog = $null
-
-      try {
-        if ($twoPass) {
-          $sharedPassLog = Join-Path $TempDir ("ffpass_shared_{0}" -f ([guid]::NewGuid().ToString("N")))
-          Invoke-EncodePassOne -InputPath $InputPath -Plan $workingPlan -PassLogPath $sharedPassLog
-        }
-
-        for ($i = 1; $i -le $tries; $i++) {
-          if (-not $seenRates.Add([int]$workingPlan.VideoKbps)) {
-            break
-          }
-
-          $tempOut = Get-PlanAttemptOutputPath -Plan $workingPlan -TempDir $TempDir -Attempt $i
-          $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $workingPlan -TempDir $TempDir -TwoPass $twoPass -PassLogPath $sharedPassLog
-
-          $ratio = $size / [double]$workingPlan.TargetBytes
-          Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $i, $workingPlan.Width, $workingPlan.Height, $workingPlan.Fps, $workingPlan.VideoKbps, $workingPlan.AudioPlan.Label, $size, $ratio)
-
-          if ($size -le $workingPlan.TargetBytes) {
-            $candidate = [PSCustomObject]@{
-              Success   = $true
-              SizeBytes = $size
-              Path      = $tempOut
-              Plan      = $workingPlan.PSObject.Copy()
-              Ratio     = $ratio
-            }
-
-            if (Test-IsBetterPlanAttempt -Candidate $candidate -Current $bestUnder) {
-              if ($bestUnder -and $bestUnder.Path -and (Test-Path $bestUnder.Path)) {
-                Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
-              }
-              $bestUnder = $candidate
-            }
-            else {
-              Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-            }
-
-            if (($null -eq $lowerBound) -or ($size -gt $lowerBound.SizeBytes)) {
-              $lowerBound = [PSCustomObject]@{
-                VideoKbps = [int]$workingPlan.VideoKbps
-                SizeBytes = [long]$size
-              }
-            }
-
-            $isCloseEnough = ($ratio -ge $closeEnoughRatio)
-            $isBracketTight = ($lowerBound -and $upperBound -and (([int]$upperBound.VideoKbps - [int]$lowerBound.VideoKbps) -le 8))
-
-            if ($isCloseEnough -or $isBracketTight) {
-              break
-            }
-          }
-          else {
-            if ($tempOut -and (Test-Path $tempOut)) {
-              Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
-            }
-
-            if (($null -eq $upperBound) -or ($size -lt $upperBound.SizeBytes)) {
-              $upperBound = [PSCustomObject]@{
-                VideoKbps = [int]$workingPlan.VideoKbps
-                SizeBytes = [long]$size
-              }
-            }
-          }
-
-          if ($i -ge $tries) { break }
-
-          $newRate = Get-NextVideoKbpsGuess `
-            -Mode $workingPlan.Mode `
-            -TargetBytes $workingPlan.TargetBytes `
-            -CurrentVideoKbps $workingPlan.VideoKbps `
-            -CurrentSizeBytes $size `
-            -LowerBound $lowerBound `
-            -UpperBound $upperBound
-
-          if ($newRate -lt 35 -or $newRate -eq $workingPlan.VideoKbps) {
-            break
-          }
-
-          if ($lowerBound -and $newRate -le [int]$lowerBound.VideoKbps) {
-            $newRate = [int]$lowerBound.VideoKbps + 1
-          }
-          if ($upperBound -and $newRate -ge [int]$upperBound.VideoKbps) {
-            $newRate = [int]$upperBound.VideoKbps - 1
-          }
-
-          if ($newRate -lt 35 -or $seenRates.Contains($newRate)) {
-            break
-          }
-
-          $workingPlan.VideoKbps = $newRate
-        }
-      }
-      finally {
-        if ($sharedPassLog) {
-          Remove-PassLogFiles -PassLogPath $sharedPassLog
-        }
-      }
-
-      if ($bestUnder) {
-        return $bestUnder
-      }
-
-      return [PSCustomObject]@{
-        Success   = $false
-        SizeBytes = 0
-        Path      = $null
-        Plan      = $workingPlan
-        Ratio     = 0.0
-      }
-    }
+  return [PSCustomObject]@{
+    Success        = ($size -le $Plan.TargetBytes)
+    SizeBytes      = [long]$size
+    Path           = if ($size -le $Plan.TargetBytes) { $tempOut } else { $null }
+    Plan           = $Plan.PSObject.Copy()
+    Ratio          = [double]$ratio
+    Attempt        = [int]$Attempt
+    PredictionBias = [double]$predictionBias
   }
 }
 
-function Get-PresetCandidatesForPlan {
+function Get-RetryPlanFromResult {
   param(
     [Parameter(Mandatory = $true)]$Plan,
-    [Parameter(Mandatory = $true)][string]$BasePreset,
-    [Parameter(Mandatory = $true)][bool]$PresetWasExplicit,
-    [Parameter(Mandatory = $true)][int]$PlanIndex
+    [Parameter(Mandatory = $true)]$Result
   )
 
-  if ($PresetWasExplicit) {
-    return @($BasePreset)
-  }
-
-  switch ($Plan.Mode) {
-    "Balanced" {
-      $previewRank = [int](Get-ObjectPropertyValue -Object $Plan -Name "PreviewRank" -DefaultValue $PlanIndex)
-      $shouldUseSlow = (
-        $previewRank -eq 1 -and
-        $PlanIndex -eq 1 -and
-        $Plan.DurationSeconds -le 60 -and
-        (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")
-      )
-
-      if ($shouldUseSlow) {
-        return @("slow")
-      }
-
-      return @($BasePreset)
-    }
-
-    "ExtraQuality" {
-      $candidates = @()
-
-      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -gt (Get-X264PresetRank "medium")) {
-        $candidates += "medium"
-      }
-
-      if ($PlanIndex -le 2 -and (Get-X264PresetRank $BasePreset) -lt (Get-X264PresetRank "slow")) {
-        $candidates += "slow"
-      }
-
-      $candidates += $BasePreset
-      return $candidates | Select-Object -Unique
-    }
-
-    default {
-      return @($BasePreset)
+  $lowerBound = $null
+  $upperBound = $null
+  if ($Result.Success) {
+    $lowerBound = [PSCustomObject]@{
+      VideoKbps = [int]$Plan.VideoKbps
+      SizeBytes = [long]$Result.SizeBytes
     }
   }
+  else {
+    $upperBound = [PSCustomObject]@{
+      VideoKbps = [int]$Plan.VideoKbps
+      SizeBytes = [long]$Result.SizeBytes
+    }
+  }
+
+  $newRate = Get-NextVideoKbpsGuess `
+    -Mode $Plan.Mode `
+    -TargetBytes $Plan.TargetBytes `
+    -CurrentVideoKbps $Plan.VideoKbps `
+    -CurrentSizeBytes $Result.SizeBytes `
+    -LowerBound $lowerBound `
+    -UpperBound $upperBound
+
+  if ($newRate -lt 35 -or $newRate -eq $Plan.VideoKbps) {
+    return $null
+  }
+
+  $retryPlan = $Plan.PSObject.Copy()
+  $retryPlan.VideoKbps = [int]$newRate
+  $retryPlan | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($Plan.TargetBytes * $Result.PredictionBias)) -Force
+  $retryPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$Result.Ratio) -Force
+  return $retryPlan
+}
+
+function Try-PlanBitrateRefinement {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$CurrentResult,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][int]$Attempt,
+    [string]$PassLogPath = ""
+  )
+
+  $retryPlan = Get-RetryPlanFromResult -Plan $Plan -Result $CurrentResult
+  if ($null -eq $retryPlan) { return $null }
+
+  Write-Host ("Second-stage:    bitrate refinement -> {0}k" -f $retryPlan.VideoKbps)
+  return Invoke-PlanAttempt -InputPath $InputPath -Plan $retryPlan -TempDir $TempDir -Attempt $Attempt -PassLogPath $PassLogPath
+}
+
+function Get-AdjacentAudioPlans {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans
+  )
+
+  $audioIdentity = Get-AudioPlanIdentity -AudioPlan $Plan.AudioPlan
+  $matching = @(
+    $Plans |
+      Where-Object {
+        $_.Width -eq $Plan.Width -and
+        $_.Fps -eq $Plan.Fps -and
+        $_.PreprocessTier -eq $Plan.PreprocessTier
+      } |
+      Sort-Object -Property @{ Expression = { $_.AudioPlan.EstimatedBytes }; Descending = $true }, @{ Expression = { $_.AudioPlan.Rank }; Descending = $true }
+  )
+
+  if ($matching.Count -lt 2) { return @() }
+  $currentIndex = -1
+  for ($i = 0; $i -lt $matching.Count; $i++) {
+    if ((Get-AudioPlanIdentity -AudioPlan $matching[$i].AudioPlan) -eq $audioIdentity) {
+      $currentIndex = $i
+      break
+    }
+  }
+
+  if ($currentIndex -lt 0) { return @() }
+
+  $neighbors = New-Object System.Collections.Generic.List[object]
+  if ($currentIndex -gt 0) { [void]$neighbors.Add($matching[$currentIndex - 1]) }
+  if ($currentIndex -lt ($matching.Count - 1)) { [void]$neighbors.Add($matching[$currentIndex + 1]) }
+  return @($neighbors.ToArray())
+}
+
+function Get-AdjacentWidthPlans {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans
+  )
+
+  $audioIdentity = Get-AudioPlanIdentity -AudioPlan $Plan.AudioPlan
+  $matching = @(
+    $Plans |
+      Where-Object {
+        $_.Fps -eq $Plan.Fps -and
+        (Get-AudioPlanIdentity -AudioPlan $_.AudioPlan) -eq $audioIdentity -and
+        $_.PreprocessTier -eq $Plan.PreprocessTier
+      } |
+      Sort-Object -Property @{ Expression = { $_.Width }; Descending = $true }, @{ Expression = { $_.Score }; Descending = $true }
+  )
+
+  if ($matching.Count -lt 2) { return @() }
+  $currentIndex = -1
+  for ($i = 0; $i -lt $matching.Count; $i++) {
+    if ($matching[$i].Width -eq $Plan.Width) {
+      $currentIndex = $i
+      break
+    }
+  }
+
+  if ($currentIndex -lt 0) { return @() }
+
+  $neighbors = New-Object System.Collections.Generic.List[object]
+  if ($currentIndex -gt 0) { [void]$neighbors.Add($matching[$currentIndex - 1]) }
+  if ($currentIndex -lt ($matching.Count - 1)) { [void]$neighbors.Add($matching[$currentIndex + 1]) }
+  return @($neighbors.ToArray())
+}
+
+function Get-DenoiseTogglePlan {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans
+  )
+
+  $audioIdentity = Get-AudioPlanIdentity -AudioPlan $Plan.AudioPlan
+  return @(
+    $Plans |
+      Where-Object {
+        $_.Width -eq $Plan.Width -and
+        $_.Fps -eq $Plan.Fps -and
+        (Get-AudioPlanIdentity -AudioPlan $_.AudioPlan) -eq $audioIdentity -and
+        $_.UseDenoise -ne $Plan.UseDenoise
+      } |
+      Select-Object -First 1
+  )
+}
+
+function Test-IsSaferFallbackPlan {
+  param(
+    [Parameter(Mandatory = $true)]$Candidate,
+    [Parameter(Mandatory = $true)]$ReferencePlan
+  )
+
+  return (
+    $Candidate.Width -lt $ReferencePlan.Width -or
+    $Candidate.AudioPlan.EstimatedBytes -lt $ReferencePlan.AudioPlan.EstimatedBytes -or
+    ($Candidate.UseDenoise -and -not $ReferencePlan.UseDenoise)
+  )
+}
+
+function Test-IsMoreAggressiveFallbackPlan {
+  param(
+    [Parameter(Mandatory = $true)]$Candidate,
+    [Parameter(Mandatory = $true)]$ReferencePlan
+  )
+
+  return (
+    $Candidate.Width -gt $ReferencePlan.Width -or
+    $Candidate.AudioPlan.EstimatedBytes -gt $ReferencePlan.AudioPlan.EstimatedBytes -or
+    (-not $Candidate.UseDenoise -and $ReferencePlan.UseDenoise)
+  )
+}
+
+function Get-CalibratedFallbackPlan {
+  param(
+    [Parameter(Mandatory = $true)]$CandidatePlan,
+    [Parameter(Mandatory = $true)]$ReferenceResult
+  )
+
+  $strategy = Get-ModeStrategy -Mode $CandidatePlan.Mode -Duration $CandidatePlan.DurationSeconds
+  $desiredBytes = [math]::Floor($CandidatePlan.TargetBytes * $strategy.CloseEnoughRatio)
+  $factor = [double]$desiredBytes / [double][math]::Max(1, $ReferenceResult.SizeBytes)
+
+  if ($ReferenceResult.Ratio -le 1.0) {
+    $factor = switch ($CandidatePlan.Mode) {
+      "Fast"         { [math]::Max(1.01, [math]::Min(1.08, $factor)) }
+      "Balanced"     { [math]::Max(1.01, [math]::Min(1.12, $factor)) }
+      default        { [math]::Max(1.01, [math]::Min(1.10, $factor)) }
+    }
+  }
+  else {
+    $factor = switch ($CandidatePlan.Mode) {
+      "Fast"         { [math]::Max(0.80, [math]::Min(0.99, $factor)) }
+      "Balanced"     { [math]::Max(0.85, [math]::Min(0.985, $factor)) }
+      default        { [math]::Max(0.88, [math]::Min(0.988, $factor)) }
+    }
+  }
+
+  $planCopy = $CandidatePlan.PSObject.Copy()
+  $planCopy.VideoKbps = [int][math]::Max(35, [math]::Floor($CandidatePlan.VideoKbps * $factor))
+  $planCopy | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($CandidatePlan.TargetBytes * $ReferenceResult.PredictionBias)) -Force
+  $planCopy | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$ReferenceResult.Ratio) -Force
+  return $planCopy
+}
+
+function Get-SecondStageCandidateScore {
+  param(
+    [Parameter(Mandatory = $true)]$Candidate,
+    [Parameter(Mandatory = $true)]$ReferenceResult
+  )
+
+  $score = [double]$Candidate.Score + ([double](Get-ObjectPropertyValue -Object $Candidate -Name "Confidence" -DefaultValue 0.75) * 1000.0)
+  if ($ReferenceResult.Ratio -gt 1.0) {
+    if (Test-IsSaferFallbackPlan -Candidate $Candidate -ReferencePlan $ReferenceResult.Plan) { $score += 1200.0 }
+  }
+  elseif ($ReferenceResult.Ratio -lt (Get-ModeStrategy -Mode $Candidate.Mode -Duration $Candidate.DurationSeconds).BadUnderfillRatio) {
+    if (Test-IsMoreAggressiveFallbackPlan -Candidate $Candidate -ReferencePlan $ReferenceResult.Plan) { $score += 1200.0 }
+  }
+  else {
+    $score -= 500.0
+  }
+
+  return $score
+}
+
+function Expand-PlanNeighborhood {
+  param(
+    [Parameter(Mandatory = $true)]$ReferenceResult,
+    [Parameter(Mandatory = $true)]$AllPlans,
+    [bool]$PresetWasExplicit = $false
+  )
+
+  $candidates = New-Object System.Collections.Generic.List[object]
+  foreach ($candidate in @(Get-AdjacentAudioPlans -Plan $ReferenceResult.Plan -Plans $AllPlans)) {
+    if ($candidate) { [void]$candidates.Add($candidate) }
+  }
+  foreach ($candidate in @(Get-AdjacentWidthPlans -Plan $ReferenceResult.Plan -Plans $AllPlans)) {
+    if ($candidate) { [void]$candidates.Add($candidate) }
+  }
+  foreach ($candidate in @(Get-DenoiseTogglePlan -Plan $ReferenceResult.Plan -Plans $AllPlans)) {
+    if ($candidate) { [void]$candidates.Add($candidate) }
+  }
+
+  if (-not $PresetWasExplicit -and $ReferenceResult.Plan.Mode -eq "ExtraQuality") {
+    $presetVariant = Get-PresetVariantPlan -Plan $ReferenceResult.Plan
+    if ($presetVariant) {
+      [void]$candidates.Add($presetVariant)
+    }
+  }
+
+  $seenKeys = New-Object System.Collections.Generic.HashSet[string]
+  $scored = New-Object System.Collections.Generic.List[object]
+  foreach ($candidate in $candidates) {
+    if ($null -eq $candidate) { continue }
+    $calibrated = Get-CalibratedFallbackPlan -CandidatePlan $candidate -ReferenceResult $ReferenceResult
+    $key = Get-PlanKey -Plan $calibrated
+    if (-not $seenKeys.Add($key)) { continue }
+
+    $scored.Add([PSCustomObject]@{
+        Plan  = $calibrated
+        Score = (Get-SecondStageCandidateScore -Candidate $calibrated -ReferenceResult $ReferenceResult)
+      })
+  }
+
+  return @($scored | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Plan.Score }; Descending = $true } | ForEach-Object { $_.Plan })
+}
+
+function Try-PlanSingleFallback {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$ReferenceResult,
+    [Parameter(Mandatory = $true)]$AllPlans,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][int]$Attempt,
+    [bool]$PresetWasExplicit = $false
+  )
+
+  $candidates = Expand-PlanNeighborhood -ReferenceResult $ReferenceResult -AllPlans $AllPlans -PresetWasExplicit:$PresetWasExplicit
+  $chosen = @($candidates | Select-Object -First 1)[0]
+  if ($null -eq $chosen) { return $null }
+
+  Write-Host ("Second-stage:    fallback -> {0}x{1} @{2}fps | v={3}k | a={4} | pp={5}" -f $chosen.Width, $chosen.Height, $chosen.Fps, $chosen.VideoKbps, $chosen.AudioPlan.Label, $chosen.PreprocessLabel)
+  return Invoke-PlanAttempt -InputPath $InputPath -Plan $chosen -TempDir $TempDir -Attempt $Attempt
+}
+
+function Get-PresetVariantPlan {
+  param(
+    [Parameter(Mandatory = $true)]$Plan
+  )
+
+  $strategy = Get-ModeStrategy -Mode $Plan.Mode -Duration $Plan.DurationSeconds
+  if (-not $strategy.AllowPresetExploration) { return $null }
+
+  $currentRank = Get-X264PresetRank -preset $Plan.Preset
+  if ($currentRank -lt (Get-X264PresetRank "slow")) {
+    $variantPreset = "slow"
+  }
+  elseif ($currentRank -gt (Get-X264PresetRank "medium")) {
+    $variantPreset = "medium"
+  }
+  else {
+    return $null
+  }
+
+  $planCopy = $Plan.PSObject.Copy()
+  $planCopy.Preset = $variantPreset
+  return $planCopy
 }
 
 function Get-PlanList {
@@ -2557,7 +2632,6 @@ function Get-PlanList {
     [Parameter(Mandatory = $true)]$CodecProfile,
     [Parameter(Mandatory = $true)][long]$TargetBytes,
     [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$RateControl,
     [Parameter(Mandatory = $true)][string]$Preset,
     [Parameter(Mandatory = $true)][string]$PreprocessProfile
   )
@@ -2614,7 +2688,6 @@ function Get-PlanList {
           -Probe $Probe `
           -CodecProfile $CodecProfile `
           -Mode $Mode `
-          -RateControl $RateControl `
           -TargetBytes $TargetBytes `
           -Preset $Preset `
           -Width $w.Width `
@@ -2640,7 +2713,6 @@ function Get-PlanList {
             -Probe $Probe `
             -CodecProfile $CodecProfile `
             -Mode $Mode `
-            -RateControl $RateControl `
             -TargetBytes $TargetBytes `
             -Preset $Preset `
             -Width $w.Width `
@@ -2668,6 +2740,276 @@ function Get-PlanList {
       -Unique)
     AudioCandidates = $audioCandidates
   }
+}
+
+function Get-RelativeScoreGap {
+  param(
+    [double]$PrimaryScore,
+    [double]$SecondaryScore
+  )
+
+  if ($PrimaryScore -eq 0.0) { return 1.0 }
+  return ([double]$PrimaryScore - [double]$SecondaryScore) / [double][math]::Max(1.0, [math]::Abs($PrimaryScore))
+}
+
+function Get-CropPotentialAreaRemovedRatio {
+  param(
+    [Parameter(Mandatory = $true)]$Info
+  )
+
+  $samples = @((Get-ObjectPropertyValue -Object $Info -Name "CropSamples" -DefaultValue @()))
+  if (-not $samples -or $samples.Count -eq 0) {
+    return [double](Get-ObjectPropertyValue -Object $Info -Name "CropAreaRemovedRatio" -DefaultValue 0.0)
+  }
+
+  $avgWidth = ($samples | Measure-Object -Property Width -Average).Average
+  $avgHeight = ($samples | Measure-Object -Property Height -Average).Average
+  if ($avgWidth -le 0 -or $avgHeight -le 0) { return 0.0 }
+
+  return 1.0 - (([double]$avgWidth * [double]$avgHeight) / ([double]$Info.Width * [double]$Info.Height))
+}
+
+function Get-CropConfidenceClass {
+  param(
+    [Parameter(Mandatory = $true)]$Info
+  )
+
+  $cropSummary = [string](Get-ObjectPropertyValue -Object $Info -Name "CropSummary" -DefaultValue "none")
+  $samples = @((Get-ObjectPropertyValue -Object $Info -Name "CropSamples" -DefaultValue @()))
+  $spread = 0.0
+  if ($samples.Count -ge 2) {
+    $spread = [math]::Max(
+      (Get-SpreadRatio -Values ($samples | ForEach-Object { $_.Width })),
+      (Get-SpreadRatio -Values ($samples | ForEach-Object { $_.Height }))
+    )
+  }
+
+  if ($cropSummary -eq "unstable") { return "Medium" }
+  if ([bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)) {
+    if ($spread -le 0.02) { return "High" }
+    return "Medium"
+  }
+
+  return "Low"
+}
+
+function Test-PlanWidthNearTie {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)][double]$NearTieDelta
+  )
+
+  $candidates = @(
+    $Plans |
+      Where-Object {
+        $_.Fps -eq $Plan.Fps -and
+        $_.AudioTier -eq $Plan.AudioTier -and
+        $_.PreprocessTier -eq $Plan.PreprocessTier
+      } |
+      Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Width }; Descending = $true }
+  )
+
+  if ($candidates.Count -lt 2) { return $false }
+  $gap = Get-RelativeScoreGap -PrimaryScore $candidates[0].Score -SecondaryScore $candidates[1].Score
+  return ($gap -le $NearTieDelta)
+}
+
+function Test-PlanFpsNearTie {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)][double]$NearTieDelta
+  )
+
+  $candidates = @(
+    $Plans |
+      Where-Object {
+        $_.WidthTier -eq $Plan.WidthTier -and
+        $_.AudioTier -eq $Plan.AudioTier -and
+        $_.PreprocessTier -eq $Plan.PreprocessTier
+      } |
+      Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.Fps }; Descending = $true }
+  )
+
+  if ($candidates.Count -lt 2) { return $false }
+  $gap = Get-RelativeScoreGap -PrimaryScore $candidates[0].Score -SecondaryScore $candidates[1].Score
+  return ($gap -le $NearTieDelta)
+}
+
+function Test-PlanAudioTradeoffMaterial {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)][long]$TargetBytes,
+    [Parameter(Mandatory = $true)][double]$NearTieDelta
+  )
+
+  $candidates = @(
+    $Plans |
+      Where-Object {
+        $_.FpsTier -eq $Plan.FpsTier -and
+        $_.WidthTier -eq $Plan.WidthTier -and
+        $_.PreprocessTier -eq $Plan.PreprocessTier
+      } |
+      Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.AudioPlan.Rank }; Descending = $true }
+  )
+
+  if ($candidates.Count -lt 2) { return $false }
+  $gap = Get-RelativeScoreGap -PrimaryScore $candidates[0].Score -SecondaryScore $candidates[1].Score
+  $byteDelta = [math]::Abs([double]$candidates[0].AudioPlan.EstimatedBytes - [double]$candidates[1].AudioPlan.EstimatedBytes)
+  return ($gap -le $NearTieDelta -and $byteDelta -ge ($TargetBytes * 0.04))
+}
+
+function Test-PlanProbeSpreadHigh {
+  param(
+    [Parameter(Mandatory = $true)]$Probe,
+    [Parameter(Mandatory = $true)]$Strategy
+  )
+
+  $maxSpread = [double][math]::Max(
+    [double](Get-ObjectPropertyValue -Object $Probe -Name "DetailSpreadRatio" -DefaultValue 0.0),
+    [double](Get-ObjectPropertyValue -Object $Probe -Name "MotionSpreadRatio" -DefaultValue 0.0)
+  )
+  $threshold = if ($null -ne $Strategy.ProbeEarlyStopSpreadThreshold) {
+    [double]$Strategy.ProbeEarlyStopSpreadThreshold * 1.8
+  }
+  else {
+    0.20
+  }
+
+  return ($maxSpread -ge $threshold)
+}
+
+function Add-PlanRiskMetadata {
+  param(
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$Probe,
+    [Parameter(Mandatory = $true)]$Strategy,
+    [Parameter(Mandatory = $true)][long]$TargetBytes
+  )
+
+  $riskFlags = New-Object System.Collections.Generic.List[string]
+
+  if (Test-PlanWidthNearTie -Plan $Plan -Plans $Plans -NearTieDelta $Strategy.NearTieDelta) {
+    [void]$riskFlags.Add("WidthNearTie")
+  }
+  if (Test-PlanFpsNearTie -Plan $Plan -Plans $Plans -NearTieDelta $Strategy.NearTieDelta) {
+    [void]$riskFlags.Add("FpsNearTie")
+  }
+  if (Test-PlanAudioTradeoffMaterial -Plan $Plan -Plans $Plans -TargetBytes $TargetBytes -NearTieDelta $Strategy.NearTieDelta) {
+    [void]$riskFlags.Add("AudioMaterial")
+  }
+
+  $cropPotential = Get-CropPotentialAreaRemovedRatio -Info $Info
+  $cropConfidence = Get-CropConfidenceClass -Info $Info
+  if ($cropConfidence -eq "Medium" -and $cropPotential -ge 0.06) {
+    [void]$riskFlags.Add("CropUncertain")
+  }
+  if (Test-PlanProbeSpreadHigh -Probe $Probe -Strategy $Strategy) {
+    [void]$riskFlags.Add("ProbeSpread")
+  }
+
+  $confidence = 0.94
+  $confidence -= ($riskFlags.Count * 0.10)
+  if ($Plan.WidthOrigin -eq "local") { $confidence -= 0.02 }
+  $confidence = [math]::Max(0.40, [math]::Min(0.98, $confidence))
+
+  $planCopy = $Plan.PSObject.Copy()
+  $planCopy | Add-Member -NotePropertyName RiskFlags -NotePropertyValue @($riskFlags.ToArray()) -Force
+  $planCopy | Add-Member -NotePropertyName Confidence -NotePropertyValue ([double]::Parse(([string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $confidence)), [Globalization.CultureInfo]::InvariantCulture)) -Force
+  $planCopy | Add-Member -NotePropertyName CropConfidence -NotePropertyValue $cropConfidence -Force
+  $planCopy | Add-Member -NotePropertyName CropPotentialRatio -NotePropertyValue ([double]$cropPotential) -Force
+  return $planCopy
+}
+
+function Add-UniquePlanSelection {
+  param(
+    [Parameter(Mandatory = $true)]$Selected,
+    [Parameter(Mandatory = $true)]$SeenKeys,
+    $Candidate
+  )
+
+  if ($null -eq $Candidate) { return }
+  $key = Get-PlanKey -Plan $Candidate
+  if ($SeenKeys.Add($key)) {
+    [void]$Selected.Add($Candidate)
+  }
+}
+
+function Test-IsMeaningfullyDifferentPlan {
+  param(
+    [Parameter(Mandatory = $true)]$Left,
+    [Parameter(Mandatory = $true)]$Right
+  )
+
+  return (
+    $Left.Width -ne $Right.Width -or
+    $Left.Fps -ne $Right.Fps -or
+    $Left.AudioTier -ne $Right.AudioTier -or
+    $Left.PreprocessTier -ne $Right.PreprocessTier -or
+    $Left.WidthOrigin -ne $Right.WidthOrigin
+  )
+}
+
+function Get-MeaningfulAlternativePlan {
+  param(
+    [Parameter(Mandatory = $true)]$Primary,
+    [Parameter(Mandatory = $true)]$Plans
+  )
+
+  return @($Plans | Where-Object { (Get-PlanKey -Plan $_) -ne (Get-PlanKey -Plan $Primary) -and (Test-IsMeaningfullyDifferentPlan -Left $Primary -Right $_) } | Select-Object -First 1)
+}
+
+function Get-PlanArchetypes {
+  param(
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$Probe,
+    [Parameter(Mandatory = $true)][long]$TargetBytes,
+    [Parameter(Mandatory = $true)][string]$Mode
+  )
+
+  $strategy = Get-ModeStrategy -Mode $Mode -Duration $Info.Duration
+  $groups = @{}
+  foreach ($plan in @($Plans)) {
+    $key = [string]$plan.ArchetypeKey
+    if (-not $groups.ContainsKey($key)) {
+      $groups[$key] = New-Object System.Collections.Generic.List[object]
+    }
+    [void]$groups[$key].Add($plan)
+  }
+
+  $archetypes = New-Object System.Collections.Generic.List[object]
+  foreach ($key in ($groups.Keys | Sort-Object)) {
+    $best = @($groups[$key] | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { $_.AudioPlan.Rank }; Descending = $true } | Select-Object -First 1)[0]
+    if ($null -eq $best) { continue }
+    [void]$archetypes.Add((Add-PlanRiskMetadata -Plan $best -Plans $Plans -Info $Info -Probe $Probe -Strategy $strategy -TargetBytes $TargetBytes))
+  }
+
+  $ordered = @($archetypes | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { Get-ObjectPropertyValue -Object $_ -Name "Confidence" -DefaultValue 0.75 }; Descending = $true }, @{ Expression = { $_.AudioPlan.Rank }; Descending = $true })
+  if ($ordered.Count -le $strategy.ShortlistArchetypes) { return $ordered }
+
+  $selected = New-Object System.Collections.Generic.List[object]
+  $seenKeys = New-Object System.Collections.Generic.HashSet[string]
+  $primary = $ordered | Select-Object -First 1
+  Add-UniquePlanSelection -Selected $selected -SeenKeys $seenKeys -Candidate $primary
+
+  foreach ($property in @("WidthTier", "FpsTier", "AudioTier", "PreprocessTier", "WidthOrigin")) {
+    $baseline = Get-ObjectPropertyValue -Object $primary -Name $property -DefaultValue $null
+    $candidate = $ordered | Where-Object { (Get-ObjectPropertyValue -Object $_ -Name $property -DefaultValue $null) -ne $baseline } | Select-Object -First 1
+    Add-UniquePlanSelection -Selected $selected -SeenKeys $seenKeys -Candidate $candidate
+    if ($selected.Count -ge $strategy.ShortlistArchetypes) { break }
+  }
+
+  foreach ($candidate in $ordered) {
+    if ($selected.Count -ge $strategy.ShortlistArchetypes) { break }
+    Add-UniquePlanSelection -Selected $selected -SeenKeys $seenKeys -Candidate $candidate
+  }
+
+  return @($selected.ToArray())
 }
 
 function Get-PlanPreferenceTuple {
@@ -2806,6 +3148,289 @@ function Test-IsBetterResult {
   return $false
 }
 
+function Update-BestResult {
+  param(
+    $Current,
+    $Candidate
+  )
+
+  if ($null -eq $Candidate -or -not $Candidate.Success) {
+    return $Current
+  }
+
+  if ($null -eq $Current) {
+    return $Candidate
+  }
+
+  if (Test-IsBetterResult -Candidate $Candidate -Current $Current) {
+    if ($Current.Path -and (Test-Path $Current.Path)) {
+      Remove-Item $Current.Path -Force -ErrorAction SilentlyContinue
+    }
+    return $Candidate
+  }
+
+  if ($Candidate.Path -and (Test-Path $Candidate.Path)) {
+    Remove-Item $Candidate.Path -Force -ErrorAction SilentlyContinue
+  }
+  return $Current
+}
+
+function Set-SearchStatsOnResult {
+  param(
+    $Result,
+    [Parameter(Mandatory = $true)]$Stats
+  )
+
+  if ($null -eq $Result) { return $null }
+
+  $Result | Add-Member -NotePropertyName SearchStats -NotePropertyValue $Stats -Force
+  return $Result
+}
+
+function Invoke-FastModeSearch {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)]$AllPlans,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][int]$PreviewsRun
+  )
+
+  $strategy = Get-ModeStrategy -Mode "Fast"
+  $stats = [PSCustomObject]@{
+    ProbeSamplesUsed   = 0
+    PreviewsRun        = [int]$PreviewsRun
+    FullEncodesRun     = 0
+    SecondEncodeReason = ""
+    PredictionBias     = 0.0
+  }
+
+  $primary = @($Plans | Select-Object -First 1)[0]
+  $backup = @($Plans | Select-Object -Skip 1 -First 1)[0]
+
+  Write-Host ("Testing primary:  {0}x{1} @{2}fps | codec={3} | v={4}k | a={5} | detail={6} | motion={7} | bpppf={8:N4} | preset={9} | width={10} | pp={11} | crop={12}" -f $primary.Width, $primary.Height, $primary.Fps, $primary.CodecProfile.VideoCodec, $primary.VideoKbps, $primary.AudioPlan.Label, $primary.DetailBucket, $primary.MotionBucket, $primary.Bpppf, $primary.Preset, $primary.WidthOrigin, $primary.PreprocessLabel, $primary.CropSummary)
+  $primaryResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $primary -TempDir $TempDir -Attempt 1
+  $stats.FullEncodesRun++
+  $stats.PredictionBias = [double]$primaryResult.PredictionBias
+  $bestUnder = Update-BestResult -Current $null -Candidate $primaryResult
+
+  if ($primaryResult.Success -and $primaryResult.Ratio -ge $strategy.EarlyAcceptRatio) {
+    return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+  }
+
+  $secondResult = $null
+  if ($stats.FullEncodesRun -lt $strategy.MaxFullEncodes -and ($primaryResult.Ratio -gt 1.0 -or $primaryResult.Ratio -lt $strategy.BadUnderfillRatio)) {
+    $useBackup = $false
+    if ($backup) {
+      if ($primaryResult.Ratio -gt 1.0) {
+        $useBackup = Test-IsSaferFallbackPlan -Candidate $backup -ReferencePlan $primary
+      }
+      else {
+        $useBackup = ((Test-IsMoreAggressiveFallbackPlan -Candidate $backup -ReferencePlan $primary) -and $backup.Score -gt $primary.Score)
+      }
+    }
+
+    if ($useBackup) {
+      $stats.SecondEncodeReason = "backup"
+      $backupPlan = Get-CalibratedFallbackPlan -CandidatePlan $backup -ReferenceResult $primaryResult
+      Write-Host ("Second-stage:    backup -> {0}x{1} @{2}fps | v={3}k | a={4} | pp={5}" -f $backupPlan.Width, $backupPlan.Height, $backupPlan.Fps, $backupPlan.VideoKbps, $backupPlan.AudioPlan.Label, $backupPlan.PreprocessLabel)
+      $secondResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $backupPlan -TempDir $TempDir -Attempt 2
+    }
+    else {
+      $stats.SecondEncodeReason = "bitrate refinement"
+      $secondResult = Try-PlanBitrateRefinement -InputPath $InputPath -Plan $primary -CurrentResult $primaryResult -TempDir $TempDir -Attempt 2
+    }
+
+    if ($secondResult) {
+      $stats.FullEncodesRun++
+      $bestUnder = Update-BestResult -Current $bestUnder -Candidate $secondResult
+    }
+  }
+
+  return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+}
+
+function Invoke-BalancedModeSearch {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)]$AllPlans,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][int]$PreviewsRun
+  )
+
+  $strategy = Get-ModeStrategy -Mode "Balanced"
+  $stats = [PSCustomObject]@{
+    ProbeSamplesUsed   = 0
+    PreviewsRun        = [int]$PreviewsRun
+    FullEncodesRun     = 0
+    SecondEncodeReason = ""
+    PredictionBias     = 0.0
+  }
+
+  $primary = @($Plans | Select-Object -First 1)[0]
+  $challenger = @($Plans | Select-Object -Skip 1 -First 1)[0]
+  $sharedPassLog = $null
+
+  try {
+    $sharedPassLog = Initialize-PlanPassLog -InputPath $InputPath -Plan $primary -TempDir $TempDir
+
+    Write-Host ("Testing primary:  {0}x{1} @{2}fps | codec={3} | v={4}k | a={5} | detail={6} | motion={7} | bpppf={8:N4} | preset={9} | width={10} | pp={11} | crop={12}" -f $primary.Width, $primary.Height, $primary.Fps, $primary.CodecProfile.VideoCodec, $primary.VideoKbps, $primary.AudioPlan.Label, $primary.DetailBucket, $primary.MotionBucket, $primary.Bpppf, $primary.Preset, $primary.WidthOrigin, $primary.PreprocessLabel, $primary.CropSummary)
+    $primaryResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $primary -TempDir $TempDir -Attempt 1 -PassLogPath $sharedPassLog
+    $stats.FullEncodesRun++
+    $stats.PredictionBias = [double]$primaryResult.PredictionBias
+    $bestUnder = Update-BestResult -Current $null -Candidate $primaryResult
+
+    if ($primaryResult.Success -and $primaryResult.Ratio -ge $strategy.EarlyAcceptRatio) {
+      return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+    }
+
+    $needsSecondAction = (
+      $primaryResult.Ratio -gt 1.0 -or
+      $primaryResult.Ratio -lt $strategy.BadUnderfillRatio -or
+      ($challenger -and $stats.PreviewsRun -eq 0)
+    )
+
+    if (-not $needsSecondAction) {
+      return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+    }
+
+    if ($stats.FullEncodesRun -ge $strategy.MaxFullEncodes) {
+      return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+    }
+
+    $actionOptions = New-Object System.Collections.Generic.List[object]
+    $retryPlan = Get-RetryPlanFromResult -Plan $primary -Result $primaryResult
+    if ($retryPlan) {
+      $retryScore = [double]$primary.Score + 900.0
+      if ($primaryResult.Ratio -gt 1.0 -and $primaryResult.Ratio -lt 1.03) { $retryScore += 300.0 }
+      if ($primaryResult.Ratio -lt 1.0 -and $primaryResult.Ratio -gt 0.96) { $retryScore += 200.0 }
+      [void]$actionOptions.Add([PSCustomObject]@{ Kind = "retune"; Score = $retryScore; Plan = $retryPlan })
+    }
+
+    if ($challenger) {
+      $challengerPlan = Get-CalibratedFallbackPlan -CandidatePlan $challenger -ReferenceResult $primaryResult
+      $challengerScore = [double]$challengerPlan.Score + 600.0 + ((1.0 - [double](Get-ObjectPropertyValue -Object $primary -Name "Confidence" -DefaultValue 1.0)) * 1000.0)
+      [void]$actionOptions.Add([PSCustomObject]@{ Kind = "challenger"; Score = $challengerScore; Plan = $challengerPlan })
+    }
+
+    $fallbackPlan = @(Expand-PlanNeighborhood -ReferenceResult $primaryResult -AllPlans $AllPlans | Select-Object -First 1)[0]
+    if ($fallbackPlan) {
+      $fallbackScore = Get-SecondStageCandidateScore -Candidate $fallbackPlan -ReferenceResult $primaryResult
+      [void]$actionOptions.Add([PSCustomObject]@{ Kind = "fallback"; Score = $fallbackScore; Plan = $fallbackPlan })
+    }
+
+    $selectedAction = @($actionOptions | Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true } | Select-Object -First 1)[0]
+    if ($null -eq $selectedAction) {
+      return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+    }
+
+    $stats.SecondEncodeReason = $selectedAction.Kind
+    switch ($selectedAction.Kind) {
+      "retune" {
+        Write-Host ("Second-stage:    bitrate refinement -> {0}k" -f $selectedAction.Plan.VideoKbps)
+        $secondResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $selectedAction.Plan -TempDir $TempDir -Attempt 2 -PassLogPath $sharedPassLog
+      }
+      default {
+        Write-Host ("Second-stage:    {0} -> {1}x{2} @{3}fps | v={4}k | a={5} | pp={6}" -f $selectedAction.Kind, $selectedAction.Plan.Width, $selectedAction.Plan.Height, $selectedAction.Plan.Fps, $selectedAction.Plan.VideoKbps, $selectedAction.Plan.AudioPlan.Label, $selectedAction.Plan.PreprocessLabel)
+        $secondResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $selectedAction.Plan -TempDir $TempDir -Attempt 2
+      }
+    }
+
+    if ($secondResult) {
+      $stats.FullEncodesRun++
+      $bestUnder = Update-BestResult -Current $bestUnder -Candidate $secondResult
+    }
+
+    return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+  }
+  finally {
+    if ($sharedPassLog) {
+      Remove-PassLogFiles -PassLogPath $sharedPassLog
+    }
+  }
+}
+
+function Invoke-ExtraQualityModeSearch {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)]$Plans,
+    [Parameter(Mandatory = $true)]$AllPlans,
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [Parameter(Mandatory = $true)][int]$PreviewsRun,
+    [Parameter(Mandatory = $true)][bool]$PresetWasExplicit
+  )
+
+  $strategy = Get-ModeStrategy -Mode "ExtraQuality"
+  $stats = [PSCustomObject]@{
+    ProbeSamplesUsed   = 0
+    PreviewsRun        = [int]$PreviewsRun
+    FullEncodesRun     = 0
+    SecondEncodeReason = ""
+    PredictionBias     = 0.0
+  }
+
+  $bestUnder = $null
+  $triedKeys = New-Object System.Collections.Generic.HashSet[string]
+  $attempt = 0
+
+  foreach ($plan in @($Plans | Select-Object -First 2)) {
+    if ($attempt -ge $strategy.MaxFullEncodes) { break }
+    $attempt++
+    [void]$triedKeys.Add((Get-PlanKey -Plan $plan))
+    Write-Host ("Testing finalist: {0}x{1} @{2}fps | codec={3} | v={4}k | a={5} | detail={6} | motion={7} | bpppf={8:N4} | preset={9} | width={10} | pp={11} | crop={12}" -f $plan.Width, $plan.Height, $plan.Fps, $plan.CodecProfile.VideoCodec, $plan.VideoKbps, $plan.AudioPlan.Label, $plan.DetailBucket, $plan.MotionBucket, $plan.Bpppf, $plan.Preset, $plan.WidthOrigin, $plan.PreprocessLabel, $plan.CropSummary)
+    $result = Invoke-PlanAttempt -InputPath $InputPath -Plan $plan -TempDir $TempDir -Attempt $attempt
+    $stats.FullEncodesRun++
+    $stats.PredictionBias = [double]$result.PredictionBias
+    $bestUnder = Update-BestResult -Current $bestUnder -Candidate $result
+
+    if ($bestUnder -and $bestUnder.Ratio -ge $strategy.EarlyAcceptRatio -and $attempt -ge 2) {
+      return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+    }
+  }
+
+  if ($attempt -lt $strategy.MaxFullEncodes) {
+    $extraCandidates = New-Object System.Collections.Generic.List[object]
+    $thirdFinalist = @($Plans | Select-Object -Skip 2 -First 1)[0]
+    if ($thirdFinalist) { [void]$extraCandidates.Add($thirdFinalist) }
+
+    if ($bestUnder) {
+      foreach ($candidate in @(Expand-PlanNeighborhood -ReferenceResult $bestUnder -AllPlans $AllPlans -PresetWasExplicit:$PresetWasExplicit)) {
+        if ($candidate) { [void]$extraCandidates.Add($candidate) }
+      }
+    }
+
+    $selectedExtra = @(
+      $extraCandidates |
+        Where-Object { $null -ne $_ -and -not $triedKeys.Contains((Get-PlanKey -Plan $_)) } |
+        Sort-Object -Property @{ Expression = { $_.Score }; Descending = $true }, @{ Expression = { Get-ObjectPropertyValue -Object $_ -Name "Confidence" -DefaultValue 0.75 }; Descending = $true } |
+        Select-Object -First 1
+    )[0]
+
+    if ($selectedExtra) {
+      $attempt++
+      $stats.SecondEncodeReason = "neighborhood"
+      [void]$triedKeys.Add((Get-PlanKey -Plan $selectedExtra))
+      Write-Host ("Exploring:       {0}x{1} @{2}fps | v={3}k | a={4} | pp={5} | preset={6}" -f $selectedExtra.Width, $selectedExtra.Height, $selectedExtra.Fps, $selectedExtra.VideoKbps, $selectedExtra.AudioPlan.Label, $selectedExtra.PreprocessLabel, $selectedExtra.Preset)
+      $extraResult = Invoke-PlanAttempt -InputPath $InputPath -Plan $selectedExtra -TempDir $TempDir -Attempt $attempt
+      $stats.FullEncodesRun++
+      $bestUnder = Update-BestResult -Current $bestUnder -Candidate $extraResult
+    }
+  }
+
+  if ($attempt -lt $strategy.MaxFullEncodes -and $bestUnder -and $bestUnder.Ratio -lt 0.996) {
+    $attempt++
+    $stats.SecondEncodeReason = "micro-fill"
+    $retryResult = Try-PlanBitrateRefinement -InputPath $InputPath -Plan $bestUnder.Plan -CurrentResult $bestUnder -TempDir $TempDir -Attempt $attempt
+    if ($retryResult) {
+      $stats.FullEncodesRun++
+      $bestUnder = Update-BestResult -Current $bestUnder -Candidate $retryResult
+    }
+  }
+
+  return (Set-SearchStatsOnResult -Result $bestUnder -Stats $stats)
+}
+
 function Get-BestResult {
   param(
     [Parameter(Mandatory = $true)]$Info,
@@ -2813,98 +3438,50 @@ function Get-BestResult {
     [Parameter(Mandatory = $true)]$CodecProfile,
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)][string]$TempDir,
-    [long]$TargetBytes = 0,
+    [Parameter(Mandatory = $true)][long]$TargetBytes,
     [Parameter(Mandatory = $true)][string]$Mode,
-    [Parameter(Mandatory = $true)][string]$RateControl,
     [Parameter(Mandatory = $true)][string]$Preset,
     [Parameter(Mandatory = $true)][bool]$PresetWasExplicit,
     [Parameter(Mandatory = $true)][string]$PreprocessProfile
   )
 
-  $hasTarget = ($TargetBytes -gt 0)
-  $plans = @()
-  $audioCandidates = @()
-
-  if ($RateControl -eq "ConstantQuality" -and -not $hasTarget) {
-    $audioPlan = Get-ConstantQualityAudioPlan -Info $Info -CodecProfile $CodecProfile -Mode $Mode -Duration $Info.Duration
-    $plans = @(
-      New-SourcePreserveConstantQualityPlan `
-        -Info $Info `
-        -Probe $Probe `
-        -CodecProfile $CodecProfile `
-        -Mode $Mode `
-        -Preset $Preset `
-        -AudioPlan $audioPlan `
-        -PreprocessProfile $PreprocessProfile
-    )
-    $audioCandidates = @($audioPlan)
-  }
-  else {
-    $planBundle = Get-PlanList -Info $Info -Probe $Probe -CodecProfile $CodecProfile -TargetBytes $TargetBytes -Mode $Mode -RateControl $RateControl -Preset $Preset -PreprocessProfile $PreprocessProfile
-    $plans = @($planBundle.Plans)
-    $audioCandidates = @($planBundle.AudioCandidates)
-  }
+  $planBundle = Get-PlanList -Info $Info -Probe $Probe -CodecProfile $CodecProfile -TargetBytes $TargetBytes -Mode $Mode -Preset $Preset -PreprocessProfile $PreprocessProfile
+  $plans = @($planBundle.Plans)
+  $audioCandidates = @($planBundle.AudioCandidates)
 
   if (-not $plans -or $plans.Count -eq 0 -or $null -eq $plans[0]) {
     throw "No viable encode plans were generated."
   }
 
-  if ($RateControl -eq "ConstantQuality") {
-    $finalists = @(Set-PlanPreviewMetadata -Plans @($plans | Select-Object -First 1))
+  $archetypes = Get-PlanArchetypes -Plans $plans -Info $Info -Probe $Probe -TargetBytes $TargetBytes -Mode $Mode
+  if (-not $archetypes -or $archetypes.Count -eq 0) {
+    throw "No viable archetypal plans were generated."
   }
-  else {
-    $maxPlans = switch ($Mode) {
-      "Fast"         { 2 }
-      "Balanced"     { 4 }
-      "ExtraQuality" { 6 }
+
+  $finalistBundle = Get-PlanFinalists -Info $Info -Plans $archetypes -InputPath $InputPath -TempDir $TempDir -Mode $Mode
+  $finalists = @($finalistBundle.Plans)
+
+  if (-not $finalists -or $finalists.Count -eq 0) {
+    throw "No executable finalist plans were selected."
+  }
+
+  $result = switch ($Mode) {
+    "Fast" {
+      Invoke-FastModeSearch -InputPath $InputPath -Plans $finalists -AllPlans $plans -TempDir $TempDir -PreviewsRun $finalistBundle.PreviewsRun
     }
-
-    $candidatePlans = @($plans | Select-Object -First $maxPlans)
-    $finalists = Get-PlanFinalists -Info $Info -Plans $candidatePlans -InputPath $InputPath -TempDir $TempDir -Mode $Mode
-  }
-
-  $bestUnder = $null
-  $tested = 0
-
-  foreach ($plan in $finalists) {
-    $tested++
-    $presetCandidates = Get-PresetCandidatesForPlan -Plan $plan -BasePreset $Preset -PresetWasExplicit $PresetWasExplicit -PlanIndex $tested
-
-    foreach ($presetCandidate in $presetCandidates) {
-      $planForPreset = $plan.PSObject.Copy()
-      $planForPreset.Preset = $presetCandidate
-
-      Write-Host ("Testing plan {0}/{1}: {2}x{3} @{4}fps | rc={5} | codec={6} | v={7}k | crf={8} | a={9} | detail={10} | motion={11} | bpppf={12:N4} | preset={13} | width={14} | pp={15} | crop={16}" -f $tested, $finalists.Count, $planForPreset.Width, $planForPreset.Height, $planForPreset.Fps, $planForPreset.RateControl, $planForPreset.CodecProfile.VideoCodec, $planForPreset.VideoKbps, $planForPreset.Crf, $planForPreset.AudioPlan.Label, $planForPreset.DetailBucket, $planForPreset.MotionBucket, $planForPreset.Bpppf, $planForPreset.Preset, $planForPreset.WidthOrigin, $planForPreset.PreprocessLabel, $planForPreset.CropSummary)
-
-      $result = Try-PlanWithAdjustments -InputPath $InputPath -Plan $planForPreset -TempDir $TempDir -AllAudioPlans $audioCandidates
-
-      if ($result.Success) {
-        if ($null -eq $bestUnder) {
-          $bestUnder = $result
-        }
-        else {
-          if (Test-IsBetterResult -Candidate $result -Current $bestUnder) {
-            if ($bestUnder.Path -and (Test-Path $bestUnder.Path)) {
-              Remove-Item $bestUnder.Path -Force -ErrorAction SilentlyContinue
-            }
-            $bestUnder = $result
-          }
-          else {
-            if ($result.Path -and (Test-Path $result.Path)) {
-              Remove-Item $result.Path -Force -ErrorAction SilentlyContinue
-            }
-          }
-        }
-
-        $earlyAcceptRatio = Get-EarlyAcceptRatioForMode -mode $Mode
-        if ($RateControl -eq "ExactSize" -and $Mode -eq "Balanced" -and $tested -eq 1 -and $bestUnder -and $bestUnder.Ratio -ge $earlyAcceptRatio) {
-          return $bestUnder
-        }
-      }
+    "Balanced" {
+      Invoke-BalancedModeSearch -InputPath $InputPath -Plans $finalists -AllPlans $plans -TempDir $TempDir -PreviewsRun $finalistBundle.PreviewsRun
+    }
+    default {
+      Invoke-ExtraQualityModeSearch -InputPath $InputPath -Plans $finalists -AllPlans $plans -TempDir $TempDir -PreviewsRun $finalistBundle.PreviewsRun -PresetWasExplicit:$PresetWasExplicit
     }
   }
 
-  return $bestUnder
+  if ($result -and $result.SearchStats) {
+    $result.SearchStats.ProbeSamplesUsed = [int](Get-ObjectPropertyValue -Object $Probe -Name "ProbeSamplesUsed" -DefaultValue 0)
+  }
+
+  return $result
 }
 
 Require-Tool "ffmpeg"
@@ -2925,7 +3502,7 @@ $codecProfile = Resolve-CodecProfile -VideoCodec $VideoCodec -Container $Contain
 Assert-CodecProfileSupport -CodecProfile $codecProfile
 
 if ([string]::IsNullOrWhiteSpace($OutputFile)) {
-  $OutputFile = Get-DefaultOutputPath -InputPath $inputFull -CodecProfile $codecProfile -RateControl $RateControl
+  $OutputFile = Get-DefaultOutputPath -InputPath $inputFull -CodecProfile $codecProfile
 }
 
 Assert-OutputFileMatchesProfile -OutputPath $OutputFile -CodecProfile $codecProfile
@@ -2960,7 +3537,6 @@ Write-Host "Total budget:     $(if ($hasExplicitTarget) { '{0} kbps' -f ([math]:
 Write-Host "Mode:             $Mode"
 Write-Host "Output codec:     $($codecProfile.VideoCodec)"
 Write-Host "Container:        $($codecProfile.Container)"
-Write-Host "Rate control:     $RateControl"
 Write-Host "Preset:           $Preset"
 Write-Host "Crop mode:        $CropMode"
 Write-Host "Crop detect:      $(Get-CropSummary -Info $info)"
@@ -2977,8 +3553,7 @@ try {
     -InputPath $inputFull `
     -TempDir $tempDir `
     -Mode $Mode `
-    -SampleSeconds $ProbeSampleSeconds `
-    -MaxSamples $MaxProbeSamples
+    -SampleSeconds $ProbeSampleSeconds
   $resolutionProfile = Get-ResolutionPlanningProfile -Info $info -Probe $probe -Mode $Mode
 
   Write-Host "Detail probe:     $($probe.DetailProbe.ProbeWidth)p @ $($probe.DetailProbe.ProbeFps) fps"
@@ -3003,23 +3578,12 @@ try {
     -TempDir $tempDir `
     -TargetBytes $usableTargetBytes `
     -Mode $Mode `
-    -RateControl $RateControl `
     -Preset $Preset `
     -PresetWasExplicit $presetWasExplicit `
     -PreprocessProfile $PreprocessProfile
 
   if (-not $winner -or -not $winner.Success) {
-    switch ($RateControl) {
-      "ExactSize" {
-        throw "Could not get under target size with the current exact-size plan."
-      }
-      "QualityCap" {
-        throw "Could not get under target size with the current quality-cap plan."
-      }
-      default {
-        throw "Constant-quality encoding failed."
-      }
-    }
+    throw "Could not get under target size with the current exact-size plan."
   }
 
   $winner.SizeBytes = Finalize-OutputFile -InputPath $winner.Path -OutputPath $OutputFile -CodecProfile $codecProfile
@@ -3031,10 +3595,9 @@ try {
   Write-Host "Chosen width:     $($winner.Plan.Width)"
   Write-Host "Chosen height:    $($winner.Plan.Height)"
   Write-Host "Chosen fps:       $($winner.Plan.Fps)"
-  Write-Host "Rate control:     $($winner.Plan.RateControl)"
   Write-Host "Chosen codec:     $($winner.Plan.CodecProfile.VideoCodec)"
   Write-Host "Container:        $($winner.Plan.CodecProfile.Container)"
-  Write-Host "Video bitrate:    $(if ($winner.Plan.VideoKbps -gt 0) { "$($winner.Plan.VideoKbps) kbps" } else { '(crf only)' })"
+  Write-Host "Video bitrate:    $($winner.Plan.VideoKbps) kbps"
   Write-Host "Chosen CRF:       $($winner.Plan.Crf)"
   Write-Host "Chosen audio:     $($winner.Plan.AudioPlan.Label)"
   Write-Host "Chosen preset:    $($winner.Plan.Preset)"
@@ -3047,6 +3610,13 @@ try {
   Write-Host "Predicted bpppf:  $('{0:N4}' -f $winner.Plan.Bpppf)"
   Write-Host "Video args:       $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VideoPrivateArgs)) { '(default)' } else { $winner.Plan.VideoPrivateArgs })"
   Write-Host "Video filter:     $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VFilter)) { '(none)' } else { $winner.Plan.VFilter })"
+  if ($winner.SearchStats) {
+    Write-Host "Probe samples:    $($winner.SearchStats.ProbeSamplesUsed)"
+    Write-Host "Previews run:     $($winner.SearchStats.PreviewsRun)"
+    Write-Host "Full encodes:     $($winner.SearchStats.FullEncodesRun)"
+    Write-Host "Second-stage:     $(if ([string]::IsNullOrWhiteSpace($winner.SearchStats.SecondEncodeReason)) { '(none)' } else { $winner.SearchStats.SecondEncodeReason })"
+    Write-Host "Prediction bias:  $('{0:N3}' -f $winner.SearchStats.PredictionBias)"
+  }
 }
 finally {
   if (Test-Path $tempDir) {
