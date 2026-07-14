@@ -733,12 +733,25 @@ function Get-ProbeInfo($path) {
     $audioBitrate = [int][math]::Round(([double]$audio.bit_rate) / 1000.0)
   }
 
+  $pixelFormat = [string](Get-ObjectPropertyValue -Object $video -Name "pix_fmt" -DefaultValue "")
+  $videoBitDepth = 8
+  $rawBitDepthText = [string](Get-ObjectPropertyValue -Object $video -Name "bits_per_raw_sample" -DefaultValue "")
+  $parsedBitDepth = 0
+  if ([int]::TryParse($rawBitDepthText, [ref]$parsedBitDepth) -and $parsedBitDepth -gt 0) {
+    $videoBitDepth = $parsedBitDepth
+  }
+  elseif ($pixelFormat -match '(?:p0?|gray)(?<depth>9|10|12|14|16)(?:le|be)?$') {
+    $videoBitDepth = [int]$matches["depth"]
+  }
+
   [PSCustomObject]@{
     Duration         = [double]::Parse($probe.format.duration, [Globalization.CultureInfo]::InvariantCulture)
     Width            = [int]$video.width
     Height           = [int]$video.height
     Fps              = $srcFps
     VideoCodec       = [string]$video.codec_name
+    PixelFormat      = $pixelFormat
+    VideoBitDepth    = $videoBitDepth
     VideoBitrateKbps = $videoBitrate
     HasAudio         = [bool]$audio
     AudioCodec       = if ($audio) { [string]$audio.codec_name } else { "" }
@@ -1722,7 +1735,9 @@ function Invoke-CropDetectSample {
     "-ss", "$Offset",
     "-t", "$SampleSeconds",
     "-i", $InputPath,
-    "-vf", "cropdetect=limit=24:round=2:reset=0",
+    # A normalized threshold keeps the 24/255 black cutoff equivalent for 8-,
+    # 10-, and 12-bit sources.
+    "-vf", "cropdetect=limit=0.0941176:round=2:reset=0",
     "-an",
     "-f", "null",
     "NUL"
@@ -1744,13 +1759,200 @@ function Invoke-CropDetectSample {
   }
 }
 
+function Get-CropSampleOffsets {
+  param(
+    [Parameter(Mandatory = $true)][double]$Duration,
+    [Parameter(Mandatory = $true)][int]$SampleLength,
+    [Parameter(Mandatory = $true)][int]$MaxSamples
+  )
+
+  if ($Duration -le ($SampleLength + 0.1)) {
+    return @(0.0)
+  }
+
+  # Crop is applied to the whole encode, so include the beginning and end rather
+  # than assuming that mid-video samples represent intros, credits, or overlays.
+  $usableEnd = [math]::Max(0.0, $Duration - $SampleLength - 0.05)
+  $fractions = @(
+    switch ($MaxSamples) {
+      1 { 0.50 }
+      2 { 0.00; 1.00 }
+      3 { 0.00; 0.50; 1.00 }
+      4 { 0.00; 0.33; 0.67; 1.00 }
+      default { 0.00; 0.25; 0.50; 0.75; 1.00 }
+    }
+  )
+
+  $count = [math]::Min($fractions.Length, $MaxSamples)
+  $offsets = foreach ($fraction in @($fractions[0..($count - 1)])) {
+    [math]::Round($usableEnd * $fraction, 3)
+  }
+  return @($offsets | Select-Object -Unique)
+}
+
+function Test-CropBorderPairBalanced {
+  param(
+    [Parameter(Mandatory = $true)][int]$FirstBorder,
+    [Parameter(Mandatory = $true)][int]$SecondBorder
+  )
+
+  if ($FirstBorder -eq 0 -and $SecondBorder -eq 0) {
+    return $true
+  }
+
+  # Automatic cropping should only remove conventional paired bars. A lone dark
+  # edge is much more likely to be picture composition, a title bar, or UI.
+  if ($FirstBorder -le 0 -or $SecondBorder -le 0) {
+    return $false
+  }
+
+  $largestBorder = [int][math]::Max($FirstBorder, $SecondBorder)
+  $allowedDifference = [int][math]::Max(4, [math]::Ceiling($largestBorder * 0.10))
+  return ([math]::Abs($FirstBorder - $SecondBorder) -le $allowedDifference)
+}
+
+function Test-CropBorderRegionsBlank {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][double]$Offset,
+    [Parameter(Mandatory = $true)][int]$SampleSeconds,
+    [Parameter(Mandatory = $true)][int]$BitDepth,
+    [Parameter(Mandatory = $true)][object[]]$Regions
+  )
+
+  $validRegions = @($Regions | Where-Object { $_.Width -gt 0 -and $_.Height -gt 0 })
+  if ($validRegions.Count -eq 0) {
+    return $true
+  }
+
+  $offsetText = [string]::Format([Globalization.CultureInfo]::InvariantCulture, "{0:F3}", $Offset)
+  $filterParts = New-Object System.Collections.Generic.List[string]
+  $inputLabels = @()
+  if ($validRegions.Count -eq 1) {
+    $inputLabels = @("[0:v]")
+  }
+  else {
+    $inputLabels = @(for ($index = 0; $index -lt $validRegions.Count; $index++) { "[border${index}in]" })
+    [void]$filterParts.Add(("[0:v]split={0}{1}" -f $validRegions.Count, ($inputLabels -join "")))
+  }
+
+  for ($index = 0; $index -lt $validRegions.Count; $index++) {
+    $region = $validRegions[$index]
+    $outputLabel = "[border${index}out]"
+    [void]$filterParts.Add(("{0}crop={1}:{2}:{3}:{4},fps=8,signalstats,metadata=print{5}" -f $inputLabels[$index], $region.Width, $region.Height, $region.X, $region.Y, $outputLabel))
+  }
+
+  $filter = $filterParts -join ";"
+  $args = @(
+    "-hide_banner",
+    "-loglevel", "info",
+    "-ss", $offsetText,
+    "-t", "$SampleSeconds",
+    "-i", $InputPath,
+    "-filter_complex", $filter
+  )
+  for ($index = 0; $index -lt $validRegions.Count; $index++) {
+    $args += @("-map", "[border${index}out]", "-an", "-f", "null", "NUL")
+  }
+
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args $args -AllowFailure
+  if ($capture.ExitCode -ne 0) {
+    return $false
+  }
+
+  $values = @{}
+  foreach ($key in @("YMIN", "YMAX", "UMIN", "UMAX", "VMIN", "VMAX")) {
+    $matches = [regex]::Matches($capture.Output, ("lavfi\.signalstats\.{0}=(?<value>[0-9.]+)" -f $key))
+    if ($matches.Count -eq 0) {
+      return $false
+    }
+    $values[$key] = @($matches | ForEach-Object {
+        [double]::Parse($_.Groups["value"].Value, [Globalization.CultureInfo]::InvariantCulture)
+      })
+  }
+
+  $sampleScale = [math]::Pow(2.0, [math]::Max(0, $BitDepth - 8))
+  $yMinimum = [double](($values["YMIN"] | Measure-Object -Minimum).Minimum)
+  $yMaximum = [double](($values["YMAX"] | Measure-Object -Maximum).Maximum)
+  $uMinimum = [double](($values["UMIN"] | Measure-Object -Minimum).Minimum)
+  $uMaximum = [double](($values["UMAX"] | Measure-Object -Maximum).Maximum)
+  $vMinimum = [double](($values["VMIN"] | Measure-Object -Minimum).Minimum)
+  $vMaximum = [double](($values["VMAX"] | Measure-Object -Maximum).Maximum)
+
+  # Encoded black padding can contain a little quantization noise. These limits
+  # allow that noise but reject text, icons, gradients, colored pixels, and other
+  # low-luma picture detail that cropdetect alone can misclassify as black.
+  $maximumBlankLuma = 40.0 * $sampleScale
+  $maximumLumaRange = 24.0 * $sampleScale
+  $minimumNeutralChroma = 96.0 * $sampleScale
+  $maximumNeutralChroma = 160.0 * $sampleScale
+  $maximumChromaRange = 32.0 * $sampleScale
+
+  return (
+    $yMaximum -le $maximumBlankLuma -and
+    ($yMaximum - $yMinimum) -le $maximumLumaRange -and
+    $uMinimum -ge $minimumNeutralChroma -and
+    $uMaximum -le $maximumNeutralChroma -and
+    ($uMaximum - $uMinimum) -le $maximumChromaRange -and
+    $vMinimum -ge $minimumNeutralChroma -and
+    $vMaximum -le $maximumNeutralChroma -and
+    ($vMaximum - $vMinimum) -le $maximumChromaRange
+  )
+}
+
+function Test-CropBordersBlank {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][double[]]$Offsets,
+    [Parameter(Mandatory = $true)][int]$SampleSeconds,
+    [Parameter(Mandatory = $true)][int]$CropWidth,
+    [Parameter(Mandatory = $true)][int]$CropHeight,
+    [Parameter(Mandatory = $true)][int]$CropX,
+    [Parameter(Mandatory = $true)][int]$CropY
+  )
+
+  $rightRemoved = [int]($Info.Width - ($CropX + $CropWidth))
+  $bottomRemoved = [int]($Info.Height - ($CropY + $CropHeight))
+  $regions = New-Object System.Collections.Generic.List[object]
+
+  if ($CropX -gt 0) {
+    [void]$regions.Add([PSCustomObject]@{ Width = $CropX; Height = [int]$Info.Height; X = 0; Y = 0 })
+  }
+  if ($rightRemoved -gt 0) {
+    [void]$regions.Add([PSCustomObject]@{ Width = $rightRemoved; Height = [int]$Info.Height; X = [int]($Info.Width - $rightRemoved); Y = 0 })
+  }
+  if ($CropY -gt 0) {
+    [void]$regions.Add([PSCustomObject]@{ Width = [int]$Info.Width; Height = $CropY; X = 0; Y = 0 })
+  }
+  if ($bottomRemoved -gt 0) {
+    [void]$regions.Add([PSCustomObject]@{ Width = [int]$Info.Width; Height = $bottomRemoved; X = 0; Y = [int]($Info.Height - $bottomRemoved) })
+  }
+
+  $bitDepth = [int](Get-ObjectPropertyValue -Object $Info -Name "VideoBitDepth" -DefaultValue 8)
+
+  foreach ($offset in $Offsets) {
+    $isBlank = Test-CropBorderRegionsBlank `
+      -InputPath $InputPath `
+      -Offset $offset `
+      -SampleSeconds $SampleSeconds `
+      -BitDepth $bitDepth `
+      -Regions $regions.ToArray()
+    if (-not $isBlank) {
+      return $false
+    }
+  }
+
+  return $true
+}
+
 function Invoke-CropDetect {
   param(
     [Parameter(Mandatory = $true)]$Info,
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)][string]$CropMode,
-    [int]$SampleSeconds = 3,
-    [int]$MaxSamples = 3
+    [int]$SampleSeconds = 2,
+    [int]$MaxSamples = 5
   )
 
   $defaultResult = [PSCustomObject]@{
@@ -1769,7 +1971,7 @@ function Invoke-CropDetect {
     return $defaultResult
   }
 
-  $offsets = Get-SampleOffsets -duration $Info.Duration -sampleLength $SampleSeconds -maxSamples $MaxSamples
+  $offsets = Get-CropSampleOffsets -Duration $Info.Duration -SampleLength $SampleSeconds -MaxSamples $MaxSamples
   $samples = New-Object System.Collections.Generic.List[object]
 
   foreach ($offset in $offsets) {
@@ -1795,22 +1997,51 @@ function Invoke-CropDetect {
     return $defaultResult
   }
 
-  $cropWidth = [int][math]::Round(($samples | Measure-Object -Property Width -Average).Average / 2.0) * 2
-  $cropHeight = [int][math]::Round(($samples | Measure-Object -Property Height -Average).Average / 2.0) * 2
-  $cropX = [int][math]::Round(($samples | Measure-Object -Property X -Average).Average / 2.0) * 2
-  $cropY = [int][math]::Round(($samples | Measure-Object -Property Y -Average).Average / 2.0) * 2
-  $cropWidth = [int][math]::Min($Info.Width, [math]::Max(2, $cropWidth))
-  $cropHeight = [int][math]::Min($Info.Height, [math]::Max(2, $cropHeight))
+  # Use the union of detected picture rectangles. Averaging can trim pixels that
+  # even one sample identified as picture content.
+  $cropX = [int](($samples | Measure-Object -Property X -Minimum).Minimum)
+  $cropY = [int](($samples | Measure-Object -Property Y -Minimum).Minimum)
+  $cropRight = [int](($samples | ForEach-Object { $_.X + $_.Width } | Measure-Object -Maximum).Maximum)
+  $cropBottom = [int](($samples | ForEach-Object { $_.Y + $_.Height } | Measure-Object -Maximum).Maximum)
   $cropX = [int][math]::Max(0, $cropX)
   $cropY = [int][math]::Max(0, $cropY)
+  $cropRight = [int][math]::Min($Info.Width, $cropRight)
+  $cropBottom = [int][math]::Min($Info.Height, $cropBottom)
+  $cropWidth = [int][math]::Max(2, $cropRight - $cropX)
+  $cropHeight = [int][math]::Max(2, $cropBottom - $cropY)
 
   $rightRemoved = [int][math]::Max(0, $Info.Width - ($cropWidth + $cropX))
   $bottomRemoved = [int][math]::Max(0, $Info.Height - ($cropHeight + $cropY))
   $maxBorderRemoved = (@($cropX, $cropY, $rightRemoved, $bottomRemoved) | Measure-Object -Maximum).Maximum
   $removedAreaRatio = 1.0 - (([double]$cropWidth * [double]$cropHeight) / ([double]$Info.Width * [double]$Info.Height))
 
-  if ($removedAreaRatio -lt 0.04 -and $maxBorderRemoved -lt 6) {
-    $defaultResult.Summary = "none"
+  # Cropping is an optimization, so marginal savings are not worth any risk of
+  # deleting edge detail. Both tests must pass before more expensive validation.
+  if ($removedAreaRatio -lt 0.04 -or $maxBorderRemoved -lt 8) {
+    $defaultResult.Summary = "insignificant"
+    $defaultResult.Samples = $samples.ToArray()
+    return $defaultResult
+  }
+
+  $horizontalPairBalanced = Test-CropBorderPairBalanced -FirstBorder $cropX -SecondBorder $rightRemoved
+  $verticalPairBalanced = Test-CropBorderPairBalanced -FirstBorder $cropY -SecondBorder $bottomRemoved
+  if (-not $horizontalPairBalanced -or -not $verticalPairBalanced) {
+    $defaultResult.Summary = "asymmetric"
+    $defaultResult.Samples = $samples.ToArray()
+    return $defaultResult
+  }
+
+  $bordersBlank = Test-CropBordersBlank `
+    -Info $Info `
+    -InputPath $InputPath `
+    -Offsets @($offsets) `
+    -SampleSeconds $SampleSeconds `
+    -CropWidth $cropWidth `
+    -CropHeight $cropHeight `
+    -CropX $cropX `
+    -CropY $cropY
+  if (-not $bordersBlank) {
+    $defaultResult.Summary = "border-content"
     $defaultResult.Samples = $samples.ToArray()
     return $defaultResult
   }
