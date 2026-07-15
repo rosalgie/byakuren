@@ -9,6 +9,7 @@ namespace Byakuren.Results;
 
 public sealed class ResultContract
 {
+    public const string SchemaVersion = "byakuren.compress.result.v1";
     private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
 
     public async Task<object> BuildAsync(
@@ -38,7 +39,7 @@ public sealed class ResultContract
 
         return new
         {
-            SchemaVersion = "byakuren.compress.result.v1",
+            SchemaVersion,
             Status = "succeeded",
             Action = action,
             StartedUtc = started,

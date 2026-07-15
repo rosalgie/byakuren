@@ -73,7 +73,7 @@ public static class CLIOptions
           --enable-experimental-encoders
           --result-json <path>
 
-        PowerShell-style names such as -InputFile and -TargetBytes are also accepted.
+        Single-dash aliases such as -InputFile and -TargetBytes are also accepted.
         """;
 
     private static long ParseTargetBytes(Dictionary<string, string?> values)

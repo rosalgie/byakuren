@@ -6,6 +6,7 @@ using Byakuren.Execution;
 using Byakuren.Models;
 using Byakuren.Planner;
 using Byakuren.Policy;
+using Byakuren.Results;
 using Byakuren.Worker;
 
 namespace Byakuren.Tests;
@@ -17,19 +18,15 @@ public static class Program
 
     public static async Task<int> Main(string[] arguments)
     {
-        string repositoryRoot = FindRepositoryRoot();
-        string goldenPath = Path.Combine(repositoryRoot, "tests", "golden", "parity-v1.json");
-        using JsonDocument golden = JsonDocument.Parse(File.ReadAllText(goldenPath));
-
-        Run("golden policy parity", () => TestPolicyCases(golden.RootElement));
+        Run("codec policy resolves expected production profiles", TestPolicyCases);
         Run("automatic policies retain ordered functional fallbacks", TestAutomaticPolicyFallbacks);
-        Run("golden canonical canvas parity", () => TestCanvasCases(golden.RootElement));
-        Run("golden mode strategy parity", () => TestModeCases(golden.RootElement));
+        Run("canonical canvas normalizes source geometry", TestCanvasCases);
+        Run("mode strategies enforce encode and fill limits", TestModeCases);
         Run("payload correction targets the working budget once", TestPayloadCorrection);
         Run("frozen direct evidence recognizes gameplay and screen content", TestContentClassifier);
         Run("process execution never invokes a shell", TestProcessStartInfo);
-        Run("CLI accepts PowerShell-compatible option names", TestCliAliases);
-        Run("result schema uses byakuren identity", () => Equal("byakuren.compress.result.v1", golden.RootElement.GetProperty("schemaVersion").GetString(), "schema"));
+        Run("CLI accepts single-dash aliases", TestCLIAliases);
+        Run("result schema uses byakuren identity", () => Equal("byakuren.compress.result.v1", ResultContract.SchemaVersion, "schema"));
 
         if (arguments.Contains("--media", StringComparer.OrdinalIgnoreCase))
             await RunMediaTestsAsync().ConfigureAwait(false);
@@ -38,56 +35,68 @@ public static class Program
         return _failed == 0 ? 0 : 1;
     }
 
-    private static void TestPolicyCases(JsonElement root)
+    private static void TestPolicyCases()
     {
-        CompressionPolicy policy = new();
-        foreach (JsonElement testCase in root.GetProperty("policyCases").EnumerateArray())
+        CompressionPolicy policy = new CompressionPolicy();
+        PolicyCase[] cases =
+        [
+            new PolicyCase("widest-auto", "auto", "auto", "auto", "widest", false, "x264", "libx264", "mp4"),
+            new PolicyCase("modern-auto", "auto", "auto", "auto", "modern", false, "av1", "svtav1", "webm"),
+            new PolicyCase("pinned-x265", "x265", "auto", "auto", "widest", false, "x265", "libx265", "mp4"),
+            new PolicyCase("explicit-aom", "auto", "aom", "auto", "modern", true, "av1", "aom", "webm"),
+            new PolicyCase("explicit-vpx", "auto", "vpx", "auto", "modern", true, "vp9", "vpx", "webm")
+        ];
+        foreach (PolicyCase testCase in cases)
         {
             CompressionRequest request = new()
             {
                 InputPath = "input.mp4",
                 TargetBytes = 1_000_000,
-                VideoCodec = Text(testCase, "videoCodec"),
-                EncoderBackend = Text(testCase, "encoderBackend"),
-                Container = Text(testCase, "container"),
-                CompatibilityMode = Text(testCase, "compatibility"),
-                EnableExperimentalEncoders = testCase.GetProperty("experimental").GetBoolean(),
+                VideoCodec = testCase.VideoCodec,
+                EncoderBackend = testCase.EncoderBackend,
+                Container = testCase.Container,
+                CompatibilityMode = testCase.Compatibility,
+                EnableExperimentalEncoders = testCase.Experimental,
                 Mode = CompressionMode.Fast
             };
             ResolvedPolicy resolved = policy.Resolve(request);
-            string name = Text(testCase, "name");
-            Equal(Text(testCase, "expectedCodec"), resolved.Profile.VideoCodec, name + " codec");
-            Equal(Text(testCase, "expectedBackend"), resolved.Profile.Backend, name + " backend");
-            Equal(Text(testCase, "expectedContainer"), resolved.Profile.Container, name + " container");
+            Equal(testCase.ExpectedCodec, resolved.Profile.VideoCodec, testCase.Name + " codec");
+            Equal(testCase.ExpectedBackend, resolved.Profile.Backend, testCase.Name + " backend");
+            Equal(testCase.ExpectedContainer, resolved.Profile.Container, testCase.Name + " container");
         }
     }
 
-    private static void TestCanvasCases(JsonElement root)
+    private static void TestCanvasCases()
     {
-        CompressionPlanner planner = new();
-        foreach (JsonElement testCase in root.GetProperty("canvasCases").EnumerateArray())
+        CompressionPlanner planner = new CompressionPlanner();
+        CanvasCase[] cases =
+        [
+            new CanvasCase("bounded-uhd", 3840, 2160, 120, 8, 1, 0, 1920, 1080, 60, "yuv420p"),
+            new CanvasCase("no-upscale-ten-bit", 640, 360, 29.97, 10, 1, 0, 640, 360, 29.97, "yuv420p10le"),
+            new CanvasCase("portrait-rotation", 1920, 1080, 60, 8, 1, 90, 1080, 1920, 60, "yuv420p")
+        ];
+        foreach (CanvasCase testCase in cases)
         {
             MediaInfo media = new()
             {
                 Path = "input",
                 InputBytes = 1,
                 DurationSeconds = 1,
-                Width = Number(testCase, "width"),
-                Height = Number(testCase, "height"),
-                Fps = Decimal(testCase, "fps"),
+                Width = testCase.Width,
+                Height = testCase.Height,
+                Fps = testCase.FPS,
                 VideoCodec = "h264",
                 PixelFormat = "yuv420p",
-                BitDepth = Number(testCase, "bitDepth"),
+                BitDepth = testCase.BitDepth,
                 FormatName = "mp4",
-                SampleAspectRatio = Decimal(testCase, "sar"),
-                Rotation = Number(testCase, "rotation")
+                SampleAspectRatio = testCase.SampleAspectRatio,
+                Rotation = testCase.Rotation
             };
             CanonicalCanvas canvas = planner.GetCanonicalCanvas(media);
-            string name = Text(testCase, "name");
-            Equal(Number(testCase, "expectedWidth"), canvas.Width, name + " width");
-            Equal(Number(testCase, "expectedHeight"), canvas.Height, name + " height");
-            Near(Decimal(testCase, "expectedFps"), canvas.Fps, 0.0001, name + " fps");
-            Equal(Text(testCase, "expectedPixelFormat"), canvas.PixelFormat, name + " format");
+            Equal(testCase.ExpectedWidth, canvas.Width, testCase.Name + " width");
+            Equal(testCase.ExpectedHeight, canvas.Height, testCase.Name + " height");
+            Near(testCase.ExpectedFPS, canvas.Fps, 0.0001, testCase.Name + " fps");
+            Equal(testCase.ExpectedPixelFormat, canvas.PixelFormat, testCase.Name + " format");
         }
     }
 
@@ -116,14 +125,19 @@ public static class Program
         Equal("libx264", string.Join(',', mp4Backends), "explicit container filter");
     }
 
-    private static void TestModeCases(JsonElement root)
+    private static void TestModeCases()
     {
-        foreach (JsonElement testCase in root.GetProperty("modeCases").EnumerateArray())
+        (CompressionMode Mode, int MaxFullEncodes, double FillGate)[] cases =
+        [
+            (CompressionMode.Fast, 2, 0.97),
+            (CompressionMode.Balanced, 3, 0.99),
+            (CompressionMode.ExtraQuality, 5, 0.995)
+        ];
+        foreach ((CompressionMode mode, int maxFullEncodes, double fillGate) in cases)
         {
-            CompressionMode mode = Enum.Parse<CompressionMode>(Text(testCase, "mode"));
             ModeStrategy strategy = CompressionPlanner.Strategy(mode);
-            Equal(Number(testCase, "maxFullEncodes"), strategy.MaxFullEncodes, mode + " encodes");
-            Near(Decimal(testCase, "fillGate"), strategy.FillGate, 1e-9, mode + " fill");
+            Equal(maxFullEncodes, strategy.MaxFullEncodes, mode + " encodes");
+            Near(fillGate, strategy.FillGate, 1e-9, mode + " fill");
         }
     }
 
@@ -204,7 +218,7 @@ public static class Program
         Equal(662, corrected, "corrected bitrate");
     }
 
-    private static void TestCliAliases()
+    private static void TestCLIAliases()
     {
         CompressionRequest request = CLIOptions.Parse(["-InputFile", "input.mp4", "-TargetBytes", "123456", "-Mode", "Fast", "-ResultJsonPath", "result.json"]);
         Equal("input.mp4", request.InputPath, "input");
@@ -328,26 +342,36 @@ public static class Program
         HasAudio = hasAudio
     };
 
-    private static string FindRepositoryRoot()
-    {
-        DirectoryInfo? directory = new(AppContext.BaseDirectory);
-        while (directory is not null)
-        {
-            if (File.Exists(Path.Combine(directory.FullName, "compress.ps1"))) return directory.FullName;
-            directory = directory.Parent;
-        }
-        throw new DirectoryNotFoundException("Could not locate repository root.");
-    }
-
     private static void Run(string name, Action test)
     {
         try { test(); _passed++; Console.WriteLine($"PASS {name}"); }
         catch (Exception exception) { _failed++; Console.WriteLine($"FAIL {name} - {exception.Message}"); }
     }
 
-    private static string Text(JsonElement element, string name) => element.GetProperty(name).GetString()!;
-    private static int Number(JsonElement element, string name) => element.GetProperty(name).GetInt32();
-    private static double Decimal(JsonElement element, string name) => element.GetProperty(name).GetDouble();
     private static void Equal<T>(T expected, T actual, string name) { if (!EqualityComparer<T>.Default.Equals(expected, actual)) throw new InvalidOperationException($"{name}: expected '{expected}', actual '{actual}'"); }
     private static void Near(double expected, double actual, double tolerance, string name) { if (Math.Abs(expected - actual) > tolerance) throw new InvalidOperationException($"{name}: expected '{expected}', actual '{actual}'"); }
+
+    private sealed record PolicyCase(
+        string Name,
+        string VideoCodec,
+        string EncoderBackend,
+        string Container,
+        string Compatibility,
+        bool Experimental,
+        string ExpectedCodec,
+        string ExpectedBackend,
+        string ExpectedContainer);
+
+    private sealed record CanvasCase(
+        string Name,
+        int Width,
+        int Height,
+        double FPS,
+        int BitDepth,
+        double SampleAspectRatio,
+        int Rotation,
+        int ExpectedWidth,
+        int ExpectedHeight,
+        double ExpectedFPS,
+        string ExpectedPixelFormat);
 }
