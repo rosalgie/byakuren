@@ -212,6 +212,39 @@ Invoke-Test "under-cap passthrough preserves bytes exactly" {
   finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
+Invoke-Test "versioned copy result preserves unavailable metrics" {
+  $temp = Join-Path $env:TEMP ("compress_result_test_" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $temp | Out-Null
+  try {
+    $input = Join-Path $temp "input.mp4"
+    $output = Join-Path $temp "output.mp4"
+    $jsonPath = Join-Path $temp "result.json"
+    [IO.File]::WriteAllBytes($input, (New-Object byte[] 64))
+    [IO.File]::Copy($input, $output)
+    $info = New-TestInfo
+    foreach ($entry in @{
+        InputBytes = 64L; Duration = 1.0; VideoCodec = "h264"; AudioCodec = "aac"; HasAudio = $true
+      }.GetEnumerator()) {
+      $info | Add-Member -NotePropertyName $entry.Key -NotePropertyValue $entry.Value -Force
+    }
+    $profile = Resolve-CodecProfile -VideoCodec x264 -Container mp4 -EncoderBackend libx264
+    $policy = [PSCustomObject]@{
+      VideoCodec = "x264"; EncoderBackend = "libx264"; Container = "mp4"; DefaultAudioCodec = "aac"
+      CodecPolicyReason = "pinned"; ContainerPolicyReason = "codec-default"; CompatibilityMode = "widest"
+    }
+    $result = New-CompressorResultObject -Action copy -Info $info -CodecProfile $profile -PolicyProfile $policy -InputPath $input -OutputPath $output -HardCapBytes 100 -WorkingTargetBytes 99
+    Assert-Equal $result.SchemaVersion "barusu.compress.result.v1" "Unexpected result schema"
+    Assert-Equal $result.Metrics.Available $false "Copy result advertised metric evidence"
+    Assert-Equal $result.Metrics.PrimaryScore $null "Unavailable metric became zero-valued"
+    Assert-Equal $result.CapabilityProbe.SkippedReason "under-cap passthrough" "Copy probe disposition is missing"
+    Write-CompressorResultJson -Result $result -Path $jsonPath | Out-Null
+    $roundTrip = Get-Content -LiteralPath $jsonPath -Raw | ConvertFrom-Json
+    Assert-Equal $roundTrip.Output.Bytes 64 "Result JSON output size changed"
+    Assert-Equal $roundTrip.Output.Sha256 (Get-FileHash $output).Hash.ToLowerInvariant() "Result JSON output hash changed"
+  }
+  finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 Invoke-Test "payload correction ignores unrelated mux size" {
   $guess = Get-NextVideoKbpsGuess -Mode Balanced -TargetBytes 1000000 -CurrentVideoKbps 800 -CurrentSizeBytes 930000 -TargetVideoPayloadBytes 850000 -CurrentVideoPayloadBytes 680000
   Assert-True ($guess -gt 800) "Underfilled video payload did not increase bitrate"

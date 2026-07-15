@@ -16,14 +16,6 @@ param(
   [ValidateSet("x264", "x265", "av1", "auto")]
   [string]$VideoCodec = "x264",
 
-  [ValidateSet("auto", "libx264", "libx265", "svtav1", "aom", "rav1e", "vpx", "vvenc", "vaapi")]
-  [string]$EncoderBackend = "auto",
-
-  [switch]$EnableExperimentalEncoders,
-
-  [AllowEmptyString()]
-  [string]$HardwareDevice = "auto",
-
   [AllowEmptyString()]
   [string]$Container = "",
 
@@ -73,10 +65,21 @@ param(
   [ValidateSet("Auto", "8", "10")]
   [string]$OutputBitDepth = "Auto",
 
+  [switch]$VerboseCommands,
+
   [ValidateSet("Auto", "Copy", "Transcode")]
   [string]$UnderCapBehavior = "Auto",
 
-  [switch]$VerboseCommands
+  [ValidateSet("auto", "libx264", "libx265", "svtav1", "aom", "rav1e", "vpx", "vvenc", "vaapi")]
+  [string]$EncoderBackend = "auto",
+
+  [switch]$EnableExperimentalEncoders,
+
+  [AllowEmptyString()]
+  [string]$HardwareDevice = "auto",
+
+  [AllowEmptyString()]
+  [string]$ResultJsonPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -89,6 +92,7 @@ $script:AudioCache = @{}
 $script:FunctionalProbeCache = @{}
 $script:FunctionalProbeCacheLoaded = $false
 $script:FunctionalProbeCachePath = ""
+$script:HostFingerprint = $null
 
 function Require-Tool($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
@@ -4891,6 +4895,171 @@ function Get-OutcomeRecord {
   }
 }
 
+function Get-HostFingerprint {
+  if ($null -ne $script:HostFingerprint) { return $script:HostFingerprint }
+
+  $cpu = [string]$env:PROCESSOR_IDENTIFIER
+  $gpu = ""
+  $driver = ""
+  if (Get-Command Get-CimInstance -ErrorAction SilentlyContinue) {
+    try {
+      $processor = Get-CimInstance Win32_Processor -ErrorAction Stop | Select-Object -First 1
+      if ($processor -and $processor.Name) { $cpu = [string]$processor.Name.Trim() }
+      $controllers = @(Get-CimInstance Win32_VideoController -ErrorAction Stop)
+      $gpu = (@($controllers | ForEach-Object { [string]$_.Name }) -join "; ")
+      $driver = (@($controllers | ForEach-Object { [string]$_.DriverVersion }) -join "; ")
+    }
+    catch {
+      # The portable runtime fields below remain sufficient when CIM is absent.
+    }
+  }
+
+  $identityText = "{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f [System.Runtime.InteropServices.RuntimeInformation]::OSDescription, [Environment]::OSVersion.VersionString, [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture, $cpu, $gpu, $driver, (Get-FfmpegBuildFingerprint)
+  $sha = [Security.Cryptography.SHA256]::Create()
+  try {
+    $idBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identityText))
+    $hostId = ([BitConverter]::ToString($idBytes)).Replace("-", "").Substring(0, 16).ToLowerInvariant()
+  }
+  finally { $sha.Dispose() }
+
+  $script:HostFingerprint = [PSCustomObject]@{
+    Id = $hostId
+    MachineName = [Environment]::MachineName
+    Os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+    Kernel = [Environment]::OSVersion.VersionString
+    OsArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    ProcessArchitecture = [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
+    Cpu = $cpu
+    Gpu = $gpu
+    Driver = $driver
+    FfmpegBuild = Get-FfmpegBuildFingerprint
+    HardwareDevice = $HardwareDevice
+  }
+  return $script:HostFingerprint
+}
+
+function New-CompressorResultObject {
+  param(
+    [Parameter(Mandatory = $true)][ValidateSet("copy", "encode")][string]$Action,
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$CodecProfile,
+    [Parameter(Mandatory = $true)]$PolicyProfile,
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [Parameter(Mandatory = $true)][long]$HardCapBytes,
+    [Parameter(Mandatory = $true)][long]$WorkingTargetBytes,
+    $Winner = $null
+  )
+
+  $outputFull = (Resolve-Path -LiteralPath $OutputPath).Path
+  $outputBytes = [long](Get-Item -LiteralPath $outputFull).Length
+  $canonical = Get-CanonicalMetricProfile -Info $Info
+  $plan = if ($Winner) { $Winner.Plan } else { $null }
+  $fillGate = if ($Action -eq "encode") { [double](Get-ModeStrategy -Mode $Mode -Duration $Info.Duration).EarlyAcceptRatio } else { $null }
+  $fillRatio = [double]$outputBytes / [double]$HardCapBytes
+  $warnings = New-Object System.Collections.Generic.List[string]
+  if ($Action -eq "encode" -and $fillRatio -lt $fillGate) {
+    [void]$warnings.Add(("final fill {0:P2} is below the {1:P2} mode gate" -f $fillRatio, $fillGate))
+  }
+
+  $probe = Get-ObjectPropertyValue -Object $CodecProfile -Name "FunctionalProbe" -DefaultValue $null
+  $metricScore = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "MetricScore" -DefaultValue $null } else { $null }
+  $encoderArguments = if ($plan) { @(Get-CommonVideoEncodeArgs -Plan $plan) } else { @() }
+  $searchStats = if ($Winner) { Get-ObjectPropertyValue -Object $Winner -Name "SearchStats" -DefaultValue $null } else { $null }
+
+  return [PSCustomObject]@{
+    SchemaVersion = "barusu.compress.result.v1"
+    Status = "succeeded"
+    Action = $Action
+    StartedUtc = $scriptStart.ToUniversalTime().ToString("o")
+    CompletedUtc = (Get-Date).ToUniversalTime().ToString("o")
+    ElapsedMilliseconds = [long]((Get-Date) - $scriptStart).TotalMilliseconds
+    Request = [PSCustomObject]@{
+      InputPath = $InputPath; OutputPath = $outputFull; HardCapBytes = $HardCapBytes; WorkingTargetBytes = $WorkingTargetBytes
+      Mode = $Mode; RequestedVideoCodec = $VideoCodec; RequestedEncoderBackend = $EncoderBackend
+      RequestedContainer = if ([string]::IsNullOrWhiteSpace($Container)) { "auto" } else { $Container }
+      CompatibilityMode = $CompatibilityMode; UnderCapBehavior = $UnderCapBehavior; MetricMode = $MetricMode
+      SampleMode = $SampleMode; HardwareDevice = $HardwareDevice; ExperimentalEncoders = [bool]$EnableExperimentalEncoders
+    }
+    Policy = [PSCustomObject]@{
+      VideoCodec = [string]$PolicyProfile.VideoCodec; EncoderBackend = [string]$PolicyProfile.EncoderBackend
+      Container = [string]$PolicyProfile.Container; AudioCodec = [string]$PolicyProfile.DefaultAudioCodec
+      CodecReason = [string]$PolicyProfile.CodecPolicyReason; ContainerReason = [string]$PolicyProfile.ContainerPolicyReason
+      CompatibilityMode = [string]$PolicyProfile.CompatibilityMode
+    }
+    Host = Get-HostFingerprint
+    CapabilityProbe = if ($probe) { $probe } else { [PSCustomObject]@{ Success = $null; Backend = $CodecProfile.EncoderBackend; SkippedReason = "under-cap passthrough" } }
+    Source = [PSCustomObject]@{
+      Bytes = [long]$Info.InputBytes; DurationSeconds = [double]$Info.Duration; Width = [int]$Info.Width; Height = [int]$Info.Height
+      Fps = [double]$Info.Fps; VideoCodec = [string]$Info.VideoCodec; PixelFormat = [string]$Info.PixelFormat
+      BitDepth = [int]$Info.VideoBitDepth; AudioCodec = [string]$Info.AudioCodec; Rotation = [int]$Info.Rotation
+      SampleAspectRatio = [string]$Info.SampleAspectRatio; HdrClassification = [string]$Info.HdrClassification
+    }
+    Evaluator = [PSCustomObject]@{
+      Version = [string]$canonical.EvaluatorVersion; MetricMode = if ($plan) { [string](Get-ObjectPropertyValue -Object $plan -Name "MetricModeUsed" -DefaultValue "off") } else { "off" }
+      PrimaryMetric = if ($plan) { [string](Get-ObjectPropertyValue -Object $plan -Name "PrimaryMetricMode" -DefaultValue "") } else { "" }
+      CanonicalCanvas = [PSCustomObject]@{ Width = [int]$canonical.Width; Height = [int]$canonical.Height; Fps = [double]$canonical.Fps; PixelFormat = [string]$canonical.PixelFormat; BitDepth = [int]$canonical.BitDepth }
+      VmafModel = "vmaf-neg-primary+vmaf-standard-supplemental"; XpsnrGuard = $true
+    }
+    Encoder = [PSCustomObject]@{
+      Backend = [string]$CodecProfile.EncoderBackend; Name = [string]$CodecProfile.VideoEncoder; Codec = [string]$CodecProfile.VideoCodec
+      Container = [string]$CodecProfile.Container; AudioProfile = [string]$CodecProfile.ContainerAudioProfile
+      RateControlAdapter = [string]$CodecProfile.RateControlAdapter; Preset = if ($plan) { [string]$plan.Preset } else { "copy" }
+      PixelFormat = if ($plan) { [string]$plan.OutputPixelFormat } else { [string]$Info.PixelFormat }; Arguments = @($encoderArguments)
+      ParameterFamilies = @(Get-EncoderParameterFamilies -Backend $CodecProfile.EncoderBackend -ContentClass $(if ($plan) { [string]$plan.ContentClass } else { "general" }))
+    }
+    Plan = if ($plan) { Get-PlanFeatureVector -Plan $plan } else { $null }
+    PayloadBytes = [PSCustomObject]@{
+      Video = if ($Winner) { [long]$Winner.VideoPayloadBytes } else { $null }
+      Audio = if ($Winner) { [long]$Winner.AudioPayloadBytes } else { $null }
+      MuxOverhead = if ($Winner) { [long]$Winner.MuxOverheadBytes } else { $null }
+      Total = $outputBytes
+    }
+    SizeSearch = [PSCustomObject]@{
+      HardCapBytes = $HardCapBytes; WorkingTargetBytes = $WorkingTargetBytes; FillRatio = $fillRatio; FillGate = $fillGate
+      FullEncodes = if ($searchStats) { [int]$searchStats.FullEncodesRun } else { 0 }
+      CorrectionHistory = if ($Winner) { @($Winner.CorrectionHistory) } else { @() }
+    }
+    Metrics = [PSCustomObject]@{
+      Available = ($null -ne $metricScore); PrimaryScore = $metricScore
+      WorstWindowScore = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstMetricScore" -DefaultValue $null } else { $null }
+      VmafNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "VmafNegScore" -DefaultValue $null } else { $null }
+      WorstVmafNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstVmafNegScore" -DefaultValue $null } else { $null }
+      StandardVmaf = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "StandardVmafScore" -DefaultValue $null } else { $null }
+      Xpsnr = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "XpsnrScore" -DefaultValue $null } else { $null }
+      WorstXpsnr = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstXpsnrScore" -DefaultValue $null } else { $null }
+      Windows = if ($Winner) { @((Get-ObjectPropertyValue -Object $Winner -Name "MetricSegmentScores" -DefaultValue @())) } else { @() }
+    }
+    Output = [PSCustomObject]@{
+      Path = $outputFull; Bytes = $outputBytes; FillRatio = $fillRatio; Sha256 = (Get-FileHash -LiteralPath $outputFull -Algorithm SHA256).Hash.ToLowerInvariant()
+      DecodeVerified = if ($probe) { [bool]$probe.Success } else { $true }
+    }
+    Warnings = @($warnings.ToArray())
+  }
+}
+
+function Write-CompressorResultJson {
+  param(
+    [Parameter(Mandatory = $true)]$Result,
+    [Parameter(Mandatory = $true)][string]$Path
+  )
+
+  $fullPath = [System.IO.Path]::GetFullPath($Path)
+  $directory = Split-Path $fullPath -Parent
+  if (-not [string]::IsNullOrWhiteSpace($directory) -and -not (Test-Path -LiteralPath $directory)) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+  }
+  $temporary = $fullPath + "." + [guid]::NewGuid().ToString("N") + ".tmp"
+  try {
+    $Result | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $fullPath -Force
+  }
+  finally {
+    Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+  }
+  return $fullPath
+}
+
 function Get-TopResultsByPreference {
   param(
     [Parameter(Mandatory = $true)]$Results,
@@ -7019,6 +7188,11 @@ if ($UnderCapBehavior -eq "Copy" -and -not $underCapEligible) {
 }
 if ($underCapEligible) {
   $copyResult = Invoke-UnderCapPassthrough -InputPath $inputFull -OutputPath $OutputFile -HardCapBytes ([long]$targetRequestBytes)
+  if (-not [string]::IsNullOrWhiteSpace($ResultJsonPath)) {
+    $resultObject = New-CompressorResultObject -Action copy -Info $info -CodecProfile $codecProfile -PolicyProfile $policyProfile -InputPath $inputFull -OutputPath $OutputFile -HardCapBytes ([long]$targetRequestBytes) -WorkingTargetBytes $usableTargetBytes
+    $writtenResultPath = Write-CompressorResultJson -Result $resultObject -Path $ResultJsonPath
+    Write-Host "Result JSON:      $writtenResultPath"
+  }
   Write-Host "Input is already under the hard cap and matches the requested codec/container policy."
   Write-Host "Output file:      $($copyResult.OutputPath)"
   Write-Host "Final size:       $($copyResult.SizeBytes) bytes"
@@ -7072,6 +7246,7 @@ Write-PlanLogRecord -RecordType "job_start" -Data ([PSCustomObject]@{
     EncoderBackend      = $codecProfile.EncoderBackend
     HardwareDevice      = $HardwareDevice
     ExperimentalEncoders = [bool]$EnableExperimentalEncoders
+    ResultJsonPath        = $ResultJsonPath
     SourceTechnicalMetadata = $info
   })
 
@@ -7237,6 +7412,12 @@ try {
     Write-Host "Full encodes:     $($winner.SearchStats.FullEncodesRun)"
     Write-Host "Second-stage:     $(if ([string]::IsNullOrWhiteSpace($winner.SearchStats.SecondEncodeReason)) { '(none)' } else { $winner.SearchStats.SecondEncodeReason })"
     Write-Host "Prediction bias:  $('{0:N3}' -f $winner.SearchStats.PredictionBias)"
+  }
+  if (-not [string]::IsNullOrWhiteSpace($ResultJsonPath)) {
+    $resultObject = New-CompressorResultObject -Action encode -Info $info -CodecProfile $codecProfile -PolicyProfile $policyProfile -InputPath $inputFull -OutputPath $OutputFile -HardCapBytes ([long]$targetRequestBytes) -WorkingTargetBytes $usableTargetBytes -Winner $winner
+    $writtenResultPath = Write-CompressorResultJson -Result $resultObject -Path $ResultJsonPath
+    Write-Host "Result JSON:      $writtenResultPath"
+    Write-PlanLogRecord -RecordType "result_contract" -Data $resultObject
   }
 }
 finally {
