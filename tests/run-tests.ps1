@@ -136,7 +136,98 @@ Invoke-Test "material XPSNR regression guards VMAF selection" {
   Assert-True (-not (Test-IsBetterPreviewResult -Candidate $candidate -Current $current)) "VMAF gain hid a material XPSNR regression"
 }
 
+Invoke-Test "under-cap policy copies only compatible inputs" {
+  $info = New-TestInfo
+  $info | Add-Member -NotePropertyName InputBytes -NotePropertyValue 90000 -Force
+  $info | Add-Member -NotePropertyName FormatName -NotePropertyValue "mov,mp4,m4a,3gp,3g2,mj2" -Force
+  $info | Add-Member -NotePropertyName VideoCodec -NotePropertyValue "h264" -Force
+  $info | Add-Member -NotePropertyName HasAudio -NotePropertyValue $true -Force
+  $info | Add-Member -NotePropertyName AudioCodec -NotePropertyValue "aac" -Force
+  $profile = [PSCustomObject]@{ VideoCodec = "x264"; Container = "mp4"; CopyableAudioCodecs = @("aac") }
+  Assert-True (Test-UnderCapPassthroughEligible -Info $info -InputPath "compatible.mp4" -CodecProfile $profile -HardCapBytes 100000 -Behavior Auto) "Compatible under-cap input did not pass"
+  Assert-True (-not (Test-UnderCapPassthroughEligible -Info $info -InputPath "compatible.mp4" -CodecProfile $profile -HardCapBytes 100000 -Behavior Transcode)) "Transcode policy unexpectedly copied"
+  $info.VideoCodec = "hevc"
+  Assert-True (-not (Test-UnderCapPassthroughEligible -Info $info -InputPath "compatible.mp4" -CodecProfile $profile -HardCapBytes 100000 -Behavior Auto)) "Mismatched codec unexpectedly copied"
+}
+
+Invoke-Test "under-cap passthrough preserves bytes exactly" {
+  $temp = Join-Path $env:TEMP ("compress_copy_test_" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $temp | Out-Null
+  try {
+    $input = Join-Path $temp "input.mp4"
+    $output = Join-Path $temp "output.mp4"
+    [IO.File]::WriteAllBytes($input, (New-Object byte[] 1234))
+    $result = Invoke-UnderCapPassthrough -InputPath $input -OutputPath $output -HardCapBytes 2000
+    Assert-Equal $result.SizeBytes 1234 "Passthrough size changed"
+    Assert-Equal (Get-FileHash $input).Hash (Get-FileHash $output).Hash "Passthrough bytes changed"
+  }
+  finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+Invoke-Test "payload correction ignores unrelated mux size" {
+  $guess = Get-NextVideoKbpsGuess -Mode Balanced -TargetBytes 1000000 -CurrentVideoKbps 800 -CurrentSizeBytes 930000 -TargetVideoPayloadBytes 850000 -CurrentVideoPayloadBytes 680000
+  Assert-True ($guess -gt 800) "Underfilled video payload did not increase bitrate"
+  $shrink = Get-NextVideoKbpsGuess -Mode Balanced -TargetBytes 1000000 -CurrentVideoKbps 800 -CurrentSizeBytes 930000 -TargetVideoPayloadBytes 650000 -CurrentVideoPayloadBytes 680000
+  Assert-True ($shrink -lt 800) "Oversized video payload did not reduce bitrate"
+}
+
+Invoke-Test "ExtraQuality keeps source and next-lower sentinels" {
+  $fps = @(Get-TargetFpsCandidates -srcFps 60 -mode ExtraQuality -duration 120 -totalKbps 400 -motionBucket VeryLow -detailBucket Medium)
+  Assert-True (60 -in $fps) "Source FPS sentinel was omitted"
+  Assert-True (30 -in $fps) "Next-lower FPS sentinel was omitted"
+
+  $info = New-TestInfo -Width 1920 -Height 1080 -Fps 60
+  $info | Add-Member -NotePropertyName VideoBitrateKbps -NotePropertyValue 4000 -Force
+  $probe = [PSCustomObject]@{
+    DetailBucket = "Medium"; MotionNormalized = 1.0; ContentClass = "general"
+    DetailProbe = [PSCustomObject]@{ AvgKbps = 100.0; PeakishKbps = 120.0 }
+  }
+  $widths = @(Get-WidthPlanCandidates -Info $info -Probe $probe -TargetFps 30 -VideoKbps 700 -Mode ExtraQuality)
+  Assert-True (1920 -in @($widths.Width)) "Source resolution sentinel was omitted"
+  Assert-True (1600 -in @($widths.Width)) "Next-lower resolution sentinel was omitted"
+}
+
+Invoke-Test "direct classifier thresholds are frozen before Holdout" {
+  $thresholds = Get-ContentClassifierThresholds
+  Assert-Equal $thresholds.Version "direct-core-v1" "Unexpected classifier version"
+  Assert-Equal $thresholds.CalibrationSet "core" "Classifier was not calibrated on Core"
+  Assert-True $thresholds.Frozen "Classifier thresholds are not frozen"
+}
+
+Invoke-Test "Core-shaped direct evidence recognizes gaming and screen content" {
+  $probe = [PSCustomObject]@{ MotionBucket = "Medium"; DetailBucket = "Medium" }
+  $gamingInfo = [PSCustomObject]@{ Fps = 60.0; HasAudio = $false }
+  $gaming = [PSCustomObject]@{
+    UiPersistence = 0.52; EdgeDensity = 0.050; Entropy = 0.84; FlatAreaRatio = 0.864
+    TemporalDifference = 0.053; Noise = 0.006; MotionSpread = 0.20
+  }
+  Assert-Equal (Invoke-ContentClassifier -Info $gamingInfo -Probe $probe -Features $gaming) "gameplay" "S015-shaped direct evidence was not classified as gameplay"
+
+  $screenInfo = [PSCustomObject]@{ Fps = 30.0; HasAudio = $false }
+  $screen = [PSCustomObject]@{
+    UiPersistence = 0.62; EdgeDensity = 0.044; Entropy = 0.79; FlatAreaRatio = 0.898
+    TemporalDifference = 0.007; Noise = 0.025; MotionSpread = 0.10
+  }
+  Assert-Equal (Invoke-ContentClassifier -Info $screenInfo -Probe $probe -Features $screen) "screen" "S018-shaped direct evidence was not classified as screen content"
+}
+
 if ($IncludeSyntheticMetrics) {
+  Invoke-Test "direct content probe measures independent feature families" {
+    $temp = Join-Path $env:TEMP ("compress_content_probe_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    try {
+      $source = Join-Path $temp "source.mkv"
+      & ffmpeg -hide_banner -loglevel error -y -f lavfi -i "testsrc2=size=320x180:rate=30:duration=1" -c:v ffv1 -pix_fmt yuv420p $source
+      $features = Invoke-ContentFeatureProbe -InputPath $source -SampleWindows @([PSCustomObject]@{ Start = 0.0; Duration = 0.9 })
+      Assert-True ($null -ne $features.EdgeDensity -and $features.EdgeDensity -gt 0) "Edge evidence was unavailable"
+      Assert-True ($null -ne $features.FlatAreaRatio -and $features.FlatAreaRatio -gt 0) "Flat-area evidence was unavailable"
+      Assert-True ($null -ne $features.Entropy -and $features.Entropy -gt 0) "Entropy evidence was unavailable"
+      Assert-True ($null -ne $features.TemporalDifference -and $features.TemporalDifference -gt 0) "Temporal evidence was unavailable"
+      Assert-True ($null -ne $features.Noise) "Noise evidence was unavailable"
+    }
+    finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
+  }
+
   Invoke-Test "canonical metrics expose temporal and spatial loss" {
     if (-not (Test-FfmpegFilterAvailable -Filter "libvmaf") -or -not (Test-VmafNegModelAvailable)) {
       Write-Host "SKIP libvmaf NEG is unavailable"
@@ -170,6 +261,26 @@ if ($IncludeSyntheticMetrics) {
     finally {
       Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
     }
+  }
+
+  Invoke-Test "audio identities are encoded once and cached" {
+    $temp = Join-Path $env:TEMP ("compress_audio_cache_" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $temp | Out-Null
+    try {
+      $source = Join-Path $temp "source.mp4"
+      & ffmpeg -hide_banner -loglevel error -y -f lavfi -i "color=size=64x64:rate=10:duration=1" -f lavfi -i "sine=frequency=440:duration=1" -c:v libx264 -c:a aac -shortest $source
+      $script:AudioCache = @{}
+      $plan = [PSCustomObject]@{
+        AudioPlan = [PSCustomObject]@{ Mode = "aac"; Codec = "aac"; Kbps = 64; EstimatedBytes = 8000 }
+        CodecProfile = [PSCustomObject]@{ DefaultAudioEncoder = "aac" }
+      }
+      $first = Get-CachedAudioEntry -InputPath $source -Plan $plan -TempDir $temp
+      $second = Get-CachedAudioEntry -InputPath $source -Plan $plan -TempDir $temp
+      Assert-Equal $first.Path $second.Path "Audio cache returned a different artifact"
+      Assert-Equal $script:AudioCache.Count 1 "Audio identity was encoded more than once"
+      Assert-True ($first.PayloadBytes -gt 0) "Cached audio payload was not measured"
+    }
+    finally { Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue }
   }
 }
 
