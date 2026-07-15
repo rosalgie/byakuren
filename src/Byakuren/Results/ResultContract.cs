@@ -30,9 +30,11 @@ public sealed class ResultContract
         double fill = output.Length / (double)request.TargetBytes;
         ModeStrategy strategy = CompressionPlanner.Strategy(request.Mode);
         CanonicalCanvas canvas = plan?.CanonicalCanvas ?? new CompressionPlanner().GetCanonicalCanvas(media);
-        string[] warnings = action == "encode" && fill < strategy.FillGate
-            ? new[] { $"final fill {fill:P2} is below the {strategy.FillGate:P2} mode gate" }
-            : Array.Empty<string>();
+        List<string> warnings = new List<string>();
+        if (action == "encode" && fill < strategy.FillGate)
+            warnings.Add($"final fill {fill:P2} is below the {strategy.FillGate:P2} mode gate");
+        if (action == "encode" && attempt is not null && attempt.MuxOverheadBytes > Math.Max(4096, plan?.MuxReserveBytes ?? 0))
+            warnings.Add($"mux overhead used {attempt.MuxOverheadBytes} bytes, above the reserved {plan?.MuxReserveBytes ?? 0} bytes; short-file/container overhead may limit fill");
         string hash = await Sha256Async(outputPath, cancellationToken).ConfigureAwait(false);
         DateTimeOffset completed = DateTimeOffset.UtcNow;
         string hostText = $"{RuntimeInformation.OSDescription}|{RuntimeInformation.OSArchitecture}|{Environment.ProcessorCount}|{capability?.Driver}|{capability?.FFmpegBuild}";
@@ -52,11 +54,21 @@ public sealed class ResultContract
                 HardCapBytes = request.TargetBytes,
                 WorkingTargetBytes = plan?.WorkingTargetBytes ?? (long)Math.Floor(request.TargetBytes * request.WorkingTargetRatio),
                 Mode = request.Mode.ToString(),
+                TargetUnit = request.TargetUnit.ToString(),
                 RequestedVideoCodec = request.VideoCodec,
                 RequestedEncoderBackend = request.EncoderBackend,
                 RequestedContainer = request.Container,
                 CompatibilityMode = request.CompatibilityMode,
                 ContentClassMode = request.ContentClassMode,
+                SampleMode = request.SampleMode.ToString(),
+                AudioPriority = request.AudioPriority.ToString(),
+                PreprocessMode = request.PreprocessMode.ToString(),
+                CropMode = request.CropMode.ToString(),
+                VBVMode = request.VBVMode.ToString(),
+                request.OutputBitDepth,
+                request.ProbeSampleSeconds,
+                request.MetricSampleSeconds,
+                request.MetricMaxSamples,
                 UnderCapBehavior = request.UnderCapBehavior.ToString(),
                 MetricMode = request.MetricMode.ToString(),
                 HardwareDevice = request.HardwareDevice,
@@ -103,9 +115,17 @@ public sealed class ResultContract
                 media.PixelFormat,
                 media.BitDepth,
                 media.AudioCodec,
+                media.AudioBitrateKbps,
+                media.AudioChannels,
                 media.Rotation,
                 media.SampleAspectRatio,
-                HdrClassification = media.IsHdr ? "HDR" : "SDR"
+                media.ColorRange,
+                media.ColorPrimaries,
+                media.ColorTransfer,
+                media.ColorSpace,
+                media.ChromaLocation,
+                media.HDRClassification,
+                media.HDRReason
             },
             Evaluator = new
             {
@@ -126,10 +146,7 @@ public sealed class ResultContract
                 policy.Profile.RateControlAdapter,
                 Preset = plan?.Preset ?? "copy",
                 PixelFormat = plan?.PixelFormat ?? media.PixelFormat,
-                Arguments = plan is null ? Array.Empty<string>() : new[]
-                {
-                    "-vf", plan.VideoFilter, "-c:v", plan.Profile.Encoder, "-pix_fmt", plan.PixelFormat, "-b:v", $"{plan.VideoKbps}k"
-                }
+                Arguments = plan is null ? Array.Empty<string>() : BuildEncoderArguments(plan)
             },
             Plan = plan,
             PayloadBytes = new
@@ -159,6 +176,8 @@ public sealed class ResultContract
                 metrics.StandardVMAF,
                 metrics.XPSNR,
                 metrics.WorstXPSNR,
+                metrics.CAMBI,
+                metrics.WorstCAMBI,
                 metrics.Error,
                 metrics.Windows
             },
@@ -191,4 +210,14 @@ public sealed class ResultContract
     }
 
     private static string HashText(string value) => Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value))).ToLowerInvariant();
+
+    private static IReadOnlyList<string> BuildEncoderArguments(CompressionPlan plan)
+    {
+        List<string> arguments = ["-vf", plan.VideoFilter, "-c:v", plan.Profile.Encoder, "-pix_fmt", plan.PixelFormat, "-b:v", $"{plan.VideoKbps}k"];
+        if (plan.MaxrateKbps.HasValue) arguments.AddRange(["-maxrate", $"{plan.MaxrateKbps.Value}k"]);
+        if (plan.BufsizeKbits.HasValue) arguments.AddRange(["-bufsize", $"{plan.BufsizeKbits.Value}k"]);
+        arguments.AddRange(plan.ColorArguments);
+        arguments.AddRange(plan.Profile.PrivateArguments);
+        return arguments;
+    }
 }

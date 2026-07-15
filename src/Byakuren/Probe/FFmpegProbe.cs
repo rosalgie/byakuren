@@ -37,12 +37,23 @@ public sealed class FFmpegProbe(ProcessRunner runner)
                 if (item.TryGetProperty("rotation", out JsonElement value) && value.TryGetInt32(out int parsed)) rotation = parsed;
         }
 
+        rotation = NormalizeRotation(rotation);
         int bitDepth = Integer(video, "bits_per_raw_sample", 0);
         if (bitDepth <= 0)
             bitDepth = pixelFormat.Contains("12", StringComparison.Ordinal) ? 12 : pixelFormat.Contains("10", StringComparison.Ordinal) ? 10 : 8;
         double sar = ParseRatio(String(video, "sample_aspect_ratio"), 1.0);
-        bool hdr = transfer is "smpte2084" or "arib-std-b67";
+        bool hasHdrSideData = HasHDRSideData(video);
+        bool hdr = transfer is "smpte2084" or "arib-std-b67" || hasHdrSideData;
+        string hdrClassification = transfer switch
+        {
+            "smpte2084" => "HDR10/PQ",
+            "arib-std-b67" => "HLG",
+            _ when hasHdrSideData => "HDR",
+            _ => "SDR"
+        };
+        string hdrReason = transfer is "smpte2084" or "arib-std-b67" ? $"color transfer is {transfer}" : hasHdrSideData ? "HDR mastering side data is present" : "no HDR transfer or mastering side data";
         int videoBitrateKbps = (int)Math.Round(Double(video, "bit_rate", 0) / 1000.0);
+        int audioBitrateKbps = audio.ValueKind == JsonValueKind.Undefined ? 0 : (int)Math.Round(Double(audio, "bit_rate", 0) / 1000.0);
 
         return new MediaInfo
         {
@@ -61,8 +72,16 @@ public sealed class FFmpegProbe(ProcessRunner runner)
             Rotation = rotation,
             SampleAspectRatio = sar,
             ColorTransfer = transfer,
+            ColorRange = String(video, "color_range"),
+            ColorPrimaries = String(video, "color_primaries"),
+            ColorSpace = String(video, "color_space"),
+            ChromaLocation = String(video, "chroma_location"),
             IsHdr = hdr,
-            VideoBitrateKbps = videoBitrateKbps
+            HDRClassification = hdrClassification,
+            HDRReason = hdrReason,
+            VideoBitrateKbps = videoBitrateKbps,
+            AudioBitrateKbps = audioBitrateKbps,
+            AudioChannels = audio.ValueKind == JsonValueKind.Undefined ? 0 : Integer(audio, "channels", 0)
         };
     }
 
@@ -108,5 +127,24 @@ public sealed class FFmpegProbe(ProcessRunner runner)
             && double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out double denominator) && Math.Abs(denominator) > 1e-9)
             return numerator / denominator;
         return double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsed) ? parsed : fallback;
+    }
+
+    private static int NormalizeRotation(int rotation)
+    {
+        int normalized = rotation % 360;
+        if (normalized < 0) normalized += 360;
+        return normalized is >= 315 or < 45 ? 0 : normalized < 135 ? 90 : normalized < 225 ? 180 : 270;
+    }
+
+    private static bool HasHDRSideData(JsonElement video)
+    {
+        if (!video.TryGetProperty("side_data_list", out JsonElement sideData)) return false;
+        foreach (JsonElement item in sideData.EnumerateArray())
+        {
+            string sideDataType = String(item, "side_data_type");
+            if (sideDataType.Contains("Mastering display metadata", StringComparison.OrdinalIgnoreCase) ||
+                sideDataType.Contains("Content light level metadata", StringComparison.OrdinalIgnoreCase)) return true;
+        }
+        return false;
     }
 }

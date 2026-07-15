@@ -3,9 +3,11 @@ using System.Text.Json;
 using Byakuren.Analysis;
 using Byakuren.CLI;
 using Byakuren.Execution;
+using Byakuren.Metrics;
 using Byakuren.Models;
 using Byakuren.Planner;
 using Byakuren.Policy;
+using Byakuren.Probe;
 using Byakuren.Results;
 using Byakuren.Worker;
 
@@ -26,6 +28,9 @@ public static class Program
         Run("frozen direct evidence recognizes gameplay and screen content", TestContentClassifier);
         Run("process execution never invokes a shell", TestProcessStartInfo);
         Run("CLI accepts single-dash aliases", TestCLIAliases);
+        Run("CLI preserves advanced planning controls", TestCLIAdvancedControls);
+        Run("planner retains structural sentinels and reference isolation", TestPlannerCandidates);
+        Run("audio priorities change payload allocation", TestAudioPriorities);
         Run("result schema uses byakuren identity", () => Equal("byakuren.compress.result.v1", ResultContract.SchemaVersion, "schema"));
 
         if (arguments.Contains("--media", StringComparer.OrdinalIgnoreCase))
@@ -73,7 +78,8 @@ public static class Program
         [
             new CanvasCase("bounded-uhd", 3840, 2160, 120, 8, 1, 0, 1920, 1080, 60, "yuv420p"),
             new CanvasCase("no-upscale-ten-bit", 640, 360, 29.97, 10, 1, 0, 640, 360, 29.97, "yuv420p10le"),
-            new CanvasCase("portrait-rotation", 1920, 1080, 60, 8, 1, 90, 1080, 1920, 60, "yuv420p")
+            new CanvasCase("portrait-rotation", 1920, 1080, 60, 8, 1, 90, 1080, 1920, 60, "yuv420p"),
+            new CanvasCase("anamorphic-SAR", 720, 480, 24, 8, 4.0 / 3.0, 0, 960, 480, 24, "yuv420p")
         ];
         foreach (CanvasCase testCase in cases)
         {
@@ -227,6 +233,88 @@ public static class Program
         Equal("result.json", request.ResultJsonPath, "result path");
     }
 
+    private static void TestCLIAdvancedControls()
+    {
+        CompressionRequest request = CLIOptions.Parse([
+            "--input", "input.mp4", "--target-mb", "1.5", "--target-unit", "DecimalMB",
+            "--sample-mode", "SceneAware", "--audio-priority", "Speech", "--preprocess-profile", "Mild",
+            "--crop-mode", "Off", "--vbv-mode", "Streaming", "--output-bit-depth", "10",
+            "--safety-margin-percent", "1.25", "--probe-sample-seconds", "7", "--metric-max-samples", "4",
+            "--enable-plan-logging", "--verbose-commands"
+        ]);
+        Equal(1_500_000L, request.TargetBytes, "decimal target");
+        Equal(TargetUnit.DecimalMB, request.TargetUnit, "target unit");
+        Equal(SampleMode.SceneAware, request.SampleMode, "sample mode");
+        Equal(AudioPriority.Speech, request.AudioPriority, "audio priority");
+        Equal(PreprocessMode.Mild, request.PreprocessMode, "preprocess mode");
+        Equal(CropMode.Off, request.CropMode, "crop mode");
+        Equal(VBVMode.Streaming, request.VBVMode, "VBV mode");
+        Equal("10", request.OutputBitDepth, "bit depth");
+        Near(0.9875, request.WorkingTargetRatio, 1e-9, "working ratio");
+        Equal(7, request.ProbeSampleSeconds, "probe seconds");
+        Equal(4, request.MetricMaxSamples, "metric samples");
+        Equal(true, request.EnablePlanLogging, "plan logging");
+        Equal(true, request.VerboseCommands, "verbose commands");
+        CompressionRequest legacyMargin = CLIOptions.Parse(["-InputFile", "input.mp4", "-TargetBytes", "1000", "-SafetyMarginPercent", "0.995"]);
+        Near(0.995, legacyMargin.WorkingTargetRatio, 1e-9, "legacy safety ratio");
+    }
+
+    private static void TestPlannerCandidates()
+    {
+        CompressionPlanner planner = new CompressionPlanner();
+        MediaInfo media = TestMedia(60, hasAudio: true) with
+        {
+            DurationSeconds = 30,
+            AudioCodec = "aac",
+            AudioBitrateKbps = 96,
+            AudioChannels = 2,
+            ColorPrimaries = "bt709",
+            ColorTransfer = "bt709",
+            ColorSpace = "bt709",
+            ChromaLocation = "left"
+        };
+        CompressionRequest request = new CompressionRequest
+        {
+            InputPath = "input",
+            TargetBytes = 2_000_000,
+            Mode = CompressionMode.ExtraQuality,
+            VideoCodec = "x265",
+            OutputBitDepth = "10",
+            VBVMode = VBVMode.Streaming
+        };
+        EncoderProfile profile = CompressionPolicy.CreateProfile("x265", "libx265", "mp4");
+        IReadOnlyList<SampleWindow> windows = [new SampleWindow(2, 6, "fixed")];
+        ComplexityAnalysis complexity = new ComplexityAnalysis { DetailBucket = "Low", MotionBucket = "Low", Windows = windows };
+        CropAnalysis crop = new CropAnalysis { Applied = true, Width = 1920, Height = 800, X = 0, Y = 140, Filter = "crop=1920:800:0:140" };
+        ContentAnalysis content = new ContentAnalysis("anime", new ContentFeatures { Available = true });
+        AudioPlan audioPlan = new AudioPlan("encode", 96, "aac", "aac 96k", 100);
+        AudioArtifact audio = new AudioArtifact(null, 360_000, audioPlan);
+
+        IReadOnlyList<CompressionPlan> plans = planner.CreateCandidatePlans(request, media, profile, audio, content, complexity, crop, windows);
+
+        Equal(true, plans.Any(plan => plan.WidthOrigin.Contains("source-sentinel", StringComparison.Ordinal)), "source width sentinel");
+        Equal(true, plans.Any(plan => plan.WidthOrigin.Contains("lower-sentinel", StringComparison.Ordinal)), "lower width sentinel");
+        Equal(true, plans.Any(plan => Math.Abs(plan.Fps - 60) < 0.01), "source FPS sentinel");
+        Equal(true, plans.Any(plan => Math.Abs(plan.Fps - 30) < 0.01), "lower FPS sentinel");
+        Equal(true, plans.All(plan => plan.PixelFormat == "yuv420p10le"), "10-bit plans");
+        Equal(true, plans.All(plan => plan.MaxrateKbps.HasValue && plan.BufsizeKbits.HasValue), "streaming VBV");
+        Equal(true, plans.All(plan => plan.ColorArguments.Contains("bt709")), "color metadata");
+        Equal(true, plans.All(plan => !plan.MetricReferenceFilter.Contains("deband", StringComparison.Ordinal)), "reference preprocessing isolation");
+    }
+
+    private static void TestAudioPriorities()
+    {
+        CompressionPlanner planner = new CompressionPlanner();
+        EncoderProfile profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4");
+        MediaInfo media = TestMedia(30, hasAudio: true) with { DurationSeconds = 30, AudioCodec = "aac", AudioBitrateKbps = 256, AudioChannels = 2 };
+        ComplexityAnalysis complexity = new ComplexityAnalysis { DetailBucket = "Medium" };
+        CompressionRequest visual = new CompressionRequest { InputPath = "input", TargetBytes = 2_000_000, AudioPriority = AudioPriority.Visual };
+        CompressionRequest speech = visual with { AudioPriority = AudioPriority.Speech };
+        int visualKbps = planner.CreateAudioPlans(visual, media, profile, complexity, "general").First(plan => plan.Mode == "encode").Kbps;
+        int speechKbps = planner.CreateAudioPlans(speech, media, profile, complexity, "general").First(plan => plan.Mode == "encode").Kbps;
+        Equal(true, speechKbps > visualKbps, "speech audio allocation");
+    }
+
     private static async Task RunMediaTestsAsync()
     {
         string tempDirectory = Path.Combine(Path.GetTempPath(), $"byakuren-media-tests-{Guid.NewGuid():N}");
@@ -313,6 +401,134 @@ public static class Program
                     Equal(true, metrics.GetProperty("WorstWindowScore").ValueKind == JsonValueKind.Number, "worst metric");
                     Equal(true, metrics.GetProperty("Windows").GetArrayLength() > 0, "metric windows");
                 }
+            }).ConfigureAwait(false);
+
+            await RunAsync("media under-cap explicit conversion still transcodes", async () =>
+            {
+                string outputPath = Path.Combine(tempDirectory, "under-cap-conversion.mp4");
+                string resultPath = Path.Combine(tempDirectory, "under-cap-conversion.json");
+                CompressionRequest request = new CompressionRequest
+                {
+                    InputPath = sourcePath,
+                    OutputPath = outputPath,
+                    ResultJsonPath = resultPath,
+                    TargetBytes = new FileInfo(sourcePath).Length + 100_000,
+                    Mode = CompressionMode.Fast,
+                    VideoCodec = "x265",
+                    UnderCapBehavior = UnderCapBehavior.Auto,
+                    ContentClassMode = "off",
+                    CropMode = CropMode.Off,
+                    MetricMode = MetricMode.Off
+                };
+                await new CompressionWorker().RunAsync(request, null, CancellationToken.None).ConfigureAwait(false);
+                using JsonDocument result = JsonDocument.Parse(await File.ReadAllTextAsync(resultPath).ConfigureAwait(false));
+                Equal("encode", result.RootElement.GetProperty("Action").GetString(), "conversion action");
+                Equal("libx265", result.RootElement.GetProperty("Policy").GetProperty("EncoderBackend").GetString(), "conversion backend");
+                Equal(true, new FileInfo(outputPath).Length <= request.TargetBytes, "conversion cap");
+            }).ConfigureAwait(false);
+
+            await RunAsync("media crop detection removes only stable blank borders", async () =>
+            {
+                string cropSource = Path.Combine(tempDirectory, "crop-source.mp4");
+                await runner.RunCheckedAsync("ffmpeg",
+                [
+                    "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=3",
+                    "-vf", "pad=320:240:0:30:black", "-c:v", "libx264", "-preset", "ultrafast", cropSource
+                ], CancellationToken.None).ConfigureAwait(false);
+                CompressionRequest cropRequest = new CompressionRequest { InputPath = cropSource, TargetBytes = 300_000, CropMode = CropMode.Auto };
+                FFmpegProbe probe = new FFmpegProbe(runner);
+                MediaInfo cropMedia = await probe.ProbeMediaAsync(cropRequest, CancellationToken.None).ConfigureAwait(false);
+                CropAnalysis crop = await new CropAnalyzer(runner).AnalyzeAsync(cropRequest, cropMedia, CancellationToken.None).ConfigureAwait(false);
+                Equal(true, crop.Applied, "crop applied");
+                Equal(320, crop.Width, "crop width");
+                Equal(true, crop.Height is >= 178 and <= 182, "crop height");
+                Equal(true, crop.Y is >= 28 and <= 32, "crop Y");
+            }).ConfigureAwait(false);
+
+            await RunAsync("media 10-bit SDR remains 10-bit when requested", async () =>
+            {
+                string tenBitSource = Path.Combine(tempDirectory, "ten-bit-source.mp4");
+                string tenBitOutput = Path.Combine(tempDirectory, "ten-bit-output.mp4");
+                await runner.RunCheckedAsync("ffmpeg",
+                [
+                    "-y", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30:duration=2",
+                    "-vf", "format=yuv420p10le", "-c:v", "libx265", "-preset", "ultrafast", "-tag:v", "hvc1", tenBitSource
+                ], CancellationToken.None).ConfigureAwait(false);
+                CompressionRequest request = new CompressionRequest
+                {
+                    InputPath = tenBitSource,
+                    OutputPath = tenBitOutput,
+                    TargetBytes = 220_000,
+                    Mode = CompressionMode.Fast,
+                    VideoCodec = "x265",
+                    OutputBitDepth = "10",
+                    UnderCapBehavior = UnderCapBehavior.Transcode,
+                    ContentClassMode = "off",
+                    CropMode = CropMode.Off,
+                    MetricMode = MetricMode.Off
+                };
+                await new CompressionWorker().RunAsync(request, null, CancellationToken.None).ConfigureAwait(false);
+                MediaInfo outputMedia = await new FFmpegProbe(runner).ProbeMediaAsync(request with { InputPath = tenBitOutput }, CancellationToken.None).ConfigureAwait(false);
+                Equal(10, outputMedia.BitDepth, "output bit depth");
+                Equal(false, outputMedia.IsHdr, "SDR classification");
+            }).ConfigureAwait(false);
+
+            await RunAsync("media HDR metadata is rejected before planning", async () =>
+            {
+                string hdrSource = Path.Combine(tempDirectory, "hdr-source.mp4");
+                await runner.RunCheckedAsync("ffmpeg",
+                [
+                    "-y", "-f", "lavfi", "-i", "testsrc2=size=160x90:rate=24:duration=1",
+                    "-vf", "format=yuv420p10le,setparams=color_primaries=bt2020:color_trc=smpte2084:colorspace=bt2020nc", "-c:v", "libx265", "-preset", "ultrafast", hdrSource
+                ], CancellationToken.None).ConfigureAwait(false);
+                CompressionRequest hdrRequest = new CompressionRequest { InputPath = hdrSource, TargetBytes = 150_000, Mode = CompressionMode.Fast };
+                MediaInfo hdrMedia = await new FFmpegProbe(runner).ProbeMediaAsync(hdrRequest, CancellationToken.None).ConfigureAwait(false);
+                Equal(true, hdrMedia.IsHdr, "PQ probe classification");
+                bool rejected = false;
+                try { await new CompressionWorker().RunAsync(hdrRequest, null, CancellationToken.None).ConfigureAwait(false); }
+                catch (NotSupportedException) { rejected = true; }
+                Equal(true, rejected, "HDR rejected");
+            }).ConfigureAwait(false);
+
+            await RunAsync("canonical metrics expose frame-rate and resolution loss", async () =>
+            {
+                string highPath = Path.Combine(tempDirectory, "metric-high.mp4");
+                string lowPath = Path.Combine(tempDirectory, "metric-low.mp4");
+                await runner.RunCheckedAsync("ffmpeg", ["-y", "-i", sourcePath, "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", highPath], CancellationToken.None).ConfigureAwait(false);
+                await runner.RunCheckedAsync("ffmpeg", ["-y", "-i", sourcePath, "-vf", "scale=320:180,fps=30", "-an", "-c:v", "libx264", "-preset", "ultrafast", "-crf", "18", lowPath], CancellationToken.None).ConfigureAwait(false);
+                MediaInfo sourceMedia = await new FFmpegProbe(runner).ProbeMediaAsync(new CompressionRequest { InputPath = sourcePath, TargetBytes = 1 }, CancellationToken.None).ConfigureAwait(false);
+                CanonicalCanvas canvas = new CompressionPlanner().GetCanonicalCanvas(sourceMedia);
+                CompressionPlan metricPlan = new CompressionPlan
+                {
+                    Profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4"),
+                    Mode = CompressionMode.Balanced,
+                    HardCapBytes = 1_000_000,
+                    WorkingTargetBytes = 995_000,
+                    Width = 640,
+                    Height = 360,
+                    Fps = 60,
+                    VideoKbps = 1_000,
+                    AudioKbps = 0,
+                    Preset = "medium",
+                    PixelFormat = "yuv420p",
+                    VideoFilter = "scale=640:360,fps=60",
+                    CanonicalCanvas = canvas,
+                    MetricReferenceFilter = MetricEvaluator.ReferenceFilter(canvas),
+                    SampleWindows = [new SampleWindow(0, 3, "fixed")]
+                };
+                MetricEvaluator evaluator = new MetricEvaluator(runner, new FFmpegProbe(runner));
+                CompressionRequest metricRequest = new CompressionRequest { InputPath = sourcePath, TargetBytes = 1_000_000, Mode = CompressionMode.Balanced, MetricMode = MetricMode.Ensemble, MetricSampleSeconds = 3, MetricMaxSamples = 1 };
+                MetricEnsemble high = await evaluator.EvaluateAsync(metricRequest, sourceMedia, metricPlan, highPath, tempDirectory, CancellationToken.None).ConfigureAwait(false);
+                MetricEnsemble low = await evaluator.EvaluateAsync(metricRequest, sourceMedia, metricPlan, lowPath, tempDirectory, CancellationToken.None).ConfigureAwait(false);
+                Equal(true, high.Available && low.Available, "metrics available");
+                Equal(true, high.PrimaryScore > low.PrimaryScore, "canonical loss ordering");
+                Equal(canvas.Width, metricPlan.CanonicalCanvas.Width, "common canvas width");
+                Equal(canvas.Fps, metricPlan.CanonicalCanvas.Fps, "common canvas FPS");
+
+                CompressionPlan invalidMetricPlan = metricPlan with { MetricReferenceFilter = "definitely_not_a_filter" };
+                MetricEnsemble unavailable = await evaluator.EvaluateAsync(metricRequest with { MetricMode = MetricMode.VMAF }, sourceMedia, invalidMetricPlan, highPath, tempDirectory, CancellationToken.None).ConfigureAwait(false);
+                Equal(false, unavailable.Available, "failed metric unavailable");
+                Equal(null, unavailable.PrimaryScore, "failed metric is not zero");
             }).ConfigureAwait(false);
         }
         finally

@@ -9,6 +9,8 @@ public sealed record ProcessResult(int ExitCode, string StandardOutput, string S
 
 public sealed class ProcessRunner
 {
+    public Action<string>? CommandObserver { get; set; }
+
     public static ProcessStartInfo CreateStartInfo(string fileName, IEnumerable<string> arguments, string? workingDirectory = null)
     {
         ProcessStartInfo startInfo = new ProcessStartInfo
@@ -31,6 +33,7 @@ public sealed class ProcessRunner
         CancellationToken cancellationToken,
         string? workingDirectory = null)
     {
+        CommandObserver?.Invoke(FormatCommand(fileName, arguments));
         using Process process = new Process { StartInfo = CreateStartInfo(fileName, arguments, workingDirectory) };
         if (!process.Start())
             throw new InvalidOperationException($"Could not start '{fileName}'.");
@@ -64,4 +67,7 @@ public sealed class ProcessRunner
 
     private static string LastUsefulLine(string value) =>
         value.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim() ?? "no diagnostic output";
+
+    private static string FormatCommand(string fileName, IEnumerable<string> arguments) =>
+        string.Join(' ', new[] { fileName }.Concat(arguments).Select(argument => argument.Any(char.IsWhiteSpace) ? $"\"{argument.Replace("\"", "\\\"")}\"" : argument));
 }

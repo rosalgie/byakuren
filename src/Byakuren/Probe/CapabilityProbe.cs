@@ -19,7 +19,9 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
         string build = await ffmpegProbe.GetFFmpegBuildAsync(request.FFmpegPath, cancellationToken).ConfigureAwait(false);
         string device = profile.IsHardware ? ResolveHardwareDevice(request.HardwareDevice) : "none";
         string driver = profile.IsHardware ? await GetDriverFingerprintAsync(device, cancellationToken).ConfigureAwait(false) : "software";
-        string pixelFormat = profile.IsHardware ? "nv12" : "yuv420p";
+        string pixelFormat = profile.IsHardware
+            ? "nv12"
+            : request.OutputBitDepth == "10" && profile.VideoCodec is "x265" or "av1" or "vp9" ? "yuv420p10le" : "yuv420p";
         string keyMaterial = $"probe-v2|{build}|{RuntimeInformation.OSDescription}|{driver}|{device}|{profile.Backend}|{profile.Encoder}|{profile.AudioEncoder}|{profile.RateControlAdapter}|{profile.Container}|{pixelFormat}";
         string key = Hash(keyMaterial);
         Dictionary<string, CapabilityProbeResult> cache = await LoadCacheAsync(cancellationToken).ConfigureAwait(false);

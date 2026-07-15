@@ -4,8 +4,6 @@ using Byakuren.Probe;
 
 namespace Byakuren.Encoding;
 
-public sealed record AudioArtifact(string? Path, long PayloadBytes, int Kbps);
-
 public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
 {
     private readonly Dictionary<string, string> _passLogs = new(StringComparer.Ordinal);
@@ -15,20 +13,31 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
         MediaInfo media,
         EncoderProfile profile,
         string tempDirectory,
-        int audioKbps,
+        AudioPlan audioPlan,
         CancellationToken cancellationToken)
     {
-        if (!media.HasAudio || audioKbps <= 0) return new AudioArtifact(null, 0, 0);
+        if (!media.HasAudio || audioPlan.Mode == "mute" || audioPlan.Kbps <= 0) return new AudioArtifact(null, 0, AudioPlan.Mute);
+        if (audioPlan.Mode == "copy")
+        {
+            string copyExtension = profile.AudioCodec == "opus" ? ".opus" : ".m4a";
+            string copyPath = Path.Combine(tempDirectory, $"audio-copy-{Sanitize(audioPlan.Identity)}{copyExtension}");
+            await runner.RunCheckedAsync(request.FFmpegPath,
+            [
+                "-y", "-i", media.Path, "-map", "0:a:0", "-vn", "-c:a", "copy", copyPath
+            ], cancellationToken).ConfigureAwait(false);
+            long copyPayload = await probe.GetPacketPayloadBytesAsync(request.FFprobePath, copyPath, "a:0", cancellationToken).ConfigureAwait(false);
+            return new AudioArtifact(copyPath, copyPayload > 0 ? copyPayload : new FileInfo(copyPath).Length, audioPlan);
+        }
         string extension = profile.AudioCodec == "opus" ? ".opus" : ".m4a";
-        string path = Path.Combine(tempDirectory, "audio" + extension);
+        string path = Path.Combine(tempDirectory, $"audio-{Sanitize(audioPlan.Identity)}{extension}");
         await runner.RunCheckedAsync(request.FFmpegPath,
         [
             "-y", "-i", media.Path, "-map", "0:a:0", "-vn", "-c:a", profile.AudioEncoder,
-            "-b:a", $"{audioKbps}k", path
+            "-b:a", $"{audioPlan.Kbps}k", path
         ], cancellationToken).ConfigureAwait(false);
         long payload = await probe.GetPacketPayloadBytesAsync(request.FFprobePath, path, "a:0", cancellationToken).ConfigureAwait(false);
         if (payload <= 0) payload = new FileInfo(path).Length;
-        return new AudioArtifact(path, payload, audioKbps);
+        return new AudioArtifact(path, payload, audioPlan);
     }
 
     public async Task<EncodeAttempt> EncodeAttemptAsync(
@@ -105,6 +114,25 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
         };
     }
 
+    public async Task<string> EncodePreviewAsync(
+        CompressionRequest request,
+        MediaInfo media,
+        CompressionPlan plan,
+        SampleWindow window,
+        string tempDirectory,
+        string hardwareDevice,
+        CancellationToken cancellationToken)
+    {
+        string path = Path.Combine(tempDirectory, $"preview-{Guid.NewGuid():N}.mkv");
+        IReadOnlyList<string> videoArguments = BuildVideoArguments(plan, hardwareDevice);
+        await runner.RunCheckedAsync(request.FFmpegPath,
+        [
+            "-y", "-ss", Number(window.StartSeconds), "-t", Number(window.DurationSeconds), "-i", media.Path,
+            .. videoArguments, "-an", path
+        ], cancellationToken).ConfigureAwait(false);
+        return path;
+    }
+
     private static IReadOnlyList<string> BuildVideoArguments(CompressionPlan plan, string hardwareDevice)
     {
         List<string> arguments = new List<string>();
@@ -114,7 +142,13 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
         arguments.AddRange(CapabilityProbe.PresetArguments(plan.Profile, plan.Preset));
         if (!plan.Profile.IsHardware) arguments.AddRange(["-pix_fmt", plan.PixelFormat]);
         arguments.AddRange(["-b:v", $"{plan.VideoKbps}k"]);
+        if (plan.MaxrateKbps.HasValue) arguments.AddRange(["-maxrate", $"{plan.MaxrateKbps.Value}k"]);
+        if (plan.BufsizeKbits.HasValue) arguments.AddRange(["-bufsize", $"{plan.BufsizeKbits.Value}k"]);
+        arguments.AddRange(plan.ColorArguments);
         arguments.AddRange(plan.Profile.PrivateArguments);
         return arguments;
     }
+
+    private static string Sanitize(string value) => string.Concat(value.Select(character => char.IsLetterOrDigit(character) ? character : '_'));
+    private static string Number(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
 }
