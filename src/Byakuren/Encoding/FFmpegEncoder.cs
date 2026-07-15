@@ -89,12 +89,12 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
             .DistinctBy(candidate => candidate.Plan.Identity)
             .OrderByDescending(candidate => candidate.PayloadBytes)
             .ToArray();
-        List<(string Path, long Size, long Overhead, AudioArtifact Audio)> muxedCandidates = new List<(string, long, long, AudioArtifact)>();
+        List<(string Path, long Size, long Overhead, AudioArtifact Audio)> muxedCandidates = [];
         int muxIndex = 0;
         foreach (AudioArtifact muxAudio in muxAudioCandidates)
         {
             string candidatePath = Path.Combine(tempDirectory, $"candidate-{attempt}-{muxIndex++}{plan.Profile.Extension}");
-            List<string> mux = new List<string> { "-y", "-i", videoPath };
+            List<string> mux = ["-y", "-i", videoPath];
             if (muxAudio.Path is not null)
                 mux.AddRange(["-i", muxAudio.Path, "-map", "0:v:0", "-map", "1:a:0"]);
             else
@@ -150,17 +150,43 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
     {
         string path = Path.Combine(tempDirectory, $"preview-{Guid.NewGuid():N}.mkv");
         IReadOnlyList<string> videoArguments = BuildVideoArguments(plan, hardwareDevice);
-        await runner.RunCheckedAsync(request.FFmpegPath,
-        [
-            "-y", "-ss", Number(window.StartSeconds), "-t", Number(window.DurationSeconds), "-i", media.Path,
-            .. videoArguments, "-an", path
-        ], cancellationToken).ConfigureAwait(false);
+        string[] inputArguments = ["-y", "-ss", Number(window.StartSeconds), "-t", Number(window.DurationSeconds), "-i", media.Path];
+        // Short one-pass ABR previews can exceed their requested bitrate by more than 2x.
+        // Match the final rate-control shape so preview quality is representative.
+        if (plan.Profile.RequiredPasses >= 2)
+        {
+            string passLog = Path.Combine(tempDirectory, $"preview-pass-{Guid.NewGuid():N}");
+            try
+            {
+                await runner.RunCheckedAsync(request.FFmpegPath,
+                [
+                    .. inputArguments, .. videoArguments, "-pass", "1", "-passlogfile", passLog,
+                    "-an", "-f", "null", "-"
+                ], cancellationToken).ConfigureAwait(false);
+                await runner.RunCheckedAsync(request.FFmpegPath,
+                [
+                    .. inputArguments, .. videoArguments, "-pass", "2", "-passlogfile", passLog,
+                    "-an", path
+                ], cancellationToken).ConfigureAwait(false);
+            }
+            finally
+            {
+                CleanupPassLog(passLog);
+            }
+        }
+        else
+        {
+            await runner.RunCheckedAsync(request.FFmpegPath,
+            [
+                .. inputArguments, .. videoArguments, "-an", path
+            ], cancellationToken).ConfigureAwait(false);
+        }
         return path;
     }
 
     private static IReadOnlyList<string> BuildVideoArguments(CompressionPlan plan, string hardwareDevice)
     {
-        List<string> arguments = new List<string>();
+        List<string> arguments = [];
         if (plan.Profile.IsHardware) arguments.AddRange(["-vaapi_device", hardwareDevice]);
         if (!string.IsNullOrWhiteSpace(plan.VideoFilter)) arguments.AddRange(["-vf", plan.VideoFilter]);
         arguments.AddRange(["-c:v", plan.Profile.Encoder]);
@@ -176,5 +202,11 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
 
     private static string Sanitize(string value) => string.Concat(value.Select(character => char.IsLetterOrDigit(character) ? character : '_'));
     private static string Number(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+    private static void CleanupPassLog(string passLog)
+    {
+        string directory = Path.GetDirectoryName(passLog)!;
+        string pattern = Path.GetFileName(passLog) + "*";
+        foreach (string path in Directory.GetFiles(directory, pattern)) TryDelete(path);
+    }
     private static void TryDelete(string path) { try { File.Delete(path); } catch { } }
 }

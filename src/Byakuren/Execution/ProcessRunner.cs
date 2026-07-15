@@ -13,7 +13,7 @@ public sealed class ProcessRunner
 
     public static ProcessStartInfo CreateStartInfo(string fileName, IEnumerable<string> arguments, string? workingDirectory = null)
     {
-        ProcessStartInfo startInfo = new ProcessStartInfo
+        ProcessStartInfo startInfo = new()
         {
             FileName = fileName,
             UseShellExecute = false,
@@ -34,7 +34,7 @@ public sealed class ProcessRunner
         string? workingDirectory = null)
     {
         CommandObserver?.Invoke(FormatCommand(fileName, arguments));
-        using Process process = new Process { StartInfo = CreateStartInfo(fileName, arguments, workingDirectory) };
+        using Process process = new() { StartInfo = CreateStartInfo(fileName, arguments, workingDirectory) };
         if (!process.Start())
             throw new InvalidOperationException($"Could not start '{fileName}'.");
 

@@ -12,7 +12,7 @@ public sealed class CompressionPlanner
     public static ModeStrategy Strategy(CompressionMode mode) => mode switch
     {
         CompressionMode.Fast => new(2, 0.97, 1, 0, 0, 1),
-        CompressionMode.Balanced => new(3, 0.99, 2, 2, 5, 2),
+        CompressionMode.Balanced => new(2, 0.99, 3, 1, 2, 2),
         CompressionMode.ExtraQuality => new(5, 0.995, 3, 3, 8, 3),
         _ => throw new ArgumentOutOfRangeException(nameof(mode))
     };
@@ -57,7 +57,7 @@ public sealed class CompressionPlanner
         int channelFloor = media.AudioChannels >= 6 ? 128 : media.AudioChannels > 2 ? 96 : 32;
         int[] rates = baseRates.Select(rate => Math.Max(channelFloor, rate + bias)).Distinct().ToArray();
         int retain = request.Mode switch { CompressionMode.Fast => 2, CompressionMode.Balanced => 2, _ => 3 };
-        List<AudioPlan> plans = new List<AudioPlan>();
+        List<AudioPlan> plans = [];
         int rank = 100;
         if (media.AudioCodec.Equals(profile.AudioCodec, StringComparison.OrdinalIgnoreCase) && media.AudioBitrateKbps > 0 && rates.Any(rate => media.AudioBitrateKbps <= rate))
             plans.Add(new AudioPlan("copy", media.AudioBitrateKbps, media.AudioCodec, $"copy original audio ({media.AudioBitrateKbps}k)", rank + 1));
@@ -86,8 +86,8 @@ public sealed class CompressionPlanner
         (int sourceWidth, int sourceHeight) = DisplayGeometry(media, crop);
         double aspect = sourceWidth / (double)sourceHeight;
         CanonicalCanvas canvas = GetCanonicalCanvas(media, crop);
-        IReadOnlyList<double> fpsCandidates = TargetFpsCandidates(request.Mode, media.Fps, totalKbps, complexity, profile, contentClass);
-        List<CompressionPlan> plans = new List<CompressionPlan>();
+        IReadOnlyList<double> fpsCandidates = TargetFpsCandidates(request.Mode, media.Fps, media.DurationSeconds, totalKbps, complexity, profile);
+        List<CompressionPlan> plans = [];
 
         foreach (EncoderProfile tunedProfile in TuningProfiles(profile, request.Mode, contentClass, totalKbps))
         {
@@ -107,7 +107,11 @@ public sealed class CompressionPlanner
                         int? maxrate = request.VBVMode == VBVMode.Streaming && tunedProfile.VideoCodec != "av1" ? Math.Max(35, (int)Math.Ceiling(videoKbps * 1.5)) : null;
                         int? bufsize = maxrate.HasValue ? maxrate.Value * 2 : null;
                         double fpsRetention = Math.Min(1, fps / Math.Max(1, Math.Min(60, media.Fps)));
-                        double heuristic = widthScore + fpsRetention * 80 + Math.Min(40, bpppf * 1000) + audio.Plan.Rank * 0.35 + TuningBonus(tunedProfile, profile);
+                        bool lowMotion = complexity.MotionBucket is "VeryLow" or "Low";
+                        double fpsWeight = request.Mode == CompressionMode.Fast || !lowMotion ? 80 : 8;
+                        double gameplayMotionBonus = contentClass == "gameplay" && !lowMotion && fpsRetention > 0.99 ? 10 : 0;
+                        double spatialQuality = Math.Min(100, bpppf * 1000);
+                        double heuristic = widthScore + fpsRetention * fpsWeight + spatialQuality + gameplayMotionBonus + audio.Plan.Rank * 0.35 + TuningBonus(tunedProfile, profile);
                         plans.Add(new CompressionPlan
                         {
                             Profile = tunedProfile,
@@ -162,6 +166,28 @@ public sealed class CompressionPlanner
         return ordered.DistinctBy(plan => plan.Identity + "|" + plan.AudioPlan.Identity).Take(candidateLimit).ToArray();
     }
 
+    public IReadOnlyList<CompressionPlan> CreatePreviewShortlist(IReadOnlyList<CompressionPlan> candidates, int limit)
+    {
+        if (limit <= 0 || candidates.Count == 0) return [];
+        CompressionPlan[] ordered = candidates.OrderByDescending(plan => plan.HeuristicScore).ToArray();
+        List<CompressionPlan> selected = [ordered[0]];
+        HashSet<string> identities = new(StringComparer.Ordinal) { ordered[0].Identity };
+
+        while (selected.Count < limit)
+        {
+            CompressionPlan? next = ordered
+                .Where(candidate => !identities.Contains(candidate.Identity))
+                .OrderByDescending(candidate => StructuralNovelty(candidate, selected))
+                .ThenByDescending(candidate => candidate.HeuristicScore)
+                .FirstOrDefault();
+            if (next is null) break;
+            selected.Add(next);
+            identities.Add(next.Identity);
+        }
+
+        return selected;
+    }
+
     public CompressionPlan CreateInitialPlan(
         CompressionRequest request,
         MediaInfo media,
@@ -170,10 +196,10 @@ public sealed class CompressionPlanner
         ContentAnalysis? contentAnalysis = null)
     {
         IReadOnlyList<SampleWindow> windows = SampleWindowPlanner.FixedWindows(media.DurationSeconds, request.ProbeSampleSeconds, Strategy(request.Mode).ProbeMaxSamples);
-        ComplexityAnalysis complexity = new ComplexityAnalysis { Windows = windows };
-        CropAnalysis crop = new CropAnalysis { Width = media.Width, Height = media.Height };
+        ComplexityAnalysis complexity = new() { Windows = windows };
+        CropAnalysis crop = new() { Width = media.Width, Height = media.Height };
         AudioPlan audioPlan = media.HasAudio ? new AudioPlan("encode", request.Mode == CompressionMode.Fast ? 80 : 96, profile.AudioCodec, "default", 100) : AudioPlan.Mute;
-        AudioArtifact audio = new AudioArtifact(null, audioPayloadBytes, audioPlan);
+        AudioArtifact audio = new(null, audioPayloadBytes, audioPlan);
         return CreateCandidatePlans(request, media, profile, audio, contentAnalysis, complexity, crop, windows).First();
     }
 
@@ -199,33 +225,108 @@ public sealed class CompressionPlanner
     private static IReadOnlyList<double> TargetFpsCandidates(
         CompressionMode mode,
         double sourceFps,
+        double durationSeconds,
         double totalKbps,
         ComplexityAnalysis complexity,
-        EncoderProfile profile,
-        string contentClass)
+        EncoderProfile profile)
     {
         int source = Math.Max(1, (int)Math.Round(Math.Min(60, sourceFps)));
-        List<double> candidates = new List<double>();
+        List<double> candidates = [];
+        bool veryLowMotion = complexity.MotionBucket == "VeryLow";
         bool lowMotion = complexity.MotionBucket is "VeryLow" or "Low";
+        bool lowDetail = complexity.DetailBucket is "VeryLow" or "Low";
         if (mode == CompressionMode.Fast)
         {
-            candidates.Add(sourceFps > 50 && lowMotion && totalKbps < 1250 ? 30 : source);
-            if (totalKbps < 500 && sourceFps > 24) candidates.Add(24);
+            if (sourceFps > 50)
+            {
+                if (veryLowMotion)
+                {
+                    candidates.Add(30);
+                    if (lowDetail && durationSeconds <= 45 && totalKbps >= 1500) candidates.Add(source);
+                    if (totalKbps < 500) candidates.Add(24);
+                }
+                else
+                {
+                    candidates.Add(source);
+                    if (totalKbps < 900) candidates.Add(30);
+                    if (totalKbps < 500) candidates.Add(24);
+                }
+            }
+            else if (sourceFps > 30.5)
+            {
+                if (veryLowMotion && totalKbps < 700)
+                {
+                    candidates.Add(30);
+                    if (totalKbps < 450) candidates.Add(24);
+                }
+                else
+                {
+                    candidates.Add(source);
+                    if (totalKbps < 650) candidates.Add(30);
+                    if (totalKbps < 450) candidates.Add(24);
+                }
+            }
+            else
+            {
+                candidates.Add(source);
+                if (source > 24 && totalKbps < 650) candidates.Add(24);
+            }
+        }
+        else if (mode == CompressionMode.Balanced)
+        {
+            if (sourceFps > 50)
+            {
+                if (!veryLowMotion || totalKbps >= 1250 || lowDetail && durationSeconds <= 45 && totalKbps >= 950) candidates.Add(source);
+                candidates.Add(30);
+                if (totalKbps < 330) candidates.Add(24);
+            }
+            else if (sourceFps > 30.5)
+            {
+                if (!veryLowMotion || durationSeconds <= 90 && totalKbps >= 900) candidates.Add(source);
+                candidates.Add(30);
+                if (totalKbps < 300) candidates.Add(24);
+            }
+            else
+            {
+                candidates.Add(source);
+                if (source > 24 && totalKbps < 700) candidates.Add(24);
+            }
         }
         else
         {
-            if (!lowMotion || totalKbps >= (mode == CompressionMode.ExtraQuality ? 1100 : 1250) || contentClass == "gameplay") candidates.Add(source);
-            if (sourceFps > 30.5) candidates.Add(30);
-            else candidates.Add(source);
-            if (totalKbps < (mode == CompressionMode.ExtraQuality ? 420 : 330) && sourceFps > 24) candidates.Add(24);
-        }
-        if (profile.VideoCodec == "av1" && mode == CompressionMode.ExtraQuality && totalKbps >= 550) candidates.Insert(0, source);
-        if (mode == CompressionMode.ExtraQuality)
-        {
+            if (sourceFps > 50)
+            {
+                if (!lowMotion || totalKbps >= 1100) candidates.Add(source);
+                candidates.Add(30);
+                if (totalKbps < 420) candidates.Add(24);
+            }
+            else if (sourceFps > 30.5)
+            {
+                if (!veryLowMotion || totalKbps >= 850) candidates.Add(source);
+                candidates.Add(30);
+                if (totalKbps < 360) candidates.Add(24);
+            }
+            else
+            {
+                candidates.Add(source);
+                if (source > 24 && totalKbps < 650) candidates.Add(24);
+            }
+            if (profile.VideoCodec == "av1" && totalKbps >= 550) candidates.Insert(0, source);
             candidates.Insert(0, source);
             candidates.Add(sourceFps > 30.5 ? 30 : sourceFps > 24.5 ? 24 : sourceFps > 20.5 ? 20 : 15);
         }
         return candidates.Where(fps => fps > 0 && fps <= source + 0.5).Distinct().ToArray();
+    }
+
+    private static int StructuralNovelty(CompressionPlan candidate, IReadOnlyList<CompressionPlan> selected)
+    {
+        int score = 0;
+        if (selected.All(plan => plan.Profile.Backend != candidate.Profile.Backend)) score += 100;
+        if (selected.All(plan => Math.Abs(plan.Fps - candidate.Fps) > 0.1)) score += 80;
+        if (selected.All(plan => plan.Width != candidate.Width || plan.Height != candidate.Height)) score += 60;
+        if (selected.All(plan => plan.Preprocess != candidate.Preprocess)) score += 40;
+        if (selected.All(plan => !plan.Profile.PrivateArguments.SequenceEqual(candidate.Profile.PrivateArguments))) score += 20;
+        return score;
     }
 
     private static IReadOnlyList<(int Width, string Origin, double Score)> WidthCandidates(
@@ -240,7 +341,7 @@ public sealed class CompressionPlanner
         double aspect = sourceWidth / (double)sourceHeight;
         double targetBpppf = TargetBpppf(mode, complexity.DetailBucket, profile.VideoCodec);
         double expected = Math.Min(sourceWidth, Math.Sqrt(videoKbps * 1000.0 * aspect / Math.Max(1, fps * targetBpppf)));
-        Dictionary<int, string> origins = new Dictionary<int, string>();
+        Dictionary<int, string> origins = new();
         int[] ladder = WidthLadder.Where(width => width <= sourceWidth).DefaultIfEmpty(EvenFloor(sourceWidth)).ToArray();
         foreach (int width in ladder.OrderBy(width => Math.Abs(width - expected)).Take(3)) origins[width] = "ladder";
         foreach (double factor in new[] { 0.85, 0.92, 1.0, 1.08, 1.15 })
@@ -333,9 +434,9 @@ public sealed class CompressionPlanner
 
     private static (IReadOnlyList<string> Arguments, IReadOnlyList<string> Preserved, IReadOnlyList<string> Omitted) ColorMetadata(MediaInfo media)
     {
-        List<string> arguments = new List<string>();
-        List<string> preserved = new List<string>();
-        List<string> omitted = new List<string>();
+        List<string> arguments = [];
+        List<string> preserved = [];
+        List<string> omitted = [];
         AddColor("range", media.ColorRange, "-color_range", arguments, preserved, omitted);
         AddColor("primaries", media.ColorPrimaries, "-color_primaries", arguments, preserved, omitted);
         AddColor("transfer", media.ColorTransfer, "-color_trc", arguments, preserved, omitted);

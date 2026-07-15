@@ -38,7 +38,7 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
         string error = "";
         try
         {
-            List<string> baseArguments = new List<string> { "-y" };
+            List<string> baseArguments = ["-y"];
             if (profile.IsHardware) baseArguments.AddRange(["-vaapi_device", device]);
             baseArguments.AddRange(["-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=0.4"]);
             if (profile.IsHardware) baseArguments.AddRange(["-vf", "format=nv12,hwupload"]);
@@ -68,10 +68,8 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
             ], cancellationToken).ConfigureAwait(false);
             if (encodedAudio.ExitCode != 0) throw new InvalidOperationException(encodedAudio.StandardError);
 
-            List<string> muxArguments = new List<string>
-            {
-                "-y", "-i", videoOutput, "-i", audioOutput, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy"
-            };
+            List<string> muxArguments =
+                ["-y", "-i", videoOutput, "-i", audioOutput, "-map", "0:v:0", "-map", "1:a:0", "-c", "copy"];
             if (profile.Container == "mp4") muxArguments.AddRange(["-movflags", "+faststart"]);
             muxArguments.Add(deliveryOutput);
             ProcessResult muxed = await runner.RunAsync(request.FFmpegPath, muxArguments, cancellationToken).ConfigureAwait(false);
@@ -90,7 +88,7 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
             try { Directory.Delete(temp, recursive: true); } catch { }
         }
 
-        CapabilityProbeResult result = new CapabilityProbeResult
+        CapabilityProbeResult result = new()
         {
             Success = success,
             Backend = profile.Backend,

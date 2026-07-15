@@ -25,7 +25,7 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
         }
 
         List<SampleWindow> distinct = Deduplicate(candidates, safeSampleSeconds);
-        List<SampleWindow> scored = new List<SampleWindow>();
+        List<SampleWindow> scored = [];
         foreach (SampleWindow candidate in distinct.Take(safeMaxSamples * 3))
         {
             double difficulty = await ScoreDifficultyAsync(request, media, tempDirectory, candidate, cancellationToken).ConfigureAwait(false);
@@ -69,7 +69,7 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
         ], cancellationToken).ConfigureAwait(false);
         if (result.ExitCode != 0) return [];
 
-        List<SampleWindow> windows = new List<SampleWindow>();
+        List<SampleWindow> windows = [];
         double? currentPts = null;
         foreach (string line in result.CombinedOutput.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries))
         {
@@ -118,7 +118,7 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
 
     private static List<SampleWindow> Deduplicate(IEnumerable<SampleWindow> windows, int sampleSeconds)
     {
-        List<SampleWindow> distinct = new List<SampleWindow>();
+        List<SampleWindow> distinct = [];
         foreach (SampleWindow candidate in windows.OrderBy(window => window.StartSeconds))
         {
             int existingIndex = distinct.FindIndex(window => Math.Abs(window.StartSeconds - candidate.StartSeconds) < sampleSeconds * 0.60);
@@ -135,7 +135,7 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
         int maxSamples)
     {
         if (candidates.Count <= maxSamples) return candidates.OrderBy(window => window.StartSeconds).ToArray();
-        List<SampleWindow> selected = new List<SampleWindow>();
+        List<SampleWindow> selected = [];
         AddUnique(selected, candidates.OrderBy(window => window.StartSeconds).First(), sampleSeconds);
         if (maxSamples > 1) AddUnique(selected, candidates.OrderBy(window => window.StartSeconds).Last(), sampleSeconds);
         if (maxSamples > 2)

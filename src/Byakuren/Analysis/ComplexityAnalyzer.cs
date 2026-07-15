@@ -58,7 +58,7 @@ public sealed class ComplexityAnalyzer(ProcessRunner runner)
         string name,
         CancellationToken cancellationToken)
     {
-        List<double> values = new List<double>();
+        List<double> values = [];
         int index = 0;
         foreach (SampleWindow window in windows)
         {

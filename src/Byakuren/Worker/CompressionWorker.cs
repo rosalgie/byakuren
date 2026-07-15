@@ -49,7 +49,7 @@ public sealed class CompressionWorker
         DateTimeOffset started = DateTimeOffset.UtcNow;
         Validate(request);
         if (request.VerboseCommands) _runner.CommandObserver = command => progress?.Report(command);
-        PlanLogger planLogger = new PlanLogger(request);
+        PlanLogger planLogger = new(request);
         MediaInfo media = await _probe.ProbeMediaAsync(request, cancellationToken).ConfigureAwait(false);
         await planLogger.WriteAsync("source-probed", media, cancellationToken).ConfigureAwait(false);
         if (media.IsHdr) throw new NotSupportedException($"HDR input is rejected until an explicit color-management policy is selected ({media.HDRClassification}: {media.HDRReason}).");
@@ -71,8 +71,8 @@ public sealed class CompressionWorker
             return new CompressionOutcome(copyOutputPath, copyResult);
         }
 
-        List<(ResolvedPolicy Policy, CapabilityProbeResult Capability)> viablePolicies = new List<(ResolvedPolicy, CapabilityProbeResult)>();
-        List<string> capabilityErrors = new List<string>();
+        List<(ResolvedPolicy Policy, CapabilityProbeResult Capability)> viablePolicies = [];
+        List<string> capabilityErrors = [];
         foreach (ResolvedPolicy candidate in policyCandidates)
         {
             if (request.OutputBitDepth == "10" && (candidate.Profile.IsHardware || candidate.Profile.VideoCodec is not ("x265" or "av1" or "vp9")))
@@ -110,8 +110,8 @@ public sealed class CompressionWorker
             progress?.Report($"Complexity: detail {complexity.DetailBucket}, motion {complexity.MotionBucket}, sampling {complexity.SamplingMode}");
             await planLogger.WriteAsync("analysis-complete", new { Crop = crop, Samples = sampleWindows, Complexity = complexity, Content = contentAnalysis }, cancellationToken).ConfigureAwait(false);
 
-            Dictionary<string, AudioArtifact> audioArtifacts = new Dictionary<string, AudioArtifact>(StringComparer.Ordinal);
-            List<CompressionPlan> allCandidates = new List<CompressionPlan>();
+            Dictionary<string, AudioArtifact> audioArtifacts = new(StringComparer.Ordinal);
+            List<CompressionPlan> allCandidates = [];
             foreach ((ResolvedPolicy policy, _) in viablePolicies)
             {
                 IReadOnlyList<AudioPlan> audioPlans = _planner.CreateAudioPlans(request, media, policy.Profile, complexity, contentAnalysis?.ContentClass ?? "general");
@@ -136,14 +136,14 @@ public sealed class CompressionWorker
             List<CompressionPlan> encodeOrder = BuildEncodeOrder(selectedPlan, allCandidates, previews);
             await planLogger.WriteAsync("plan-selected", new { Selected = selectedPlan, Previews = previews.Select(preview => new { preview.Plan.Identity, preview.Metrics, preview.OutputBytes, preview.RuntimeSeconds }) }, cancellationToken).ConfigureAwait(false);
 
-            List<CorrectionPoint> corrections = new List<CorrectionPoint>();
+            List<CorrectionPoint> corrections = [];
             EncodeAttempt? best = null;
             int currentIndex = 0;
             int attemptsOnCurrentPlan = 0;
             CompressionPlan currentPlan = encodeOrder[0];
             Dictionary<string, int> priority = encodeOrder.Select((plan, index) => (Key: PlanKey(plan), Index: index)).DistinctBy(item => item.Key).ToDictionary(item => item.Key, item => item.Index, StringComparer.Ordinal);
-            Dictionary<string, List<CorrectionPoint>> correctionHistory = new Dictionary<string, List<CorrectionPoint>>(StringComparer.Ordinal);
-            Dictionary<string, EncodeAttempt> lastAttempts = new Dictionary<string, EncodeAttempt>(StringComparer.Ordinal);
+            Dictionary<string, List<CorrectionPoint>> correctionHistory = new(StringComparer.Ordinal);
+            Dictionary<string, EncodeAttempt> lastAttempts = new(StringComparer.Ordinal);
 
             for (int attemptNumber = 1; attemptNumber <= strategy.MaxFullEncodes; attemptNumber++)
             {
@@ -157,12 +157,12 @@ public sealed class CompressionWorker
                 progress?.Report($"Encode {attemptNumber}/{strategy.MaxFullEncodes}: {currentPlan.Width}x{currentPlan.Height}@{currentPlan.Fps:0.###}, {currentPlan.VideoKbps} kbps, {currentPlan.Profile.Backend}, {currentPlan.AudioPlan.Label}");
                 EncodeAttempt attempt = await _encoder.EncodeAttemptAsync(request, media, currentPlan, audio, fallbackAudio, tempDirectory, attemptNumber, capability.Device, cancellationToken).ConfigureAwait(false);
                 currentPlan = attempt.Plan;
-                CorrectionPoint correctionPoint = new CorrectionPoint(attemptNumber, currentPlan.VideoKbps, attempt.VideoPayloadBytes, attempt.AudioPayloadBytes, attempt.MuxOverheadBytes, attempt.SizeBytes);
+                CorrectionPoint correctionPoint = new(attemptNumber, currentPlan.VideoKbps, attempt.VideoPayloadBytes, attempt.AudioPayloadBytes, attempt.MuxOverheadBytes, attempt.SizeBytes);
                 corrections.Add(correctionPoint);
                 string currentKey = PlanKey(currentPlan);
                 if (!correctionHistory.TryGetValue(currentKey, out List<CorrectionPoint>? planHistory))
                 {
-                    planHistory = new List<CorrectionPoint>();
+                    planHistory = [];
                     correctionHistory[currentKey] = planHistory;
                 }
                 planHistory.Add(correctionPoint);
@@ -267,21 +267,16 @@ public sealed class CompressionWorker
             await _probe.HasFilterAsync(request.FFmpegPath, "xpsnr", cancellationToken).ConfigureAwait(false);
         if (!metricAvailable) return [];
 
-        List<CompressionPlan> previewPlans = candidates.GroupBy(plan => plan.Profile.Backend).Select(group => group.OrderByDescending(plan => plan.HeuristicScore).First()).ToList();
-        foreach (CompressionPlan candidate in candidates.OrderByDescending(plan => plan.HeuristicScore))
-        {
-            if (previewPlans.Count >= strategy.PreviewTop) break;
-            if (previewPlans.All(plan => plan.Identity != candidate.Identity || plan.AudioPlan.Identity != candidate.AudioPlan.Identity)) previewPlans.Add(candidate);
-        }
+        IReadOnlyList<CompressionPlan> previewPlans = _planner.CreatePreviewShortlist(candidates, strategy.PreviewTop);
 
-        List<PlanPreview> previews = new List<PlanPreview>();
+        List<PlanPreview> previews = [];
         int previewNumber = 0;
         foreach (CompressionPlan plan in previewPlans.Take(strategy.PreviewTop))
         {
             previewNumber++;
             progress?.Report($"Preview {previewNumber}/{Math.Min(strategy.PreviewTop, previewPlans.Count)}: {plan.Profile.Backend} {plan.Width}x{plan.Height}@{plan.Fps:0.###} {plan.Preprocess}");
             DateTimeOffset started = DateTimeOffset.UtcNow;
-            List<MetricEnsemble> windowMetrics = new List<MetricEnsemble>();
+            List<MetricEnsemble> windowMetrics = [];
             long bytes = 0;
             string lastPath = "";
             try
@@ -298,7 +293,7 @@ public sealed class CompressionWorker
                     TryDelete(path);
                 }
                 MetricEnsemble merged = MergeMetrics(windowMetrics);
-                PlanPreview preview = new PlanPreview(plan, merged, lastPath, bytes, (DateTimeOffset.UtcNow - started).TotalSeconds);
+                PlanPreview preview = new(plan, merged, lastPath, bytes, (DateTimeOffset.UtcNow - started).TotalSeconds);
                 previews.Add(preview);
                 await logger.WriteAsync("preview-complete", new { Plan = plan, Metrics = merged, Bytes = bytes, preview.RuntimeSeconds }, cancellationToken).ConfigureAwait(false);
             }
@@ -392,7 +387,8 @@ public sealed class CompressionWorker
         if (string.IsNullOrWhiteSpace(output))
         {
             string input = Path.GetFullPath(request.InputPath);
-            output = Path.Combine(Path.GetDirectoryName(input)!, $"{Path.GetFileNameWithoutExtension(input)}_{request.TargetBytes}_{profile.Backend}{profile.Extension}");
+            string mode = request.Mode.ToString().ToLowerInvariant();
+            output = Path.Combine(Path.GetDirectoryName(input)!, $"{Path.GetFileNameWithoutExtension(input)}_{request.TargetBytes}_{profile.Backend}_{mode}{profile.Extension}");
         }
         output = Path.GetFullPath(output);
         if (!Path.GetExtension(output).Equals(profile.Extension, StringComparison.OrdinalIgnoreCase))

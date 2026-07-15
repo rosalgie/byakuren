@@ -21,7 +21,7 @@ public sealed class CompressionPolicy
             _ => throw new ArgumentException($"Unsupported compatibility mode '{request.CompatibilityMode}'.")
         };
 
-        List<ResolvedPolicy> resolved = new List<ResolvedPolicy>();
+        List<ResolvedPolicy> resolved = [];
         foreach ((string codec, string backend) in candidates)
         {
             try

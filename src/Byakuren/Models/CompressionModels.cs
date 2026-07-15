@@ -268,7 +268,7 @@ public sealed record ComplexityAnalysis
 
 public sealed record AudioPlan(string Mode, int Kbps, string Codec, string Label, int Rank)
 {
-    public static AudioPlan Mute { get; } = new AudioPlan("mute", 0, "", "mute", 1);
+    public static AudioPlan Mute { get; } = new("mute", 0, "", "mute", 1);
     public string Identity => $"{Mode}|{Kbps}|{Codec}";
 }
 

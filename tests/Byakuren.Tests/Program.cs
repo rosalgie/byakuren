@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text.Json;
 using Byakuren.Analysis;
 using Byakuren.CLI;
+using Byakuren.Encoding;
 using Byakuren.Execution;
 using Byakuren.Metrics;
 using Byakuren.Models;
@@ -30,6 +31,7 @@ public static class Program
         Run("CLI accepts single-dash aliases", TestCLIAliases);
         Run("CLI preserves advanced planning controls", TestCLIAdvancedControls);
         Run("planner retains structural sentinels and reference isolation", TestPlannerCandidates);
+        Run("planner balances temporal and spatial candidates", TestTemporalSpatialPlanning);
         Run("audio priorities change payload allocation", TestAudioPriorities);
         Run("result schema uses byakuren identity", () => Equal("byakuren.compress.result.v1", ResultContract.SchemaVersion, "schema"));
 
@@ -136,7 +138,7 @@ public static class Program
         (CompressionMode Mode, int MaxFullEncodes, double FillGate)[] cases =
         [
             (CompressionMode.Fast, 2, 0.97),
-            (CompressionMode.Balanced, 3, 0.99),
+            (CompressionMode.Balanced, 2, 0.99),
             (CompressionMode.ExtraQuality, 5, 0.995)
         ];
         foreach ((CompressionMode mode, int maxFullEncodes, double fillGate) in cases)
@@ -145,6 +147,10 @@ public static class Program
             Equal(maxFullEncodes, strategy.MaxFullEncodes, mode + " encodes");
             Near(fillGate, strategy.FillGate, 1e-9, mode + " fill");
         }
+        ModeStrategy balanced = CompressionPlanner.Strategy(CompressionMode.Balanced);
+        Equal(3, balanced.ProbeMaxSamples, "Balanced probe samples");
+        Equal(1, balanced.PreviewMaxSamples, "Balanced preview samples");
+        Equal(2, balanced.PreviewTop, "Balanced preview plans");
     }
 
     private static void TestProcessStartInfo()
@@ -315,6 +321,51 @@ public static class Program
         Equal(true, speechKbps > visualKbps, "speech audio allocation");
     }
 
+    private static void TestTemporalSpatialPlanning()
+    {
+        CompressionPlanner planner = new CompressionPlanner();
+        MediaInfo media = TestMedia(60, hasAudio: true) with
+        {
+            DurationSeconds = 40,
+            AudioCodec = "aac",
+            AudioBitrateKbps = 96,
+            AudioChannels = 2
+        };
+        EncoderProfile profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4");
+        ComplexityAnalysis complexity = new ComplexityAnalysis
+        {
+            DetailBucket = "High",
+            MotionBucket = "VeryLow",
+            Windows = [new SampleWindow(10, 4, "fixed")]
+        };
+        ContentAnalysis content = new ContentAnalysis("general", new ContentFeatures { Available = true });
+        CropAnalysis crop = new CropAnalysis { Width = media.Width, Height = media.Height };
+        AudioPlan audioPlan = new AudioPlan("copy", 96, "aac", "copy source audio", 101);
+        AudioArtifact audio = new AudioArtifact(null, 480_000, audioPlan);
+
+        CompressionRequest balancedRequest = new CompressionRequest
+        {
+            InputPath = "input",
+            TargetBytes = 8 * 1024 * 1024,
+            Mode = CompressionMode.Balanced,
+            VideoCodec = "x264"
+        };
+        IReadOnlyList<CompressionPlan> balancedPlans = planner.CreateCandidatePlans(
+            balancedRequest, media, profile, audio, content, complexity, crop, complexity.Windows);
+        IReadOnlyList<CompressionPlan> shortlist = planner.CreatePreviewShortlist(balancedPlans, 2);
+
+        Equal(30.0, balancedPlans[0].Fps, "Balanced primary FPS");
+        Equal(2, shortlist.Count, "Balanced shortlist size");
+        Equal(true, shortlist.Any(plan => Math.Abs(plan.Fps - 30) < 0.1), "Balanced 30 FPS finalist");
+        Equal(true, shortlist.Any(plan => Math.Abs(plan.Fps - 60) < 0.1), "Balanced 60 FPS challenger");
+        Equal(true, shortlist.Select(plan => plan.Identity).Distinct().Count() == shortlist.Count, "structurally distinct previews");
+
+        CompressionRequest fastRequest = balancedRequest with { Mode = CompressionMode.Fast };
+        IReadOnlyList<CompressionPlan> fastPlans = planner.CreateCandidatePlans(
+            fastRequest, media, profile, audio, content, complexity, crop, complexity.Windows);
+        Equal(30.0, fastPlans[0].Fps, "Fast primary FPS");
+    }
+
     private static async Task RunMediaTestsAsync()
     {
         string tempDirectory = Path.Combine(Path.GetTempPath(), $"byakuren-media-tests-{Guid.NewGuid():N}");
@@ -346,6 +397,96 @@ public static class Program
                 byte[] sourceBytes = await File.ReadAllBytesAsync(sourcePath).ConfigureAwait(false);
                 byte[] outputBytes = await File.ReadAllBytesAsync(outputPath).ConfigureAwait(false);
                 Equal(true, sourceBytes.AsSpan().SequenceEqual(outputBytes), "copy bytes");
+            }).ConfigureAwait(false);
+
+            await RunAsync("media default output names include mode", async () =>
+            {
+                CompressionRequest request = new CompressionRequest
+                {
+                    InputPath = sourcePath,
+                    TargetBytes = new FileInfo(sourcePath).Length + 2048,
+                    Mode = CompressionMode.Fast,
+                    UnderCapBehavior = UnderCapBehavior.Auto,
+                    MetricMode = MetricMode.Off
+                };
+                CompressionOutcome outcome = await new CompressionWorker().RunAsync(request, null, CancellationToken.None).ConfigureAwait(false);
+                Equal(true, Path.GetFileNameWithoutExtension(outcome.OutputPath).EndsWith("_libx264_fast", StringComparison.Ordinal), "mode suffix");
+            }).ConfigureAwait(false);
+
+            await RunAsync("media previews honor planned bitrate", async () =>
+            {
+                EncoderProfile profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4");
+                CompressionPlan plan = new CompressionPlan
+                {
+                    Profile = profile,
+                    Mode = CompressionMode.Balanced,
+                    HardCapBytes = 300_000,
+                    WorkingTargetBytes = 297_000,
+                    Width = 640,
+                    Height = 360,
+                    Fps = 60,
+                    VideoKbps = 500,
+                    AudioKbps = 0,
+                    AudioPlan = AudioPlan.Mute,
+                    Preset = "medium",
+                    PixelFormat = "yuv420p",
+                    VideoFilter = "setsar=1,scale=640:360:flags=lanczos,fps=60:round=near",
+                    CanonicalCanvas = new CanonicalCanvas(640, 360, 60, 8, "yuv420p")
+                };
+                FFmpegProbe probe = new FFmpegProbe(runner);
+                MediaInfo sourceMedia = await probe.ProbeMediaAsync(new CompressionRequest { InputPath = sourcePath, TargetBytes = 300_000 }, CancellationToken.None).ConfigureAwait(false);
+                FFmpegEncoder encoder = new FFmpegEncoder(runner, probe);
+                string preview = await encoder.EncodePreviewAsync(
+                    new CompressionRequest { InputPath = sourcePath, TargetBytes = 300_000 },
+                    sourceMedia,
+                    plan,
+                    new SampleWindow(0, 3, "fixed"),
+                    tempDirectory,
+                    "none",
+                    CancellationToken.None).ConfigureAwait(false);
+                long payload = await probe.GetPacketPayloadBytesAsync("ffprobe", preview, "v:0", CancellationToken.None).ConfigureAwait(false);
+                double actualKbps = payload * 8.0 / 3.0 / 1000.0;
+                Equal(true, actualKbps is >= 450 and <= 550, $"preview bitrate {actualKbps:0.0} kbps");
+                File.Delete(preview);
+            }).ConfigureAwait(false);
+
+            await RunAsync("media preview metrics compare on candidate timeline", async () =>
+            {
+                if (!await new FFmpegProbe(runner).HasFilterAsync("ffmpeg", "libvmaf", CancellationToken.None).ConfigureAwait(false)) return;
+                string lowFpsPath = Path.Combine(tempDirectory, "selection-timeline.mkv");
+                await runner.RunCheckedAsync("ffmpeg",
+                [
+                    "-y", "-i", sourcePath, "-vf", "fps=30", "-an", "-c:v", "ffv1", lowFpsPath
+                ], CancellationToken.None).ConfigureAwait(false);
+                FFmpegProbe probe = new FFmpegProbe(runner);
+                CompressionRequest metricRequest = new CompressionRequest
+                {
+                    InputPath = sourcePath,
+                    TargetBytes = 300_000,
+                    Mode = CompressionMode.Balanced,
+                    MetricMode = MetricMode.VMAF
+                };
+                MediaInfo sourceMedia = await probe.ProbeMediaAsync(metricRequest, CancellationToken.None).ConfigureAwait(false);
+                CompressionPlan plan = new CompressionPlan
+                {
+                    Profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4"),
+                    Mode = CompressionMode.Balanced,
+                    HardCapBytes = 300_000,
+                    WorkingTargetBytes = 297_000,
+                    Width = 640,
+                    Height = 360,
+                    Fps = 30,
+                    VideoKbps = 500,
+                    AudioKbps = 0,
+                    Preset = "medium",
+                    PixelFormat = "yuv420p",
+                    VideoFilter = "fps=30",
+                    CanonicalCanvas = new CanonicalCanvas(640, 360, 60, 8, "yuv420p"),
+                    CropAnalysis = new CropAnalysis { Width = 640, Height = 360 }
+                };
+                MetricEnsemble result = await new MetricEvaluator(runner, probe).EvaluatePreviewAsync(
+                    metricRequest, sourceMedia, plan, lowFpsPath, tempDirectory, new SampleWindow(0, 2, "fixed"), CancellationToken.None).ConfigureAwait(false);
+                Equal(true, result.VMAFNeg is > 90, $"selection VMAF {result.VMAFNeg:0.0}");
             }).ConfigureAwait(false);
 
             foreach ((string codec, string extension) in new[] { ("x264", ".mp4"), ("x265", ".mp4"), ("av1", ".webm") })

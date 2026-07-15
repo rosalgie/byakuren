@@ -12,18 +12,22 @@ public sealed class CropAnalyzer(ProcessRunner runner)
         MediaInfo media,
         CancellationToken cancellationToken)
     {
-        CropAnalysis fallback = new CropAnalysis { Width = media.Width, Height = media.Height, Summary = request.CropMode == CropMode.Off ? "disabled" : "none" };
+        CropAnalysis fallback = new() { Width = media.Width, Height = media.Height, Summary = request.CropMode == CropMode.Off ? "disabled" : "none" };
         if (request.CropMode == CropMode.Off) return fallback;
+        
         int frameWidth = media.Rotation is 90 or 270 ? media.Height : media.Width;
         int frameHeight = media.Rotation is 90 or 270 ? media.Width : media.Height;
+        
         IReadOnlyList<double> offsets = Offsets(media.DurationSeconds, 2, 5);
-        List<CropSample> samples = new List<CropSample>();
+        List<CropSample> samples = [];
+        
         foreach (double offset in offsets)
         {
             CropSample? sample = await DetectSampleAsync(request, media, offset, cancellationToken).ConfigureAwait(false);
             if (sample is null) return fallback with { Summary = "detection-failed", Samples = samples };
             samples.Add(sample);
         }
+        
         if (samples.Count == 0) return fallback;
         if (Spread(samples.Select(sample => sample.Width)) > 4 || Spread(samples.Select(sample => sample.Height)) > 4 ||
             Spread(samples.Select(sample => sample.X)) > 4 || Spread(samples.Select(sample => sample.Y)) > 4)
@@ -93,7 +97,7 @@ public sealed class CropAnalyzer(ProcessRunner runner)
         int height,
         CancellationToken cancellationToken)
     {
-        List<(int Width, int Height, int X, int Y)> regions = new List<(int, int, int, int)>();
+        List<(int Width, int Height, int X, int Y)> regions = [];
         int right = frameWidth - x - width;
         int bottom = frameHeight - y - height;
         if (x > 0) regions.Add((x, frameHeight, 0, 0));

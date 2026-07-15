@@ -51,9 +51,9 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         MetricMode mode = await ResolveModeAsync(request, cancellationToken).ConfigureAwait(false);
         if (mode == MetricMode.Off) return new MetricEnsemble { Mode = "off" };
         bool collectCAMBI = plan.ContentClass is "anime" or "noisy_camera" || plan.Preprocess == "deband";
-        List<MetricWindow> metricWindows = new List<MetricWindow>();
-        List<double> standardScores = new List<double>();
-        List<string> errors = new List<string>();
+        List<MetricWindow> metricWindows = [];
+        List<double> standardScores = [];
+        List<string> errors = [];
 
         int index = 0;
         foreach (SampleWindow window in windows)
@@ -65,18 +65,18 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
             double? cambi = null;
             if (mode is MetricMode.VMAF or MetricMode.Ensemble)
             {
-                (vmafNeg, standardVMAF, string? error) = await RunVMAFAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, cancellationToken).ConfigureAwait(false);
+                (vmafNeg, standardVMAF, string? error) = await RunVMAFAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, distortedIsPreview, cancellationToken).ConfigureAwait(false);
                 if (standardVMAF.HasValue) standardScores.Add(standardVMAF.Value);
                 if (!string.IsNullOrWhiteSpace(error)) errors.Add(error);
                 if (collectCAMBI)
                 {
-                    (cambi, string? cambiError) = await RunCAMBIAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, cancellationToken).ConfigureAwait(false);
+                    (cambi, string? cambiError) = await RunCAMBIAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, distortedIsPreview, cancellationToken).ConfigureAwait(false);
                     if (!string.IsNullOrWhiteSpace(cambiError)) errors.Add(cambiError);
                 }
             }
             if (mode is MetricMode.XPSNR or MetricMode.Ensemble)
             {
-                (xpsnr, string? error) = await RunXPSNRAsync(request, media, plan, outputPath, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, cancellationToken).ConfigureAwait(false);
+                (xpsnr, string? error) = await RunXPSNRAsync(request, media, plan, outputPath, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, distortedIsPreview, cancellationToken).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(error)) errors.Add(error);
             }
             metricWindows.Add(new MetricWindow(index++, window.StartSeconds, window.StartSeconds + duration, vmafNeg, xpsnr, cambi));
@@ -114,11 +114,12 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         double distortedStart,
         double duration,
         int index,
+        bool selectionTimeline,
         CancellationToken cancellationToken)
     {
         string logPath = Path.Combine(tempDirectory, $"vmaf-{Guid.NewGuid():N}-{index}.json");
-        string referenceFilter = string.IsNullOrWhiteSpace(plan.MetricReferenceFilter) ? ReferenceFilter(plan.CanonicalCanvas) : plan.MetricReferenceFilter;
-        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{DistortedFilter(plan.CanonicalCanvas)},setpts=PTS-STARTPTS[dist];" +
+        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline);
+        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];" +
                         $"[dist][ref]libvmaf=log_fmt=json:log_path='{EscapeFilterPath(logPath)}':model='version=vmaf_v0.6.1neg\\:name=vmaf_neg|version=vmaf_v0.6.1\\:name=vmaf'";
         ProcessResult result = await runner.RunAsync(request.FFmpegPath,
         [
@@ -146,10 +147,11 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         double referenceStart,
         double distortedStart,
         double duration,
+        bool selectionTimeline,
         CancellationToken cancellationToken)
     {
-        string referenceFilter = string.IsNullOrWhiteSpace(plan.MetricReferenceFilter) ? ReferenceFilter(plan.CanonicalCanvas) : plan.MetricReferenceFilter;
-        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{DistortedFilter(plan.CanonicalCanvas)},setpts=PTS-STARTPTS[dist];[dist][ref]xpsnr=stats_file=-";
+        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline);
+        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];[dist][ref]xpsnr=stats_file=-";
         ProcessResult result = await runner.RunAsync(request.FFmpegPath,
         [
             "-v", "info", "-ss", Number(referenceStart), "-t", Number(duration), "-i", media.Path,
@@ -173,11 +175,12 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         double distortedStart,
         double duration,
         int index,
+        bool selectionTimeline,
         CancellationToken cancellationToken)
     {
         string logPath = Path.Combine(tempDirectory, $"cambi-{Guid.NewGuid():N}-{index}.json");
-        string referenceFilter = string.IsNullOrWhiteSpace(plan.MetricReferenceFilter) ? ReferenceFilter(plan.CanonicalCanvas) : plan.MetricReferenceFilter;
-        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{DistortedFilter(plan.CanonicalCanvas)},setpts=PTS-STARTPTS[dist];" +
+        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline);
+        string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];" +
                         $"[dist][ref]libvmaf=log_fmt=json:log_path='{EscapeFilterPath(logPath)}':feature='name=cambi'";
         ProcessResult result = await runner.RunAsync(request.FFmpegPath,
         [
@@ -210,6 +213,27 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         int sampleSeconds = request.MetricSampleSeconds > 0 ? request.MetricSampleSeconds : Math.Min(4, request.ProbeSampleSeconds);
         IReadOnlyList<SampleWindow> source = plan.SampleWindows.Count > 0 ? plan.SampleWindows : SampleWindowPlanner.FixedWindows(media.DurationSeconds, sampleSeconds, maxSamples);
         return source.Take(maxSamples).Select(window => window with { DurationSeconds = Math.Min(window.DurationSeconds, sampleSeconds) }).ToArray();
+    }
+
+    private static (string Reference, string Distorted) MetricFilters(CompressionPlan plan, bool selectionTimeline)
+    {
+        if (!selectionTimeline)
+        {
+            string canonicalReference = string.IsNullOrWhiteSpace(plan.MetricReferenceFilter)
+                ? ReferenceFilter(plan.CanonicalCanvas)
+                : plan.MetricReferenceFilter;
+            return (canonicalReference, DistortedFilter(plan.CanonicalCanvas));
+        }
+
+        // Candidate selection measures spatial damage at the candidate cadence.
+        // Final reporting still uses the canonical source timeline above.
+        CanonicalCanvas selectionCanvas = plan.CanonicalCanvas with
+        {
+            Fps = Math.Min(plan.CanonicalCanvas.Fps, plan.Fps)
+        };
+        string crop = plan.CropAnalysis?.Filter ?? "";
+        string selectionReference = string.Join(',', new[] { crop, ReferenceFilter(selectionCanvas) }.Where(filter => !string.IsNullOrWhiteSpace(filter)));
+        return (selectionReference, DistortedFilter(selectionCanvas));
     }
 
     private static double? Mean(JsonElement pooled, string name) =>

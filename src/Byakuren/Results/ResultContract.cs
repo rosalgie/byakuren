@@ -26,11 +26,11 @@ public sealed class ResultContract
         string outputPath,
         CancellationToken cancellationToken)
     {
-        FileInfo output = new FileInfo(outputPath);
+        FileInfo output = new(outputPath);
         double fill = output.Length / (double)request.TargetBytes;
         ModeStrategy strategy = CompressionPlanner.Strategy(request.Mode);
         CanonicalCanvas canvas = plan?.CanonicalCanvas ?? new CompressionPlanner().GetCanonicalCanvas(media);
-        List<string> warnings = new List<string>();
+        List<string> warnings = [];
         if (action == "encode" && fill < strategy.FillGate)
             warnings.Add($"final fill {fill:P2} is below the {strategy.FillGate:P2} mode gate");
         if (action == "encode" && attempt is not null && attempt.MuxOverheadBytes > Math.Max(4096, plan?.MuxReserveBytes ?? 0))
@@ -146,7 +146,7 @@ public sealed class ResultContract
                 policy.Profile.RateControlAdapter,
                 Preset = plan?.Preset ?? "copy",
                 PixelFormat = plan?.PixelFormat ?? media.PixelFormat,
-                Arguments = plan is null ? Array.Empty<string>() : BuildEncoderArguments(plan)
+                Arguments = plan is null ? [] : BuildEncoderArguments(plan)
             },
             Plan = plan,
             PayloadBytes = new

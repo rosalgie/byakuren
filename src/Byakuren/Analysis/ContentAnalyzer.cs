@@ -12,13 +12,13 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         MediaInfo media,
         CancellationToken cancellationToken)
     {
-        List<double> entropyValues = new List<double>();
-        List<double> temporalValues = new List<double>();
-        List<double> noiseValues = new List<double>();
-        List<double> edgeValues = new List<double>();
-        List<double> flatValues = new List<double>();
-        List<double> sceneValues = new List<double>();
-        List<string> errors = new List<string>();
+        List<double> entropyValues = [];
+        List<double> temporalValues = [];
+        List<double> noiseValues = [];
+        List<double> edgeValues = [];
+        List<double> flatValues = [];
+        List<double> sceneValues = [];
+        List<string> errors = [];
 
         foreach (double startSeconds in SampleStarts(media.DurationSeconds))
         {
@@ -82,7 +82,7 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         double? uiPersistence = edgeDensity.HasValue && temporalDifference.HasValue
             ? Math.Clamp((1.0 - Math.Min(1.0, temporalDifference.Value * 4.0)) * 0.60 + edgeDensity.Value * 0.40, 0.0, 1.0)
             : null;
-        ContentFeatures features = new ContentFeatures
+        ContentFeatures features = new()
         {
             Available = edgeValues.Count > 0 && flatValues.Count > 0 && entropyValues.Count > 0 &&
                         temporalValues.Count > 0 && noiseValues.Count > 0 && sceneValues.Count > 0,
