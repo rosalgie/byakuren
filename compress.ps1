@@ -16,6 +16,14 @@ param(
   [ValidateSet("x264", "x265", "av1", "auto")]
   [string]$VideoCodec = "x264",
 
+  [ValidateSet("auto", "libx264", "libx265", "svtav1", "aom", "rav1e", "vpx", "vvenc", "vaapi")]
+  [string]$EncoderBackend = "auto",
+
+  [switch]$EnableExperimentalEncoders,
+
+  [AllowEmptyString()]
+  [string]$HardwareDevice = "auto",
+
   [AllowEmptyString()]
   [string]$Container = "",
 
@@ -78,6 +86,9 @@ $script:EncoderPixelFormatSupportCache = @{}
 $script:VmafNegModelAvailable = $null
 $script:RequestedHardCapBytes = $null
 $script:AudioCache = @{}
+$script:FunctionalProbeCache = @{}
+$script:FunctionalProbeCacheLoaded = $false
+$script:FunctionalProbeCachePath = ""
 
 function Require-Tool($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
@@ -292,6 +303,10 @@ function Get-RuntimeCapabilities {
   $hasXpsnr = Test-FfmpegFilterAvailable -Filter "xpsnr"
   $hasScdet = Test-FfmpegFilterAvailable -Filter "scdet"
 
+  $x264Probe = if ($x264Available -and $mp4Available -and $aacAvailable) { Invoke-EncoderFunctionalProbe -CodecProfile (Resolve-CodecProfile -VideoCodec "x264" -Container "mp4" -EncoderBackend "libx264") } else { $null }
+  $x265Probe = if ($x265Available -and $mp4Available -and $aacAvailable) { Invoke-EncoderFunctionalProbe -CodecProfile (Resolve-CodecProfile -VideoCodec "x265" -Container "mp4" -EncoderBackend "libx265") } else { $null }
+  $av1Probe = if ($av1Available -and $webmAvailable -and $opusAvailable) { Invoke-EncoderFunctionalProbe -CodecProfile (Resolve-CodecProfile -VideoCodec "av1" -Container "webm" -EncoderBackend "svtav1") } else { $null }
+
   $capabilities = [PSCustomObject]@{
     HasLibVmaf             = [bool]$hasVmaf
     HasXpsnr               = [bool]$hasXpsnr
@@ -303,15 +318,43 @@ function Get-RuntimeCapabilities {
     HasWebmMuxer           = [bool]$webmAvailable
     HasAac                 = [bool]$aacAvailable
     HasOpus                = [bool]$opusAvailable
-    SupportsX264Mp4        = [bool]($x264Available -and $mp4Available -and $aacAvailable)
-    SupportsX265Mp4        = [bool]($x265Available -and $mp4Available -and $aacAvailable)
-    SupportsAv1Webm        = [bool]($av1Available -and $webmAvailable -and $opusAvailable)
+    X264FunctionalProbe    = $x264Probe
+    X265FunctionalProbe    = $x265Probe
+    Av1FunctionalProbe     = $av1Probe
+    SupportsX264Mp4        = [bool]($x264Probe -and $x264Probe.Success)
+    SupportsX265Mp4        = [bool]($x265Probe -and $x265Probe.Success)
+    SupportsAv1Webm        = [bool]($av1Probe -and $av1Probe.Success)
     PreferredMetricMode    = if ($hasVmaf -and $hasXpsnr) { "ensemble" } elseif ($hasVmaf) { "vmaf" } elseif ($hasXpsnr) { "xpsnr" } else { "off" }
     PreferredSamplingMode  = if ($hasScdet) { "sceneaware" } else { "fixed" }
   }
 
   $script:RuntimeCapabilities = $capabilities
   return $capabilities
+}
+
+function Get-CodecForEncoderBackend {
+  param(
+    [Parameter(Mandatory = $true)][string]$Backend,
+    [string]$RequestedVideoCodec = "auto"
+  )
+
+  switch (Get-NormalizedOptionValue -Value $Backend -DefaultValue "auto") {
+    "libx264" { return "x264" }
+    "libx265" { return "x265" }
+    "svtav1"  { return "av1" }
+    "aom"     { return "av1" }
+    "rav1e"   { return "av1" }
+    "vpx"     { return "vp9" }
+    "vvenc"   { return "vvc" }
+    "vaapi"   {
+      $codec = Get-NormalizedOptionValue -Value $RequestedVideoCodec -DefaultValue "auto"
+      if ($codec -notin @("x264", "x265", "av1")) {
+        throw "The VAAPI backend requires -VideoCodec x264, x265, or av1."
+      }
+      return $codec
+    }
+    default { return (Get-NormalizedOptionValue -Value $RequestedVideoCodec -DefaultValue "auto") }
+  }
 }
 
 function Resolve-PolicyProfile {
@@ -324,11 +367,31 @@ function Resolve-PolicyProfile {
     [Parameter(Mandatory = $true)][string]$CompatibilityMode,
     [Parameter(Mandatory = $true)][string]$AudioPriority,
     [Parameter(Mandatory = $true)][string]$Mode,
+    [string]$RequestedEncoderBackend = "auto",
+    [bool]$RequestedVideoCodecWasExplicit = $false,
+    [switch]$EnableExperimental,
     [double]$TotalKbps = 0.0
   )
 
   $caps = Get-RuntimeCapabilities
   $requestedCodec = Get-NormalizedOptionValue -Value $RequestedVideoCodec -DefaultValue "x264"
+  $requestedBackend = Get-NormalizedOptionValue -Value $RequestedEncoderBackend -DefaultValue "auto"
+  if ($requestedBackend -ne "auto") {
+    if ($requestedBackend -in @("aom", "rav1e", "vpx", "vvenc") -and -not $EnableExperimental) {
+      throw "Encoder backend '$requestedBackend' is experimental. Add -EnableExperimentalEncoders to select it explicitly."
+    }
+    if ($requestedBackend -eq "vvenc") {
+      throw "VVenC is a raw-video lab backend and is not available for delivery output."
+    }
+    if ($requestedBackend -eq "vaapi") {
+      throw "VAAPI is implemented by the cross-platform C# worker, not by this PowerShell reference frontend."
+    }
+    $backendCodec = Get-CodecForEncoderBackend -Backend $requestedBackend -RequestedVideoCodec $requestedCodec
+    if ($RequestedVideoCodecWasExplicit -and $requestedCodec -ne "auto" -and $requestedCodec -ne $backendCodec) {
+      throw "Encoder backend '$requestedBackend' does not implement requested codec '$requestedCodec'."
+    }
+    $requestedCodec = $backendCodec
+  }
   $requestedContainerValue = Get-NormalizedOptionValue -Value $RequestedContainer -DefaultValue "auto"
   $requestedMetric = Get-NormalizedOptionValue -Value $RequestedMetricMode -DefaultValue "auto"
   $requestedSample = Get-NormalizedOptionValue -Value $RequestedSampleMode -DefaultValue "auto"
@@ -339,8 +402,8 @@ function Resolve-PolicyProfile {
     throw "Unsupported container '$RequestedContainer'. Supported containers are mp4, webm, and auto."
   }
 
-  if ($requestedCodec -notin @("x264", "x265", "av1", "auto")) {
-    throw "Unsupported video codec '$RequestedVideoCodec'. Supported codecs are x264, x265, av1, and auto."
+  if ($requestedCodec -notin @("x264", "x265", "av1", "vp9", "auto")) {
+    throw "Unsupported video codec '$RequestedVideoCodec'. Supported codecs are x264, x265, av1, and auto; VP9 is selected through the experimental vpx backend."
   }
 
   $codecPinned = ($requestedCodec -ne "auto")
@@ -396,12 +459,6 @@ function Resolve-PolicyProfile {
         if ($caps.SupportsX264Mp4) {
           [void]$pairs.Add([PSCustomObject]@{ VideoCodec = "x264"; Container = "mp4"; Reason = "widest-default"; AudioCodec = "aac" })
         }
-        if ($Mode -ne "Fast" -and $caps.SupportsAv1Webm) {
-          [void]$pairs.Add([PSCustomObject]@{ VideoCodec = "av1"; Container = "webm"; Reason = "widest-secondary"; AudioCodec = "opus" })
-        }
-        if ($Mode -ne "Fast" -and $caps.SupportsX265Mp4) {
-          [void]$pairs.Add([PSCustomObject]@{ VideoCodec = "x265"; Container = "mp4"; Reason = "widest-tertiary"; AudioCodec = "aac" })
-        }
       }
     }
 
@@ -435,7 +492,7 @@ function Resolve-PolicyProfile {
   }
 
   if ($selectedContainer -eq "auto") {
-    $selectedContainer = if ($selectedCodec -eq "av1") { "webm" } else { "mp4" }
+    $selectedContainer = if ($selectedCodec -in @("av1", "vp9")) { "webm" } else { "mp4" }
     if ([string]::IsNullOrWhiteSpace($containerReason)) {
       $containerReason = "codec-default"
     }
@@ -445,6 +502,7 @@ function Resolve-PolicyProfile {
 
   return [PSCustomObject]@{
     VideoCodec                 = [string]$selectedCodec
+    EncoderBackend             = if ($requestedBackend -ne "auto") { [string]$requestedBackend } else { switch ($selectedCodec) { "x264" { "libx264" } "x265" { "libx265" } "av1" { "svtav1" } "vp9" { "vpx" } } }
     Container                  = [string]$selectedContainer
     DefaultAudioCodec          = [string]$defaultAudioCodec
     MetricModeUsed             = [string]$metricModeUsed
@@ -497,11 +555,26 @@ function Get-SvtAv1PresetForPreset([string]$Preset) {
   }
 }
 
+function Get-ExperimentalSpeedForPreset {
+  param(
+    [Parameter(Mandatory = $true)][string]$Preset,
+    [Parameter(Mandatory = $true)][ValidateSet("aom", "vpx", "rav1e")][string]$Backend
+  )
+
+  $rank = Get-CodecPresetRank -preset $Preset
+  if ($rank -le 0) { throw "Unsupported preset '$Preset' for backend '$Backend'." }
+  switch ($Backend) {
+    "rav1e" { return [int][math]::Max(0, [math]::Min(10, 11 - $rank)) }
+    default { return [int][math]::Max(0, [math]::Min(8, 9 - $rank)) }
+  }
+}
+
 function Get-CodecEfficiencyMultiplier([string]$VideoCodec) {
   switch ($VideoCodec) {
     "x264" { return 1.00 }
     "x265" { return 0.82 }
     "av1"  { return 0.72 }
+    "vp9"  { return 0.84 }
     default { return 1.00 }
   }
 }
@@ -529,6 +602,13 @@ function Get-RateControlSeedCrf([string]$VideoCodec, [string]$Mode) {
         "ExtraQuality" { return 32.0 }
       }
     }
+    "vp9" {
+      switch ($Mode) {
+        "Fast"         { return 38.0 }
+        "Balanced"     { return 34.0 }
+        "ExtraQuality" { return 31.0 }
+      }
+    }
   }
 }
 
@@ -547,6 +627,7 @@ function Get-ResolvedContainer([string]$VideoCodec, [AllowEmptyString()][string]
   if ($normalizedContainer -eq "auto") {
     switch ($normalizedCodec) {
       "av1"  { return "webm" }
+      "vp9"  { return "webm" }
       default { return "mp4" }
     }
   }
@@ -561,65 +642,315 @@ function Get-ResolvedContainer([string]$VideoCodec, [AllowEmptyString()][string]
 function Resolve-CodecProfile {
   param(
     [Parameter(Mandatory = $true)][string]$VideoCodec,
-    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Container
+    [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Container,
+    [string]$EncoderBackend = "auto"
   )
 
   $resolvedContainer = Get-ResolvedContainer -VideoCodec $VideoCodec -Container $Container
+  $backend = Get-NormalizedOptionValue -Value $EncoderBackend -DefaultValue "auto"
+  if ($backend -eq "auto") {
+    $backend = switch (Get-NormalizedOptionValue -Value $VideoCodec) {
+      "x264" { "libx264" }
+      "x265" { "libx265" }
+      "av1"  { "svtav1" }
+      "vp9"  { "vpx" }
+      default { "" }
+    }
+  }
 
-  switch ("$(Get-NormalizedOptionValue -Value $VideoCodec)|$resolvedContainer") {
-    "x264|mp4" {
+  switch ("$backend|$(Get-NormalizedOptionValue -Value $VideoCodec)|$resolvedContainer") {
+    "libx264|x264|mp4" {
       return [PSCustomObject]@{
         VideoCodec           = "x264"
+        EncoderBackend       = "libx264"
         VideoEncoder         = "libx264"
+        CodecFamily          = "h264"
         Container            = "mp4"
+        ContainerAudioProfile = "mp4-aac"
         Extension            = ".mp4"
         DefaultAudioCodec    = "aac"
         DefaultAudioEncoder  = "aac"
         CopyableAudioCodecs  = @("aac")
         PresetKind           = "x264"
+        RateControlAdapter   = "ffmpeg-two-pass-vbr"
+        RequiredPasses       = 2
+        PrivateEncoderArgs   = @()
         PreviewSpeedOverride = [PSCustomObject]@{ Kind = "preset"; Value = "veryfast"; Label = "veryfast" }
         FinalizeArgs         = @("-c", "copy", "-movflags", "+faststart")
       }
     }
-    "x265|mp4" {
+    "libx265|x265|mp4" {
       return [PSCustomObject]@{
         VideoCodec           = "x265"
+        EncoderBackend       = "libx265"
         VideoEncoder         = "libx265"
+        CodecFamily          = "hevc"
         Container            = "mp4"
+        ContainerAudioProfile = "mp4-aac"
         Extension            = ".mp4"
         DefaultAudioCodec    = "aac"
         DefaultAudioEncoder  = "aac"
         CopyableAudioCodecs  = @("aac")
         PresetKind           = "x265"
+        RateControlAdapter   = "ffmpeg-two-pass-vbr"
+        RequiredPasses       = 2
+        PrivateEncoderArgs   = @()
         PreviewSpeedOverride = [PSCustomObject]@{ Kind = "preset"; Value = "fast"; Label = "fast" }
         FinalizeArgs         = @("-c", "copy", "-movflags", "+faststart")
       }
     }
-    "av1|webm" {
+    "svtav1|av1|webm" {
       return [PSCustomObject]@{
         VideoCodec           = "av1"
+        EncoderBackend       = "svtav1"
         VideoEncoder         = "libsvtav1"
+        CodecFamily          = "av1"
         Container            = "webm"
+        ContainerAudioProfile = "webm-opus"
         Extension            = ".webm"
         DefaultAudioCodec    = "opus"
         DefaultAudioEncoder  = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs  = @("opus")
         PresetKind           = "svtav1"
+        RateControlAdapter   = "ffmpeg-two-pass-vbr"
+        RequiredPasses       = 2
+        PrivateEncoderArgs   = @()
         PreviewSpeedOverride = [PSCustomObject]@{ Kind = "preset"; Value = 12; Label = "preset=12" }
         FinalizeArgs         = @("-c", "copy")
       }
     }
-    "av1|mp4" {
+    "aom|av1|webm" {
+      return [PSCustomObject]@{
+        VideoCodec = "av1"; EncoderBackend = "aom"; VideoEncoder = "libaom-av1"; CodecFamily = "av1"
+        Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        CopyableAudioCodecs = @("opus"); PresetKind = "aom"; RateControlAdapter = "ffmpeg-two-pass-vbr"
+        RequiredPasses = 2; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "cpu-used"; Value = 8; Label = "cpu-used=8" }
+        FinalizeArgs = @("-c", "copy")
+      }
+    }
+    "rav1e|av1|webm" {
+      return [PSCustomObject]@{
+        VideoCodec = "av1"; EncoderBackend = "rav1e"; VideoEncoder = "librav1e"; CodecFamily = "av1"
+        Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        CopyableAudioCodecs = @("opus"); PresetKind = "rav1e"; RateControlAdapter = "one-pass-vbr-lab"
+        RequiredPasses = 1; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "speed"; Value = 10; Label = "speed=10" }
+        FinalizeArgs = @("-c", "copy")
+      }
+    }
+    "vpx|vp9|webm" {
+      return [PSCustomObject]@{
+        VideoCodec = "vp9"; EncoderBackend = "vpx"; VideoEncoder = "libvpx-vp9"; CodecFamily = "vp9"
+        Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        CopyableAudioCodecs = @("opus"); PresetKind = "vpx"; RateControlAdapter = "ffmpeg-two-pass-vbr"
+        RequiredPasses = 2; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "cpu-used"; Value = 8; Label = "cpu-used=8" }
+        FinalizeArgs = @("-c", "copy")
+      }
+    }
+    "svtav1|av1|mp4" {
       throw "AV1 output is restricted to WebM in Phase 1. Use -Container webm."
     }
     default {
-      throw "Unsupported codec/container combination: $VideoCodec + $resolvedContainer"
+      throw "Unsupported encoder/codec/container combination: $backend + $VideoCodec + $resolvedContainer"
     }
   }
 }
 
 function Get-OutputExtension([string]$Path) {
   return [System.IO.Path]::GetExtension($Path).ToLowerInvariant()
+}
+
+function Get-EncoderParameterFamilies {
+  param(
+    [Parameter(Mandatory = $true)][string]$Backend,
+    [string]$ContentClass = "general"
+  )
+
+  switch (Get-NormalizedOptionValue -Value $Backend) {
+    "libx264" { return @(
+        [PSCustomObject]@{ Name = "encoder-defaults"; Args = @(); Automatic = $false },
+        [PSCustomObject]@{ Name = "current-adaptive"; Args = @("content-adaptive-x264-params"); Automatic = $true }
+      ) }
+    "libx265" { return @(
+        [PSCustomObject]@{ Name = "encoder-defaults"; Args = @(); Automatic = $true },
+        [PSCustomObject]@{ Name = "aq-psy-low"; Args = @("-x265-params", "aq-mode=3:psy-rd=1.0"); Automatic = $false },
+        [PSCustomObject]@{ Name = "aq-psy-high"; Args = @("-x265-params", "aq-mode=3:psy-rd=2.0"); Automatic = $false }
+      ) }
+    "svtav1" { return @(
+        [PSCustomObject]@{ Name = "encoder-defaults"; Args = @(); Automatic = $true },
+        [PSCustomObject]@{ Name = "visual-variance"; Args = @("-svtav1-params", "tune=0:enable-variance-boost=1"); Automatic = $false },
+        [PSCustomObject]@{ Name = "gated-grain"; Args = @("lab-grain-synthesis"); Automatic = $false }
+      ) }
+    "aom" { return @(
+        [PSCustomObject]@{ Name = "encoder-defaults"; Args = @(); Automatic = $false },
+        [PSCustomObject]@{ Name = "variance-ssim"; Args = @("-aq-mode", "1", "-tune", "ssim"); Automatic = $false },
+        [PSCustomObject]@{ Name = "complexity-psnr"; Args = @("-aq-mode", "2", "-tune", "psnr"); Automatic = $false }
+      ) }
+    "vpx" {
+      $families = @(
+        [PSCustomObject]@{ Name = "encoder-defaults"; Args = @(); Automatic = $false },
+        [PSCustomObject]@{ Name = "aq-altref-rowmt"; Args = @("-aq-mode", "1", "-auto-alt-ref", "1", "-row-mt", "1"); Automatic = $false }
+      )
+      if ($ContentClass -eq "screen") {
+        $families += [PSCustomObject]@{ Name = "screen-content"; Args = @("-tune-content", "screen", "-row-mt", "1"); Automatic = $false }
+      }
+      return $families
+    }
+    "rav1e" { return @([PSCustomObject]@{ Name = "lab-defaults"; Args = @(); Automatic = $false }) }
+    "vvenc" { return @([PSCustomObject]@{ Name = "raw-two-pass-vbr"; Args = @("-passlogfile", "<path>"); Automatic = $false }) }
+    default { return @() }
+  }
+}
+
+function Get-FfmpegBuildFingerprint {
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-version") -AllowFailure
+  $firstLine = @($capture.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
+  if ($firstLine.Count -eq 0) { return "ffmpeg-unavailable" }
+  return [string]$firstLine[0]
+}
+
+function Initialize-FunctionalProbeCache {
+  if ($script:FunctionalProbeCacheLoaded) { return }
+  $script:FunctionalProbeCacheLoaded = $true
+  $cacheRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+  if ([string]::IsNullOrWhiteSpace($cacheRoot)) { return }
+  $script:FunctionalProbeCachePath = Join-Path (Join-Path $cacheRoot "Barusu") "encoder-capabilities-v1.json"
+  if (-not (Test-Path -LiteralPath $script:FunctionalProbeCachePath)) { return }
+  try {
+    $stored = Get-Content -LiteralPath $script:FunctionalProbeCachePath -Raw | ConvertFrom-Json
+    foreach ($property in @($stored.PSObject.Properties)) {
+      $script:FunctionalProbeCache[$property.Name] = $property.Value
+    }
+  }
+  catch {
+    $script:FunctionalProbeCache = @{}
+  }
+}
+
+function Save-FunctionalProbeCache {
+  if ([string]::IsNullOrWhiteSpace([string]$script:FunctionalProbeCachePath)) { return }
+  try {
+    $directory = Split-Path $script:FunctionalProbeCachePath -Parent
+    if (-not (Test-Path -LiteralPath $directory)) { New-Item -ItemType Directory -Path $directory -Force | Out-Null }
+    $temporary = $script:FunctionalProbeCachePath + "." + [guid]::NewGuid().ToString("N") + ".tmp"
+    $script:FunctionalProbeCache | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
+    Move-Item -LiteralPath $temporary -Destination $script:FunctionalProbeCachePath -Force
+  }
+  catch {
+    # A cache write failure must never make an otherwise functional encoder fail.
+  }
+}
+
+function Invoke-EncoderFunctionalProbe {
+  param(
+    [Parameter(Mandatory = $true)]$CodecProfile,
+    [string]$Device = "auto"
+  )
+
+  $build = Get-FfmpegBuildFingerprint
+  $os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+  $driver = if ($CodecProfile.EncoderBackend -eq "vaapi") { "hardware" } else { "software" }
+  $key = "{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}" -f $build, $os, $driver, $Device, $CodecProfile.EncoderBackend, $CodecProfile.RateControlAdapter, $CodecProfile.Container, "yuv420p"
+  Initialize-FunctionalProbeCache
+  if ($script:FunctionalProbeCache.ContainsKey($key)) {
+    return $script:FunctionalProbeCache[$key]
+  }
+
+  $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("compress_encoder_probe_" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $temp | Out-Null
+  $output = Join-Path $temp ("probe" + $CodecProfile.Extension)
+  $passlog = Join-Path $temp "pass"
+  $success = $false
+  $errorText = ""
+  try {
+    $plan = [PSCustomObject]@{
+      CodecProfile = $CodecProfile; Preset = "medium"; Mode = "Balanced"; VideoKbps = 200
+      EncodeVFilter = ""; VFilter = ""; OutputPixelFormat = "yuv420p"; ColorMetadataArgs = @()
+      VbvMode = "Off"; VideoPrivateArgs = ""
+    }
+    $common = @(Get-CommonVideoEncodeArgs -Plan $plan)
+    $inputArgs = @("-y", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=0.4")
+    if ([int]$CodecProfile.RequiredPasses -ge 2) {
+      $first = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + $common + @("-pass", "1", "-passlogfile", $passlog, "-an", "-f", "null", "NUL")) -AllowFailure
+      if ($first.ExitCode -ne 0) { $errorText = $first.StdErr; throw "pass-one" }
+      $second = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + $common + @("-pass", "2", "-passlogfile", $passlog, "-an", $output)) -AllowFailure
+      if ($second.ExitCode -ne 0) { $errorText = $second.StdErr; throw "pass-two" }
+    }
+    else {
+      $encoded = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + $common + @("-an", $output)) -AllowFailure
+      if ($encoded.ExitCode -ne 0) { $errorText = $encoded.StdErr; throw "encode" }
+    }
+
+    $decoded = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-v", "error", "-i", $output, "-f", "null", "NUL") -AllowFailure
+    if ($decoded.ExitCode -ne 0) { $errorText = $decoded.StdErr; throw "decode" }
+    $success = $true
+  }
+  catch {
+    if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = $_.Exception.Message }
+  }
+  finally {
+    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  $probe = [PSCustomObject]@{
+    Success = [bool]$success
+    Backend = [string]$CodecProfile.EncoderBackend
+    Encoder = [string]$CodecProfile.VideoEncoder
+    RateControlAdapter = [string]$CodecProfile.RateControlAdapter
+    PixelFormat = "yuv420p"
+    Container = [string]$CodecProfile.Container
+    Device = [string]$Device
+    Driver = [string]$driver
+    FfmpegBuild = [string]$build
+    Os = [string]$os
+    Error = if ($success) { "" } else { [string]($errorText -replace '\s+', ' ').Trim() }
+  }
+  $script:FunctionalProbeCache[$key] = $probe
+  Save-FunctionalProbeCache
+  return $probe
+}
+
+function Invoke-VvencLabFunctionalProbe {
+  $build = Get-FfmpegBuildFingerprint
+  $os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+  $key = "{0}|{1}|software|raw-lab|vvenc|vvenc-two-pass-vbr|vvc|yuv420p10le" -f $build, $os
+  Initialize-FunctionalProbeCache
+  if ($script:FunctionalProbeCache.ContainsKey($key)) { return $script:FunctionalProbeCache[$key] }
+
+  $temp = Join-Path ([System.IO.Path]::GetTempPath()) ("compress_vvenc_probe_" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Path $temp | Out-Null
+  $output = Join-Path $temp "probe.266"
+  $passlog = Join-Path $temp "pass"
+  $success = $false
+  $errorText = ""
+  try {
+    $inputArgs = @("-y", "-f", "lavfi", "-i", "testsrc2=size=64x64:rate=10:duration=0.4", "-vf", "format=yuv420p10le", "-c:v", "libvvenc", "-b:v", "200k", "-preset", "fast")
+    $first = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + @("-pass", "1", "-passlogfile", $passlog, "-an", "-f", "null", "NUL")) -AllowFailure
+    if ($first.ExitCode -ne 0) { $errorText = $first.StdErr; throw "pass-one" }
+    $second = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + @("-pass", "2", "-passlogfile", $passlog, "-an", "-f", "vvc", $output)) -AllowFailure
+    if ($second.ExitCode -ne 0) { $errorText = $second.StdErr; throw "pass-two" }
+    $decoded = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-v", "error", "-i", $output, "-f", "null", "NUL") -AllowFailure
+    if ($decoded.ExitCode -ne 0) { $errorText = $decoded.StdErr; throw "decode" }
+    $success = $true
+  }
+  catch {
+    if ([string]::IsNullOrWhiteSpace($errorText)) { $errorText = $_.Exception.Message }
+  }
+  finally {
+    Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
+  }
+
+  $probe = [PSCustomObject]@{
+    Success = [bool]$success; Backend = "vvenc"; Encoder = "libvvenc"; RateControlAdapter = "vvenc-two-pass-vbr"
+    PixelFormat = "yuv420p10le"; Container = "raw-vvc"; Device = "none"; Driver = "software"
+    FfmpegBuild = [string]$build; Os = [string]$os; DeliveryEligible = $false
+    Error = if ($success) { "" } else { [string]($errorText -replace '\s+', ' ').Trim() }
+  }
+  $script:FunctionalProbeCache[$key] = $probe
+  Save-FunctionalProbeCache
+  return $probe
 }
 
 function Test-HasExplicitTarget {
@@ -649,12 +980,10 @@ function Assert-CodecProfileSupport {
     [Parameter(Mandatory = $true)]$CodecProfile
   )
 
-  if (-not (Test-FfmpegEncoderAvailable -Encoder $CodecProfile.VideoEncoder)) {
-    throw "FFmpeg does not support encoder '$($CodecProfile.VideoEncoder)' in the current build."
-  }
-
-  if (-not (Test-FfmpegMuxerAvailable -Muxer $CodecProfile.Container)) {
-    throw "FFmpeg does not support muxer '$($CodecProfile.Container)' in the current build."
+  $probe = Invoke-EncoderFunctionalProbe -CodecProfile $CodecProfile -Device $HardwareDevice
+  $CodecProfile | Add-Member -NotePropertyName FunctionalProbe -NotePropertyValue $probe -Force
+  if (-not $probe.Success) {
+    throw "Encoder backend '$($CodecProfile.EncoderBackend)' failed its functional encode/decode probe: $($probe.Error)"
   }
 
   if (-not (Test-FfmpegEncoderAvailable -Encoder $CodecProfile.DefaultAudioEncoder)) {
@@ -737,6 +1066,7 @@ function Test-InputMatchesCodecProfile {
     "x264" { $sourceVideoCodec -eq "h264" }
     "x265" { $sourceVideoCodec -in @("hevc", "h265") }
     "av1"  { $sourceVideoCodec -eq "av1" }
+    "vp9"  { $sourceVideoCodec -eq "vp9" }
     default { $false }
   }
   if (-not $videoMatches) { return $false }
@@ -3293,7 +3623,7 @@ function Get-OutputPixelFormat {
     }
     $pixelFormat = "yuv420p10le"
   }
-  elseif ($requested -eq "auto" -and [int]$Info.VideoBitDepth -gt 8 -and $codec -in @("x265", "av1")) {
+  elseif ($requested -eq "auto" -and [int]$Info.VideoBitDepth -gt 8 -and $codec -in @("x265", "av1", "vp9")) {
     $pixelFormat = "yuv420p10le"
   }
 
@@ -3681,6 +4011,21 @@ function Get-CodecPresetArgs {
       return @("-preset", "$presetValue")
     }
 
+    "aom" {
+      $speed = if ($useSpeedOverride) { [int]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { Get-ExperimentalSpeedForPreset -Preset $Plan.Preset -Backend "aom" }
+      return @("-cpu-used", "$speed")
+    }
+
+    "vpx" {
+      $speed = if ($useSpeedOverride) { [int]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { Get-ExperimentalSpeedForPreset -Preset $Plan.Preset -Backend "vpx" }
+      return @("-deadline", "good", "-cpu-used", "$speed")
+    }
+
+    "rav1e" {
+      $speed = if ($useSpeedOverride) { [int]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { Get-ExperimentalSpeedForPreset -Preset $Plan.Preset -Backend "rav1e" }
+      return @("-speed", "$speed")
+    }
+
     default {
       $presetValue = if ($useSpeedOverride) { [string]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { [string]$Plan.Preset }
       return @("-preset", $presetValue)
@@ -3744,6 +4089,7 @@ function Get-CommonVideoEncodeArgs {
   if ($Plan.CodecProfile.VideoCodec -eq "x264" -and -not [string]::IsNullOrWhiteSpace($Plan.VideoPrivateArgs)) {
     $args += @("-x264-params", $Plan.VideoPrivateArgs)
   }
+  $args += @((Get-ObjectPropertyValue -Object $Plan.CodecProfile -Name "PrivateEncoderArgs" -DefaultValue @()))
 
   return $args
 }
@@ -4423,7 +4769,8 @@ function Get-PlanKey($Plan) {
   $encode = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
   $pixFmt = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
   $vbv = [string](Get-ObjectPropertyValue -Object $Plan -Name "VbvMode" -DefaultValue "Off")
-  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|codec={8}|container={9}|pix={10}|vbv={11}|g={12}|ef={13}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.CodecProfile.VideoCodec, $Plan.CodecProfile.Container, $pixFmt, $vbv, $geometry, $encode)
+  $backend = [string](Get-ObjectPropertyValue -Object $Plan.CodecProfile -Name "EncoderBackend" -DefaultValue $Plan.CodecProfile.VideoCodec)
+  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|codec={8}|backend={9}|container={10}|pix={11}|vbv={12}|g={13}|ef={14}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.CodecProfile.VideoCodec, $backend, $Plan.CodecProfile.Container, $pixFmt, $vbv, $geometry, $encode)
 }
 
 function Write-PlanLogRecord {
@@ -4464,6 +4811,7 @@ function Get-PlanFeatureVector {
     AudioMode             = [string]$Plan.AudioPlan.Mode
     AudioKbps             = [int](Get-ObjectPropertyValue -Object $Plan.AudioPlan -Name "Kbps" -DefaultValue 0)
     Codec                 = [string]$Plan.CodecProfile.VideoCodec
+    EncoderBackend        = [string](Get-ObjectPropertyValue -Object $Plan.CodecProfile -Name "EncoderBackend" -DefaultValue $Plan.CodecProfile.VideoCodec)
     Container             = [string]$Plan.CodecProfile.Container
     Preset                = [string]$Plan.Preset
     PreprocessLabel       = [string]$Plan.PreprocessLabel
@@ -5149,6 +5497,13 @@ function Get-RetryPlanFromResult {
     # A secant bracket is available for the final micro-fill, so use a narrow
     # hard-cap guard instead of stopping just below the 99.5% promotion gate.
     $correctionTotalBytes = [long][math]::Max($workingTargetBytes, [math]::Floor($hardCapBytes * 0.997))
+  }
+  elseif ($Result.Success -and $Plan.Mode -eq "Balanced") {
+    # Leave a small, mode-derived margin for bitrate quantization and mux drift
+    # without encoding assumptions about a particular backend or machine.
+    $fillGate = [double](Get-ModeStrategy -Mode "Balanced").EarlyAcceptRatio
+    $portableTargetRatio = [math]::Min(([double]$workingTargetBytes / [double]$hardCapBytes), $fillGate + 0.001)
+    $correctionTotalBytes = [long][math]::Floor($hardCapBytes * $portableTargetRatio)
   }
   $targetVideoPayloadBytes = [long][math]::Max(25000, $correctionTotalBytes - $audioPayloadBytes - $muxOverheadBytes)
   if ([long]$Result.SizeBytes -gt $hardCapBytes) {
@@ -6634,9 +6989,15 @@ $policyProfile = Resolve-PolicyProfile `
   -CompatibilityMode $CompatibilityMode `
   -AudioPriority $AudioPriority `
   -Mode $Mode `
+  -RequestedEncoderBackend $EncoderBackend `
+  -RequestedVideoCodecWasExplicit:$($PSBoundParameters.ContainsKey("VideoCodec")) `
+  -EnableExperimental:$EnableExperimentalEncoders `
   -TotalKbps $totalKbps
 
-$codecProfile = Resolve-CodecProfile -VideoCodec $policyProfile.VideoCodec -Container $policyProfile.Container
+$codecProfile = Resolve-CodecProfile -VideoCodec $policyProfile.VideoCodec -Container $policyProfile.Container -EncoderBackend $policyProfile.EncoderBackend
+if ($codecProfile.EncoderBackend -eq "rav1e" -and $Mode -ne "Fast") {
+  throw "The installed rav1e FFmpeg wrapper does not expose the required two-pass interface. Use -Mode Fast for lab-only rav1e runs."
+}
 
 if ([string]::IsNullOrWhiteSpace($OutputFile)) {
   $OutputFile = Get-DefaultOutputPath -InputPath $inputFull -CodecProfile $codecProfile
@@ -6708,6 +7069,9 @@ Write-PlanLogRecord -RecordType "job_start" -Data ([PSCustomObject]@{
     VbvMode              = $VbvMode
     OutputBitDepth       = $OutputBitDepth
     UnderCapBehavior     = $UnderCapBehavior
+    EncoderBackend      = $codecProfile.EncoderBackend
+    HardwareDevice      = $HardwareDevice
+    ExperimentalEncoders = [bool]$EnableExperimentalEncoders
     SourceTechnicalMetadata = $info
   })
 
@@ -6840,6 +7204,7 @@ try {
   Write-Host "Chosen height:    $($winner.Plan.Height)"
   Write-Host "Chosen fps:       $($winner.Plan.Fps)"
   Write-Host "Chosen codec:     $($winner.Plan.CodecProfile.VideoCodec)"
+  Write-Host "Encoder backend:  $($winner.Plan.CodecProfile.EncoderBackend)"
   Write-Host "Container:        $($winner.Plan.CodecProfile.Container)"
   Write-Host "Video bitrate:    $($winner.Plan.VideoKbps) kbps"
   Write-Host "Video payload:    $($winner.VideoPayloadBytes) bytes"

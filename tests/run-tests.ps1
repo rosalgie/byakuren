@@ -83,6 +83,54 @@ Invoke-Test "pinned codecs resolve their default container in Fast mode" {
   Assert-Equal $x265.ContainerPolicyReason "codec-default" "x265 resolution reason was not recorded"
 }
 
+Invoke-Test "backend policy keeps experimental encoders explicit" {
+  $script:RuntimeCapabilities = [PSCustomObject]@{
+    PreferredMetricMode = "off"; PreferredSamplingMode = "fixed"
+    SupportsX264Mp4 = $true; SupportsX265Mp4 = $true; SupportsAv1Webm = $true
+  }
+  $common = @{
+    RequestedContainer = "auto"; RequestedMetricMode = "off"; RequestedSampleMode = "fixed"
+    RequestedContentClassMode = "off"; CompatibilityMode = "widest"; AudioPriority = "balanced"; Mode = "Fast"
+  }
+  $blocked = $false
+  try { Resolve-PolicyProfile -RequestedVideoCodec auto -RequestedEncoderBackend aom @common | Out-Null }
+  catch { $blocked = $true }
+  Assert-True $blocked "Experimental aom backend was accepted without its gate"
+
+  $aom = Resolve-PolicyProfile -RequestedVideoCodec auto -RequestedEncoderBackend aom -EnableExperimental @common
+  Assert-Equal $aom.VideoCodec "av1" "aom did not resolve AV1"
+  Assert-Equal $aom.EncoderBackend "aom" "aom backend identity was lost"
+  Assert-Equal $aom.Container "webm" "aom did not resolve WebM"
+}
+
+Invoke-Test "widest automatic policy remains x264 only" {
+  $script:RuntimeCapabilities = [PSCustomObject]@{
+    PreferredMetricMode = "off"; PreferredSamplingMode = "fixed"
+    SupportsX264Mp4 = $true; SupportsX265Mp4 = $true; SupportsAv1Webm = $true
+  }
+  $profile = Resolve-PolicyProfile -RequestedVideoCodec auto -RequestedContainer auto -RequestedMetricMode off -RequestedSampleMode fixed -RequestedContentClassMode off -CompatibilityMode widest -AudioPriority balanced -Mode ExtraQuality
+  Assert-Equal $profile.VideoCodec "x264" "Widest policy selected a compatibility-gated codec"
+  Assert-Equal $profile.EncoderBackend "libx264" "Widest policy selected a non-production backend"
+}
+
+Invoke-Test "codec profiles separate backend and rate-control adapters" {
+  $aom = Resolve-CodecProfile -VideoCodec av1 -Container webm -EncoderBackend aom
+  $vpx = Resolve-CodecProfile -VideoCodec vp9 -Container webm -EncoderBackend vpx
+  $rav1e = Resolve-CodecProfile -VideoCodec av1 -Container webm -EncoderBackend rav1e
+  Assert-Equal $aom.VideoEncoder "libaom-av1" "aom encoder mapping is wrong"
+  Assert-Equal $aom.RateControlAdapter "ffmpeg-two-pass-vbr" "aom did not require exact two-pass VBR"
+  Assert-Equal $vpx.ContainerAudioProfile "webm-opus" "VP9 delivery profile is wrong"
+  Assert-Equal $rav1e.RequiredPasses 1 "rav1e was incorrectly advertised as two-pass"
+}
+
+Invoke-Test "encoder tuning families remain benchmark-only" {
+  $vp9 = @(Get-EncoderParameterFamilies -Backend vpx -ContentClass screen)
+  Assert-True ("screen-content" -in @($vp9.Name)) "VP9 screen-content candidate is missing"
+  Assert-True (-not ($vp9 | Where-Object Automatic)) "Experimental VP9 tuning was promoted without a full gate"
+  $x265 = @(Get-EncoderParameterFamilies -Backend libx265)
+  Assert-True ("aq-psy-low" -in @($x265.Name)) "x265 AQ/psy experiment family is missing"
+}
+
 Invoke-Test "canonical metric geometry is source-derived and plan-invariant" {
   $info = New-TestInfo -Width 3840 -Height 2160 -Fps 120
   $profile = Get-CanonicalMetricProfile -Info $info
@@ -212,6 +260,24 @@ Invoke-Test "Core-shaped direct evidence recognizes gaming and screen content" {
 }
 
 if ($IncludeSyntheticMetrics) {
+  Invoke-Test "experimental delivery backends pass functional probes" {
+    foreach ($profile in @(
+        (Resolve-CodecProfile -VideoCodec av1 -Container webm -EncoderBackend aom),
+        (Resolve-CodecProfile -VideoCodec vp9 -Container webm -EncoderBackend vpx)
+      )) {
+      $probe = Invoke-EncoderFunctionalProbe -CodecProfile $profile
+      Assert-True $probe.Success "Backend $($profile.EncoderBackend) failed its encode/decode rate-control probe"
+      Assert-Equal $probe.RateControlAdapter "ffmpeg-two-pass-vbr" "Functional probe used the wrong rate-control adapter"
+    }
+  }
+
+  Invoke-Test "VVenC probe remains raw-video lab only" {
+    $probe = Invoke-VvencLabFunctionalProbe
+    Assert-True $probe.Success "VVenC raw two-pass encode/decode probe failed"
+    Assert-Equal $probe.Container "raw-vvc" "VVenC probe was assigned a delivery container"
+    Assert-True (-not $probe.DeliveryEligible) "VVenC was marked eligible for website delivery"
+  }
+
   Invoke-Test "direct content probe measures independent feature families" {
     $temp = Join-Path $env:TEMP ("compress_content_probe_" + [guid]::NewGuid().ToString("N"))
     New-Item -ItemType Directory -Path $temp | Out-Null
