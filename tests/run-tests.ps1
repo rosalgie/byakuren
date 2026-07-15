@@ -123,6 +123,50 @@ Invoke-Test "codec profiles separate backend and rate-control adapters" {
   Assert-Equal $rav1e.RequiredPasses 1 "rav1e was incorrectly advertised as two-pass"
 }
 
+Invoke-Test "PowerShell matches shared byakuren golden contracts" {
+  $golden = Get-Content -LiteralPath (Join-Path $PSScriptRoot "golden\parity-v1.json") -Raw | ConvertFrom-Json
+  $script:RuntimeCapabilities = [PSCustomObject]@{
+    PreferredMetricMode = "off"; PreferredSamplingMode = "fixed"
+    SupportsX264Mp4 = $true; SupportsX265Mp4 = $true; SupportsAv1Webm = $true
+  }
+  foreach ($case in @($golden.policyCases)) {
+    $resolved = Resolve-PolicyProfile `
+      -RequestedVideoCodec $case.videoCodec `
+      -RequestedContainer $case.container `
+      -RequestedMetricMode off `
+      -RequestedSampleMode fixed `
+      -RequestedContentClassMode off `
+      -CompatibilityMode $case.compatibility `
+      -AudioPriority balanced `
+      -Mode Fast `
+      -RequestedEncoderBackend $case.encoderBackend `
+      -EnableExperimental:([bool]$case.experimental)
+    Assert-Equal $resolved.VideoCodec $case.expectedCodec "$($case.name) codec mismatch"
+    Assert-Equal $resolved.EncoderBackend $case.expectedBackend "$($case.name) backend mismatch"
+    Assert-Equal $resolved.Container $case.expectedContainer "$($case.name) container mismatch"
+  }
+  foreach ($case in @($golden.canvasCases)) {
+    $info = New-TestInfo -Width $case.width -Height $case.height -Fps $case.fps -BitDepth $case.bitDepth
+    $info.SampleAspectRatioValue = [double]$case.sar
+    $info.Rotation = [int]$case.rotation
+    if ([math]::Abs([int]$case.rotation) % 180 -eq 90) {
+      $info.PlanningWidth = [int]$case.height
+      $info.PlanningHeight = [int]$case.width
+    }
+    $canvas = Get-CanonicalMetricProfile -Info $info
+    Assert-Equal $canvas.Width $case.expectedWidth "$($case.name) canvas width mismatch"
+    Assert-Equal $canvas.Height $case.expectedHeight "$($case.name) canvas height mismatch"
+    Assert-True ([math]::Abs([double]$canvas.Fps - [double]$case.expectedFps) -lt 0.0001) "$($case.name) canvas FPS mismatch"
+    Assert-Equal $canvas.PixelFormat $case.expectedPixelFormat "$($case.name) canvas format mismatch"
+  }
+  foreach ($case in @($golden.modeCases)) {
+    $strategy = Get-ModeStrategy -Mode $case.mode
+    Assert-Equal $strategy.MaxFullEncodes $case.maxFullEncodes "$($case.mode) encode limit mismatch"
+    Assert-True ([math]::Abs([double]$strategy.EarlyAcceptRatio - [double]$case.fillGate) -lt 0.0000001) "$($case.mode) fill gate mismatch"
+  }
+  Assert-Equal $golden.schemaVersion "byakuren.compress.result.v1" "Shared result schema mismatch"
+}
+
 Invoke-Test "encoder tuning families remain benchmark-only" {
   $vp9 = @(Get-EncoderParameterFamilies -Backend vpx -ContentClass screen)
   Assert-True ("screen-content" -in @($vp9.Name)) "VP9 screen-content candidate is missing"
@@ -233,7 +277,7 @@ Invoke-Test "versioned copy result preserves unavailable metrics" {
       CodecPolicyReason = "pinned"; ContainerPolicyReason = "codec-default"; CompatibilityMode = "widest"
     }
     $result = New-CompressorResultObject -Action copy -Info $info -CodecProfile $profile -PolicyProfile $policy -InputPath $input -OutputPath $output -HardCapBytes 100 -WorkingTargetBytes 99
-    Assert-Equal $result.SchemaVersion "barusu.compress.result.v1" "Unexpected result schema"
+    Assert-Equal $result.SchemaVersion "byakuren.compress.result.v1" "Unexpected result schema"
     Assert-Equal $result.Metrics.Available $false "Copy result advertised metric evidence"
     Assert-Equal $result.Metrics.PrimaryScore $null "Unavailable metric became zero-valued"
     Assert-Equal $result.CapabilityProbe.SkippedReason "under-cap passthrough" "Copy probe disposition is missing"
@@ -328,7 +372,7 @@ if ($IncludeSyntheticMetrics) {
   }
 
   Invoke-Test "canonical metrics expose temporal and spatial loss" {
-    if (-not (Test-FfmpegFilterAvailable -Filter "libvmaf") -or -not (Test-VmafNegModelAvailable)) {
+    if (-not (Test-FFmpegFilterAvailable -Filter "libvmaf") -or -not (Test-VmafNegModelAvailable)) {
       Write-Host "SKIP libvmaf NEG is unavailable"
       return
     }

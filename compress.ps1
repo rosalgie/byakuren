@@ -233,9 +233,9 @@ function Invoke-ToolCapture {
   }
 }
 
-$script:FfmpegEncodersText = $null
-$script:FfmpegMuxersText = $null
-$script:FfmpegFiltersText = $null
+$script:FFmpegEncodersText = $null
+$script:FFmpegMuxersText = $null
+$script:FFmpegFiltersText = $null
 $script:RuntimeCapabilities = $null
 $script:PlanLogPathResolved = ""
 
@@ -252,43 +252,43 @@ function Get-NormalizedOptionValue {
   return $Value.Trim().ToLowerInvariant()
 }
 
-function Get-FfmpegEncodersText {
-  if ($null -eq $script:FfmpegEncodersText) {
-    $script:FfmpegEncodersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-encoders")).Output
+function Get-FFmpegEncodersText {
+  if ($null -eq $script:FFmpegEncodersText) {
+    $script:FFmpegEncodersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-encoders")).Output
   }
 
-  return [string]$script:FfmpegEncodersText
+  return [string]$script:FFmpegEncodersText
 }
 
-function Get-FfmpegMuxersText {
-  if ($null -eq $script:FfmpegMuxersText) {
-    $script:FfmpegMuxersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-muxers")).Output
+function Get-FFmpegMuxersText {
+  if ($null -eq $script:FFmpegMuxersText) {
+    $script:FFmpegMuxersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-muxers")).Output
   }
 
-  return [string]$script:FfmpegMuxersText
+  return [string]$script:FFmpegMuxersText
 }
 
-function Get-FfmpegFiltersText {
-  if ($null -eq $script:FfmpegFiltersText) {
-    $script:FfmpegFiltersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-filters")).Output
+function Get-FFmpegFiltersText {
+  if ($null -eq $script:FFmpegFiltersText) {
+    $script:FFmpegFiltersText = (Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-filters")).Output
   }
 
-  return [string]$script:FfmpegFiltersText
+  return [string]$script:FFmpegFiltersText
 }
 
-function Test-FfmpegEncoderAvailable([string]$Encoder) {
+function Test-FFmpegEncoderAvailable([string]$Encoder) {
   $pattern = ('(?m)^\s*[A-Z\.]+\s+{0}\s' -f [regex]::Escape($Encoder))
-  return ([regex]::IsMatch((Get-FfmpegEncodersText), $pattern))
+  return ([regex]::IsMatch((Get-FFmpegEncodersText), $pattern))
 }
 
-function Test-FfmpegMuxerAvailable([string]$Muxer) {
+function Test-FFmpegMuxerAvailable([string]$Muxer) {
   $pattern = ('(?m)^\s*E\s+{0}\s' -f [regex]::Escape($Muxer))
-  return ([regex]::IsMatch((Get-FfmpegMuxersText), $pattern))
+  return ([regex]::IsMatch((Get-FFmpegMuxersText), $pattern))
 }
 
-function Test-FfmpegFilterAvailable([string]$Filter) {
+function Test-FFmpegFilterAvailable([string]$Filter) {
   $pattern = ('(?m)^\s*[TSC\.\|AVN]+\s+{0}\s' -f [regex]::Escape($Filter))
-  return ([regex]::IsMatch((Get-FfmpegFiltersText), $pattern))
+  return ([regex]::IsMatch((Get-FFmpegFiltersText), $pattern))
 }
 
 function Get-RuntimeCapabilities {
@@ -296,16 +296,16 @@ function Get-RuntimeCapabilities {
     return $script:RuntimeCapabilities
   }
 
-  $x264Available = Test-FfmpegEncoderAvailable -Encoder "libx264"
-  $x265Available = Test-FfmpegEncoderAvailable -Encoder "libx265"
-  $av1Available = Test-FfmpegEncoderAvailable -Encoder "libsvtav1"
-  $mp4Available = Test-FfmpegMuxerAvailable -Muxer "mp4"
-  $webmAvailable = Test-FfmpegMuxerAvailable -Muxer "webm"
-  $aacAvailable = Test-FfmpegEncoderAvailable -Encoder "aac"
-  $opusAvailable = (Test-FfmpegEncoderAvailable -Encoder "libopus") -or (Test-FfmpegEncoderAvailable -Encoder "opus")
-  $hasVmaf = Test-FfmpegFilterAvailable -Filter "libvmaf"
-  $hasXpsnr = Test-FfmpegFilterAvailable -Filter "xpsnr"
-  $hasScdet = Test-FfmpegFilterAvailable -Filter "scdet"
+  $x264Available = Test-FFmpegEncoderAvailable -Encoder "libx264"
+  $x265Available = Test-FFmpegEncoderAvailable -Encoder "libx265"
+  $av1Available = Test-FFmpegEncoderAvailable -Encoder "libsvtav1"
+  $mp4Available = Test-FFmpegMuxerAvailable -Muxer "mp4"
+  $webmAvailable = Test-FFmpegMuxerAvailable -Muxer "webm"
+  $aacAvailable = Test-FFmpegEncoderAvailable -Encoder "aac"
+  $opusAvailable = (Test-FFmpegEncoderAvailable -Encoder "libopus") -or (Test-FFmpegEncoderAvailable -Encoder "opus")
+  $hasVmaf = Test-FFmpegFilterAvailable -Filter "libvmaf"
+  $hasXpsnr = Test-FFmpegFilterAvailable -Filter "xpsnr"
+  $hasScdet = Test-FFmpegFilterAvailable -Filter "scdet"
 
   $x264Probe = if ($x264Available -and $mp4Available -and $aacAvailable) { Invoke-EncoderFunctionalProbe -CodecProfile (Resolve-CodecProfile -VideoCodec "x264" -Container "mp4" -EncoderBackend "libx264") } else { $null }
   $x265Probe = if ($x265Available -and $mp4Available -and $aacAvailable) { Invoke-EncoderFunctionalProbe -CodecProfile (Resolve-CodecProfile -VideoCodec "x265" -Container "mp4" -EncoderBackend "libx265") } else { $null }
@@ -713,7 +713,7 @@ function Resolve-CodecProfile {
         ContainerAudioProfile = "webm-opus"
         Extension            = ".webm"
         DefaultAudioCodec    = "opus"
-        DefaultAudioEncoder  = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        DefaultAudioEncoder  = if (Test-FFmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs  = @("opus")
         PresetKind           = "svtav1"
         RateControlAdapter   = "ffmpeg-two-pass-vbr"
@@ -727,7 +727,7 @@ function Resolve-CodecProfile {
       return [PSCustomObject]@{
         VideoCodec = "av1"; EncoderBackend = "aom"; VideoEncoder = "libaom-av1"; CodecFamily = "av1"
         Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
-        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FFmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs = @("opus"); PresetKind = "aom"; RateControlAdapter = "ffmpeg-two-pass-vbr"
         RequiredPasses = 2; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "cpu-used"; Value = 8; Label = "cpu-used=8" }
         FinalizeArgs = @("-c", "copy")
@@ -737,7 +737,7 @@ function Resolve-CodecProfile {
       return [PSCustomObject]@{
         VideoCodec = "av1"; EncoderBackend = "rav1e"; VideoEncoder = "librav1e"; CodecFamily = "av1"
         Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
-        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FFmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs = @("opus"); PresetKind = "rav1e"; RateControlAdapter = "one-pass-vbr-lab"
         RequiredPasses = 1; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "speed"; Value = 10; Label = "speed=10" }
         FinalizeArgs = @("-c", "copy")
@@ -747,7 +747,7 @@ function Resolve-CodecProfile {
       return [PSCustomObject]@{
         VideoCodec = "vp9"; EncoderBackend = "vpx"; VideoEncoder = "libvpx-vp9"; CodecFamily = "vp9"
         Container = "webm"; ContainerAudioProfile = "webm-opus"; Extension = ".webm"
-        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FfmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
+        DefaultAudioCodec = "opus"; DefaultAudioEncoder = if (Test-FFmpegEncoderAvailable -Encoder "libopus") { "libopus" } else { "opus" }
         CopyableAudioCodecs = @("opus"); PresetKind = "vpx"; RateControlAdapter = "ffmpeg-two-pass-vbr"
         RequiredPasses = 2; PrivateEncoderArgs = @(); PreviewSpeedOverride = [PSCustomObject]@{ Kind = "cpu-used"; Value = 8; Label = "cpu-used=8" }
         FinalizeArgs = @("-c", "copy")
@@ -808,7 +808,7 @@ function Get-EncoderParameterFamilies {
   }
 }
 
-function Get-FfmpegBuildFingerprint {
+function Get-FFmpegBuildFingerprint {
   $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-version") -AllowFailure
   $firstLine = @($capture.StdOut -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1)
   if ($firstLine.Count -eq 0) { return "ffmpeg-unavailable" }
@@ -820,7 +820,7 @@ function Initialize-FunctionalProbeCache {
   $script:FunctionalProbeCacheLoaded = $true
   $cacheRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
   if ([string]::IsNullOrWhiteSpace($cacheRoot)) { return }
-  $script:FunctionalProbeCachePath = Join-Path (Join-Path $cacheRoot "Barusu") "encoder-capabilities-v1.json"
+  $script:FunctionalProbeCachePath = Join-Path (Join-Path $cacheRoot "Byakuren") "encoder-capabilities-v1.json"
   if (-not (Test-Path -LiteralPath $script:FunctionalProbeCachePath)) { return }
   try {
     $stored = Get-Content -LiteralPath $script:FunctionalProbeCachePath -Raw | ConvertFrom-Json
@@ -853,7 +853,7 @@ function Invoke-EncoderFunctionalProbe {
     [string]$Device = "auto"
   )
 
-  $build = Get-FfmpegBuildFingerprint
+  $build = Get-FFmpegBuildFingerprint
   $os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
   $driver = if ($CodecProfile.EncoderBackend -eq "vaapi") { "hardware" } else { "software" }
   $key = "{0}|{1}|{2}|{3}|{4}|{5}|{6}|{7}" -f $build, $os, $driver, $Device, $CodecProfile.EncoderBackend, $CodecProfile.RateControlAdapter, $CodecProfile.Container, "yuv420p"
@@ -907,7 +907,7 @@ function Invoke-EncoderFunctionalProbe {
     Container = [string]$CodecProfile.Container
     Device = [string]$Device
     Driver = [string]$driver
-    FfmpegBuild = [string]$build
+    FFmpegBuild = [string]$build
     Os = [string]$os
     Error = if ($success) { "" } else { [string]($errorText -replace '\s+', ' ').Trim() }
   }
@@ -917,7 +917,7 @@ function Invoke-EncoderFunctionalProbe {
 }
 
 function Invoke-VvencLabFunctionalProbe {
-  $build = Get-FfmpegBuildFingerprint
+  $build = Get-FFmpegBuildFingerprint
   $os = [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
   $key = "{0}|{1}|software|raw-lab|vvenc|vvenc-two-pass-vbr|vvc|yuv420p10le" -f $build, $os
   Initialize-FunctionalProbeCache
@@ -949,7 +949,7 @@ function Invoke-VvencLabFunctionalProbe {
   $probe = [PSCustomObject]@{
     Success = [bool]$success; Backend = "vvenc"; Encoder = "libvvenc"; RateControlAdapter = "vvenc-two-pass-vbr"
     PixelFormat = "yuv420p10le"; Container = "raw-vvc"; Device = "none"; Driver = "software"
-    FfmpegBuild = [string]$build; Os = [string]$os; DeliveryEligible = $false
+    FFmpegBuild = [string]$build; Os = [string]$os; DeliveryEligible = $false
     Error = if ($success) { "" } else { [string]($errorText -replace '\s+', ' ').Trim() }
   }
   $script:FunctionalProbeCache[$key] = $probe
@@ -990,7 +990,7 @@ function Assert-CodecProfileSupport {
     throw "Encoder backend '$($CodecProfile.EncoderBackend)' failed its functional encode/decode probe: $($probe.Error)"
   }
 
-  if (-not (Test-FfmpegEncoderAvailable -Encoder $CodecProfile.DefaultAudioEncoder)) {
+  if (-not (Test-FFmpegEncoderAvailable -Encoder $CodecProfile.DefaultAudioEncoder)) {
     throw "FFmpeg does not support audio encoder '$($CodecProfile.DefaultAudioEncoder)' in the current build."
   }
 }
@@ -4316,7 +4316,7 @@ function Test-VmafNegModelAvailable {
     return [bool]$script:VmafNegModelAvailable
   }
 
-  if (-not (Test-FfmpegFilterAvailable -Filter "libvmaf")) {
+  if (-not (Test-FFmpegFilterAvailable -Filter "libvmaf")) {
     $script:VmafNegModelAvailable = $false
     return $false
   }
@@ -4914,7 +4914,7 @@ function Get-HostFingerprint {
     }
   }
 
-  $identityText = "{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f [System.Runtime.InteropServices.RuntimeInformation]::OSDescription, [Environment]::OSVersion.VersionString, [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture, $cpu, $gpu, $driver, (Get-FfmpegBuildFingerprint)
+  $identityText = "{0}|{1}|{2}|{3}|{4}|{5}|{6}" -f [System.Runtime.InteropServices.RuntimeInformation]::OSDescription, [Environment]::OSVersion.VersionString, [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture, $cpu, $gpu, $driver, (Get-FFmpegBuildFingerprint)
   $sha = [Security.Cryptography.SHA256]::Create()
   try {
     $idBytes = $sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($identityText))
@@ -4932,7 +4932,7 @@ function Get-HostFingerprint {
     Cpu = $cpu
     Gpu = $gpu
     Driver = $driver
-    FfmpegBuild = Get-FfmpegBuildFingerprint
+    FFmpegBuild = Get-FFmpegBuildFingerprint
     HardwareDevice = $HardwareDevice
   }
   return $script:HostFingerprint
@@ -4968,7 +4968,7 @@ function New-CompressorResultObject {
   $searchStats = if ($Winner) { Get-ObjectPropertyValue -Object $Winner -Name "SearchStats" -DefaultValue $null } else { $null }
 
   return [PSCustomObject]@{
-    SchemaVersion = "barusu.compress.result.v1"
+    SchemaVersion = "byakuren.compress.result.v1"
     Status = "succeeded"
     Action = $Action
     StartedUtc = $scriptStart.ToUniversalTime().ToString("o")
@@ -4999,7 +4999,7 @@ function New-CompressorResultObject {
       Version = [string]$canonical.EvaluatorVersion; MetricMode = if ($plan) { [string](Get-ObjectPropertyValue -Object $plan -Name "MetricModeUsed" -DefaultValue "off") } else { "off" }
       PrimaryMetric = if ($plan) { [string](Get-ObjectPropertyValue -Object $plan -Name "PrimaryMetricMode" -DefaultValue "") } else { "" }
       CanonicalCanvas = [PSCustomObject]@{ Width = [int]$canonical.Width; Height = [int]$canonical.Height; Fps = [double]$canonical.Fps; PixelFormat = [string]$canonical.PixelFormat; BitDepth = [int]$canonical.BitDepth }
-      VmafModel = "vmaf-neg-primary+vmaf-standard-supplemental"; XpsnrGuard = $true
+      VMAFModel = "vmaf-neg-primary+vmaf-standard-supplemental"; XPSNRGuard = $true
     }
     Encoder = [PSCustomObject]@{
       Backend = [string]$CodecProfile.EncoderBackend; Name = [string]$CodecProfile.VideoEncoder; Codec = [string]$CodecProfile.VideoCodec
@@ -5023,11 +5023,11 @@ function New-CompressorResultObject {
     Metrics = [PSCustomObject]@{
       Available = ($null -ne $metricScore); PrimaryScore = $metricScore
       WorstWindowScore = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstMetricScore" -DefaultValue $null } else { $null }
-      VmafNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "VmafNegScore" -DefaultValue $null } else { $null }
-      WorstVmafNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstVmafNegScore" -DefaultValue $null } else { $null }
-      StandardVmaf = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "StandardVmafScore" -DefaultValue $null } else { $null }
-      Xpsnr = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "XpsnrScore" -DefaultValue $null } else { $null }
-      WorstXpsnr = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstXpsnrScore" -DefaultValue $null } else { $null }
+      VMAFNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "VmafNegScore" -DefaultValue $null } else { $null }
+      WorstVMAFNeg = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstVmafNegScore" -DefaultValue $null } else { $null }
+      StandardVMAF = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "StandardVmafScore" -DefaultValue $null } else { $null }
+      XPSNR = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "XpsnrScore" -DefaultValue $null } else { $null }
+      WorstXPSNR = if ($plan) { Get-ObjectPropertyValue -Object $plan -Name "WorstXpsnrScore" -DefaultValue $null } else { $null }
       Windows = if ($Winner) { @((Get-ObjectPropertyValue -Object $Winner -Name "MetricSegmentScores" -DefaultValue @())) } else { @() }
     }
     Output = [PSCustomObject]@{
