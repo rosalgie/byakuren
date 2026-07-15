@@ -59,12 +59,21 @@ param(
   [ValidateSet("Off", "Auto")]
   [string]$CropMode = "Auto",
 
+  [ValidateSet("Off", "Streaming")]
+  [string]$VbvMode = "Off",
+
+  [ValidateSet("Auto", "8", "10")]
+  [string]$OutputBitDepth = "Auto",
+
   [switch]$VerboseCommands
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 $scriptStart = Get-Date
+$script:EncoderPixelFormatSupportCache = @{}
+$script:VmafNegModelAvailable = $null
+$script:RequestedHardCapBytes = $null
 
 function Require-Tool($name) {
   if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
@@ -705,6 +714,103 @@ function Assert-OutputFileMatchesProfile {
   }
 }
 
+function Convert-RationalToDouble {
+  param(
+    [AllowEmptyString()][string]$Value,
+    [double]$DefaultValue = 0.0
+  )
+
+  if ([string]::IsNullOrWhiteSpace($Value) -or $Value -in @("0/0", "0:0", "N/A")) {
+    return $DefaultValue
+  }
+
+  $parts = $Value -split '[/\:]'
+  if ($parts.Count -eq 2) {
+    $numerator = 0.0
+    $denominator = 0.0
+    if (
+      [double]::TryParse($parts[0], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$numerator) -and
+      [double]::TryParse($parts[1], [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$denominator) -and
+      [math]::Abs($denominator) -gt 0.0000001
+    ) {
+      return ($numerator / $denominator)
+    }
+  }
+
+  $parsed = 0.0
+  if ([double]::TryParse($Value, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
+    return $parsed
+  }
+
+  return $DefaultValue
+}
+
+function Get-NormalizedRotation {
+  param($VideoStream)
+
+  $rotation = 0
+  $tags = Get-ObjectPropertyValue -Object $VideoStream -Name "tags" -DefaultValue $null
+  if ($tags) {
+    $rawTag = [string](Get-ObjectPropertyValue -Object $tags -Name "rotate" -DefaultValue "")
+    $tagRotation = 0
+    if ([int]::TryParse($rawTag, [ref]$tagRotation)) {
+      $rotation = $tagRotation
+    }
+  }
+
+  foreach ($sideData in @((Get-ObjectPropertyValue -Object $VideoStream -Name "side_data_list" -DefaultValue @()))) {
+    $rawSideRotation = [string](Get-ObjectPropertyValue -Object $sideData -Name "rotation" -DefaultValue "")
+    $sideRotation = 0
+    if ([int]::TryParse($rawSideRotation, [ref]$sideRotation)) {
+      $rotation = $sideRotation
+      break
+    }
+  }
+
+  $rotation = (($rotation % 360) + 360) % 360
+  if ($rotation -ge 315 -or $rotation -lt 45) { return 0 }
+  if ($rotation -lt 135) { return 90 }
+  if ($rotation -lt 225) { return 180 }
+  return 270
+}
+
+function Get-HdrClassification {
+  param($VideoStream)
+
+  $transfer = ([string](Get-ObjectPropertyValue -Object $VideoStream -Name "color_transfer" -DefaultValue "")).ToLowerInvariant()
+  if ($transfer -in @("smpte2084", "pq")) {
+    return [PSCustomObject]@{ Classification = "PQ"; HasHdrMetadata = $true; Reason = "transfer=$transfer" }
+  }
+  if ($transfer -in @("arib-std-b67", "hlg")) {
+    return [PSCustomObject]@{ Classification = "HLG"; HasHdrMetadata = $true; Reason = "transfer=$transfer" }
+  }
+
+  $hdrSideData = @((Get-ObjectPropertyValue -Object $VideoStream -Name "side_data_list" -DefaultValue @())) |
+    Where-Object {
+      ([string](Get-ObjectPropertyValue -Object $_ -Name "side_data_type" -DefaultValue "")) -match '(?i)mastering display|content light'
+    } |
+    Select-Object -First 1
+
+  if ($hdrSideData) {
+    return [PSCustomObject]@{ Classification = "unknown"; HasHdrMetadata = $true; Reason = [string](Get-ObjectPropertyValue -Object $hdrSideData -Name "side_data_type" -DefaultValue "HDR side data") }
+  }
+
+  $knownSdrTransfers = @("bt709", "smpte170m", "gamma22", "gamma28", "iec61966-2-1", "bt2020-10", "bt2020-12", "linear", "log", "log_sqrt")
+  if ($transfer -in $knownSdrTransfers) {
+    return [PSCustomObject]@{ Classification = "SDR"; HasHdrMetadata = $false; Reason = "transfer=$transfer" }
+  }
+
+  return [PSCustomObject]@{ Classification = "unknown"; HasHdrMetadata = $false; Reason = if ($transfer) { "unclassified transfer=$transfer" } else { "transfer metadata absent" } }
+}
+
+function Assert-SdrInputSupported {
+  param([Parameter(Mandatory = $true)]$Info)
+
+  if ($Info.HdrClassification -in @("PQ", "HLG") -or $Info.HasHdrMetadata) {
+    throw "HDR input was detected ($($Info.HdrClassification); $($Info.HdrReason)). HDR transcoding and tone mapping are not implemented, so no encode was started. Convert to a validated SDR master first."
+  }
+}
+
 function Get-ProbeInfo($path) {
   $json = & ffprobe -v error -print_format json -show_format -show_streams "$path"
   if (-not $json) { throw "ffprobe failed for: $path" }
@@ -715,22 +821,18 @@ function Get-ProbeInfo($path) {
 
   if (-not $video) { throw "No video stream found." }
 
-  $srcFps = 0.0
-  if ($video.avg_frame_rate -and $video.avg_frame_rate -ne "0/0") {
-    $parts = $video.avg_frame_rate -split "/"
-    if ($parts.Count -eq 2 -and [double]$parts[1] -ne 0) {
-      $srcFps = [double]$parts[0] / [double]$parts[1]
-    }
-  }
+  $srcFps = Convert-RationalToDouble -Value ([string](Get-ObjectPropertyValue -Object $video -Name "avg_frame_rate" -DefaultValue ""))
 
   $videoBitrate = $null
-  if ($video.bit_rate) {
-    $videoBitrate = [int][math]::Round(([double]$video.bit_rate) / 1000.0)
+  $rawVideoBitrate = Get-ObjectPropertyValue -Object $video -Name "bit_rate" -DefaultValue $null
+  if ($null -ne $rawVideoBitrate) {
+    $videoBitrate = [int][math]::Round(([double]$rawVideoBitrate) / 1000.0)
   }
 
   $audioBitrate = $null
-  if ($audio -and $audio.bit_rate) {
-    $audioBitrate = [int][math]::Round(([double]$audio.bit_rate) / 1000.0)
+  $rawAudioBitrate = if ($audio) { Get-ObjectPropertyValue -Object $audio -Name "bit_rate" -DefaultValue $null } else { $null }
+  if ($audio -and $null -ne $rawAudioBitrate) {
+    $audioBitrate = [int][math]::Round(([double]$rawAudioBitrate) / 1000.0)
   }
 
   $pixelFormat = [string](Get-ObjectPropertyValue -Object $video -Name "pix_fmt" -DefaultValue "")
@@ -744,19 +846,43 @@ function Get-ProbeInfo($path) {
     $videoBitDepth = [int]$matches["depth"]
   }
 
+  $codedWidth = [int]$video.width
+  $codedHeight = [int]$video.height
+  $rotation = Get-NormalizedRotation -VideoStream $video
+  $displayWidth = if ($rotation -in @(90, 270)) { $codedHeight } else { $codedWidth }
+  $displayHeight = if ($rotation -in @(90, 270)) { $codedWidth } else { $codedHeight }
+  $sampleAspectRatio = [string](Get-ObjectPropertyValue -Object $video -Name "sample_aspect_ratio" -DefaultValue "1:1")
+  $sampleAspectRatioValue = Convert-RationalToDouble -Value $sampleAspectRatio -DefaultValue 1.0
+  if ($sampleAspectRatioValue -le 0.0) { $sampleAspectRatioValue = 1.0 }
+  $hdr = Get-HdrClassification -VideoStream $video
+
   [PSCustomObject]@{
     Duration         = [double]::Parse($probe.format.duration, [Globalization.CultureInfo]::InvariantCulture)
-    Width            = [int]$video.width
-    Height           = [int]$video.height
+    Width            = [int]$displayWidth
+    Height           = [int]$displayHeight
+    CodedWidth       = [int]$codedWidth
+    CodedHeight      = [int]$codedHeight
     Fps              = $srcFps
     VideoCodec       = [string]$video.codec_name
     PixelFormat      = $pixelFormat
     VideoBitDepth    = $videoBitDepth
+    ColorRange       = [string](Get-ObjectPropertyValue -Object $video -Name "color_range" -DefaultValue "")
+    ColorPrimaries   = [string](Get-ObjectPropertyValue -Object $video -Name "color_primaries" -DefaultValue "")
+    ColorTransfer    = [string](Get-ObjectPropertyValue -Object $video -Name "color_transfer" -DefaultValue "")
+    ColorSpace       = [string](Get-ObjectPropertyValue -Object $video -Name "color_space" -DefaultValue "")
+    ChromaLocation   = [string](Get-ObjectPropertyValue -Object $video -Name "chroma_location" -DefaultValue "")
+    SampleAspectRatio = $sampleAspectRatio
+    SampleAspectRatioValue = [double]$sampleAspectRatioValue
+    DisplayAspectRatio = [string](Get-ObjectPropertyValue -Object $video -Name "display_aspect_ratio" -DefaultValue "")
+    Rotation         = [int]$rotation
+    HdrClassification = [string]$hdr.Classification
+    HasHdrMetadata   = [bool]$hdr.HasHdrMetadata
+    HdrReason        = [string]$hdr.Reason
     VideoBitrateKbps = $videoBitrate
     HasAudio         = [bool]$audio
     AudioCodec       = if ($audio) { [string]$audio.codec_name } else { "" }
     AudioBitrateKbps = $audioBitrate
-    AudioChannels    = if ($audio -and $audio.channels) { [int]$audio.channels } else { 0 }
+    AudioChannels    = if ($audio -and $null -ne (Get-ObjectPropertyValue -Object $audio -Name "channels" -DefaultValue $null)) { [int](Get-ObjectPropertyValue -Object $audio -Name "channels" -DefaultValue 0) } else { 0 }
   }
 }
 
@@ -1006,6 +1132,88 @@ function Build-PreprocessFilterChain {
   }
 }
 
+function Get-DisplaySampleAspectRatio {
+  param([Parameter(Mandatory = $true)]$Info)
+
+  $sar = [double](Get-ObjectPropertyValue -Object $Info -Name "SampleAspectRatioValue" -DefaultValue 1.0)
+  if ($sar -le 0.0) { $sar = 1.0 }
+  $rotation = [int](Get-ObjectPropertyValue -Object $Info -Name "Rotation" -DefaultValue 0)
+  if ($rotation -in @(90, 270) -and $sar -gt 0.0) {
+    return (1.0 / $sar)
+  }
+  return $sar
+}
+
+function Build-GeometryFilterChain {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][int]$TargetWidth,
+    [Parameter(Mandatory = $true)][double]$TargetFps,
+    [string]$ScaleFlags = "lanczos"
+  )
+
+  $parts = @()
+  $planningWidth = Get-PlanningWidth -Info $Info
+  $cropFilter = Get-CropFilterString -Info $Info
+
+  if (-not [string]::IsNullOrWhiteSpace($cropFilter)) {
+    $parts += $cropFilter
+  }
+
+  # FFmpeg autorotates before user filters. Normalize non-square samples before
+  # planning scale so encoded and metric-reference geometry are identical.
+  $sar = Get-DisplaySampleAspectRatio -Info $Info
+  if ([math]::Abs($sar - 1.0) -gt 0.0001) {
+    $sarText = $sar.ToString("0.########", [Globalization.CultureInfo]::InvariantCulture)
+    $parts += ("scale=trunc(iw*{0}/2)*2:ih:flags={1}" -f $sarText, $ScaleFlags)
+  }
+  $parts += "setsar=1"
+
+  if ($TargetFps -gt 0 -and $Info.Fps -gt ($TargetFps + 0.01)) {
+    $parts += ("fps={0}" -f $TargetFps)
+  }
+
+  if ($TargetWidth -lt $planningWidth) {
+    $parts += ("scale={0}:-2:flags={1}" -f $TargetWidth, $ScaleFlags)
+  }
+
+  return ($parts -join ",")
+}
+
+function Build-EncodeFilterChain {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][int]$TargetWidth,
+    [Parameter(Mandatory = $true)][double]$TargetFps,
+    [AllowEmptyString()][string]$PreprocessProfileName = "",
+    [string]$ScaleFlags = "lanczos"
+  )
+
+  $parts = @()
+  $geometry = Build-GeometryFilterChain -Info $Info -TargetWidth $TargetWidth -TargetFps $TargetFps -ScaleFlags $ScaleFlags
+  if (-not [string]::IsNullOrWhiteSpace($geometry)) {
+    $parts += $geometry
+  }
+
+  $preprocessFilter = Build-PreprocessFilterChain -PreprocessProfileName $PreprocessProfileName
+  if (-not [string]::IsNullOrWhiteSpace($preprocessFilter)) {
+    $parts += $preprocessFilter
+  }
+
+  return ($parts -join ",")
+}
+
+function Build-MetricReferenceFilterChain {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)][int]$TargetWidth,
+    [Parameter(Mandatory = $true)][double]$TargetFps,
+    [string]$ScaleFlags = "lanczos"
+  )
+
+  return (Build-GeometryFilterChain -Info $Info -TargetWidth $TargetWidth -TargetFps $TargetFps -ScaleFlags $ScaleFlags)
+}
+
 function Build-Vf {
   param(
     [Parameter(Mandatory = $true)]$Info,
@@ -1016,9 +1224,6 @@ function Build-Vf {
     [string]$ScaleFlags = "lanczos"
   )
 
-  $parts = @()
-  $planningWidth = Get-PlanningWidth -Info $Info
-  $cropFilter = Get-CropFilterString -Info $Info
   $effectiveProfile = if (-not [string]::IsNullOrWhiteSpace($PreprocessProfileName)) {
     Get-NormalizedOptionValue -Value $PreprocessProfileName -DefaultValue "none"
   }
@@ -1029,24 +1234,7 @@ function Build-Vf {
     "none"
   }
 
-  if (-not [string]::IsNullOrWhiteSpace($cropFilter)) {
-    $parts += $cropFilter
-  }
-
-  if ($TargetFps -gt 0 -and $Info.Fps -gt ($TargetFps + 0.01)) {
-    $parts += ("fps={0}" -f $TargetFps)
-  }
-
-  if ($TargetWidth -lt $planningWidth) {
-    $parts += ("scale={0}:-2:flags={1}" -f $TargetWidth, $ScaleFlags)
-  }
-
-  $preprocessFilter = Build-PreprocessFilterChain -PreprocessProfileName $effectiveProfile
-  if (-not [string]::IsNullOrWhiteSpace($preprocessFilter)) {
-    $parts += $preprocessFilter
-  }
-
-  return ($parts -join ",")
+  return (Build-EncodeFilterChain -Info $Info -TargetWidth $TargetWidth -TargetFps $TargetFps -PreprocessProfileName $effectiveProfile -ScaleFlags $ScaleFlags)
 }
 
 function Test-ShouldAddDebandPlan {
@@ -1701,8 +1889,11 @@ function Set-InfoPlanningContext {
   )
 
   $cropApplied = [bool](Get-ObjectPropertyValue -Object $CropResult -Name "Applied" -DefaultValue $false)
-  $planningWidth = if ($cropApplied) { [int]$CropResult.Width } else { [int]$Info.Width }
+  $pixelPlanningWidth = if ($cropApplied) { [int]$CropResult.Width } else { [int]$Info.Width }
   $planningHeight = if ($cropApplied) { [int]$CropResult.Height } else { [int]$Info.Height }
+  $displaySar = Get-DisplaySampleAspectRatio -Info $Info
+  $planningWidth = [int]([math]::Round(([double]$pixelPlanningWidth * $displaySar) / 2.0) * 2)
+  if ($planningWidth -lt 2) { $planningWidth = 2 }
   $cropFilter = if ($cropApplied) { [string]$CropResult.Filter } else { "" }
   $cropSummary = if ($cropApplied) {
     ("{0}x{1}+{2}+{3} ({4:P1} removed)" -f $CropResult.Width, $CropResult.Height, $CropResult.X, $CropResult.Y, $CropResult.AreaRemovedRatio)
@@ -2804,6 +2995,91 @@ function Test-ShouldAddDenoisePlan($mode, $detailBucket, $totalBudgetKbps, $bppp
   return ($totalBudgetKbps -lt 500 -or $bpppf -lt 0.02)
 }
 
+function Test-EncoderPixelFormatSupported {
+  param(
+    [Parameter(Mandatory = $true)][string]$Encoder,
+    [Parameter(Mandatory = $true)][string]$PixelFormat
+  )
+
+  $cacheKey = ("{0}|{1}" -f $Encoder.ToLowerInvariant(), $PixelFormat.ToLowerInvariant())
+  if ($script:EncoderPixelFormatSupportCache.ContainsKey($cacheKey)) {
+    return [bool]$script:EncoderPixelFormatSupportCache[$cacheKey]
+  }
+
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-h", ("encoder={0}" -f $Encoder)) -AllowFailure
+  $formatLine = [regex]::Match($capture.Output, '(?im)^\s*Supported pixel formats:\s*(?<formats>[^\r\n]+)')
+  $supported = ($capture.ExitCode -eq 0 -and $formatLine.Success -and (($formatLine.Groups["formats"].Value -split '\s+') -contains $PixelFormat))
+  $script:EncoderPixelFormatSupportCache[$cacheKey] = [bool]$supported
+  return [bool]$supported
+}
+
+function Get-OutputPixelFormat {
+  param(
+    [Parameter(Mandatory = $true)]$Info,
+    [Parameter(Mandatory = $true)]$CodecProfile,
+    [Parameter(Mandatory = $true)][string]$Compatibility,
+    [Parameter(Mandatory = $true)][string]$RequestedBitDepth
+  )
+
+  $requested = Get-NormalizedOptionValue -Value $RequestedBitDepth -DefaultValue "auto"
+  $codec = [string]$CodecProfile.VideoCodec
+  $pixelFormat = "yuv420p"
+
+  if ($requested -eq "10") {
+    if ($codec -eq "x264" -and $Compatibility -eq "widest") {
+      throw "-OutputBitDepth 10 is incompatible with x264 in -CompatibilityMode widest. Use x265/AV1 or explicitly select a less restrictive compatibility mode."
+    }
+    $pixelFormat = "yuv420p10le"
+  }
+  elseif ($requested -eq "auto" -and [int]$Info.VideoBitDepth -gt 8 -and $codec -in @("x265", "av1")) {
+    $pixelFormat = "yuv420p10le"
+  }
+
+  if (-not (Test-EncoderPixelFormatSupported -Encoder $CodecProfile.VideoEncoder -PixelFormat $pixelFormat)) {
+    throw "Encoder '$($CodecProfile.VideoEncoder)' does not support the required output pixel format '$pixelFormat' (source=$($Info.PixelFormat), requested bit depth=$RequestedBitDepth)."
+  }
+
+  return $pixelFormat
+}
+
+function Get-ColorMetadataPolicy {
+  param([Parameter(Mandatory = $true)]$Info)
+
+  Assert-SdrInputSupported -Info $Info
+  $args = New-Object System.Collections.Generic.List[string]
+  $preserved = New-Object System.Collections.Generic.List[string]
+  $omitted = New-Object System.Collections.Generic.List[string]
+
+  $values = @(
+    @{ Name = "range"; Value = ([string]$Info.ColorRange).ToLowerInvariant(); Option = "-color_range"; Valid = @("tv", "pc") },
+    @{ Name = "primaries"; Value = ([string]$Info.ColorPrimaries).ToLowerInvariant(); Option = "-color_primaries"; Valid = @("bt709", "bt470m", "bt470bg", "smpte170m", "smpte240m", "film", "bt2020", "smpte428", "smpte431", "smpte432", "jedec-p22") },
+    @{ Name = "transfer"; Value = ([string]$Info.ColorTransfer).ToLowerInvariant(); Option = "-color_trc"; Valid = @("bt709", "gamma22", "gamma28", "smpte170m", "smpte240m", "linear", "log", "log_sqrt", "iec61966-2-1", "bt2020-10", "bt2020-12") },
+    @{ Name = "matrix"; Value = ([string]$Info.ColorSpace).ToLowerInvariant(); Option = "-colorspace"; Valid = @("rgb", "bt709", "fcc", "bt470bg", "smpte170m", "smpte240m", "ycgco", "bt2020nc", "bt2020c") },
+    @{ Name = "chroma_location"; Value = ([string]$Info.ChromaLocation).ToLowerInvariant(); Option = "-chroma_sample_location"; Valid = @("left", "center", "topleft", "top", "bottomleft", "bottom") }
+  )
+
+  foreach ($entry in $values) {
+    if ([string]::IsNullOrWhiteSpace($entry.Value) -or $entry.Value -in @("unknown", "unspecified", "reserved")) {
+      [void]$omitted.Add(("{0}=unspecified" -f $entry.Name))
+      continue
+    }
+    if ($entry.Value -notin $entry.Valid) {
+      [void]$omitted.Add(("{0}={1} (unsupported)" -f $entry.Name, $entry.Value))
+      continue
+    }
+    [void]$args.Add([string]$entry.Option)
+    [void]$args.Add([string]$entry.Value)
+    [void]$preserved.Add(("{0}={1}" -f $entry.Name, $entry.Value))
+  }
+
+  return [PSCustomObject]@{
+    Args      = @($args.ToArray())
+    Preserved = @($preserved.ToArray())
+    Omitted   = @($omitted.ToArray())
+    Status    = if ($omitted.Count -eq 0) { "preserved" } elseif ($preserved.Count -gt 0) { "partial" } else { "unspecified" }
+  }
+}
+
 function New-EncodePlan {
   param(
     [Parameter(Mandatory = $true)]$Info,
@@ -2841,7 +3117,13 @@ function New-EncodePlan {
   $videoKbps = [int][math]::Floor((($usableVideoBytes * 8.0) / $Info.Duration) / 1000.0)
   if ($videoKbps -lt 40) { return $null }
 
-  $vf = Build-Vf -Info $Info -TargetWidth $Width -TargetFps $Fps -UseDenoise:$UseDenoise -PreprocessProfileName $preprocessLabel
+  $geometryVf = Build-GeometryFilterChain -Info $Info -TargetWidth $Width -TargetFps $Fps
+  $preprocessVf = Build-PreprocessFilterChain -PreprocessProfileName $preprocessLabel
+  $encodeVf = Build-EncodeFilterChain -Info $Info -TargetWidth $Width -TargetFps $Fps -PreprocessProfileName $preprocessLabel
+  $metricReferenceVf = Build-MetricReferenceFilterChain -Info $Info -TargetWidth $Width -TargetFps $Fps
+  $outputPixelFormat = Get-OutputPixelFormat -Info $Info -CodecProfile $CodecProfile -Compatibility $CompatibilityMode -RequestedBitDepth $OutputBitDepth
+  $colorPolicy = Get-ColorMetadataPolicy -Info $Info
+  $hardCapBytes = if ($null -ne $script:RequestedHardCapBytes) { [long]$script:RequestedHardCapBytes } else { [long]$TargetBytes }
   $codecEfficiency = Get-CodecEfficiencyMultiplier -VideoCodec $CodecProfile.VideoCodec
   $effectiveVideoKbps = [double]$videoKbps / [double][math]::Max(0.001, $codecEfficiency)
   $bpppf = Get-Bpppf -videoKbps $effectiveVideoKbps -width $Width -height $Height -fps $Fps
@@ -2893,13 +3175,18 @@ function New-EncodePlan {
     Width       = $Width
     Height      = $Height
     Fps         = $Fps
-    VFilter     = $vf
+    VFilter     = $encodeVf
+    GeometryVFilter = $geometryVf
+    PreprocessVFilter = $preprocessVf
+    EncodeVFilter = $encodeVf
+    MetricReferenceVFilter = $metricReferenceVf
     VideoKbps   = $videoKbps
     EffectiveVideoKbps = $effectiveVideoKbps
     Crf         = $crf
     AudioPlan   = $AudioPlan
-    AudioCodec  = if ($AudioPlan.Codec) { $AudioPlan.Codec } else { $CodecProfile.DefaultAudioCodec }
+    AudioCodec  = [string](Get-ObjectPropertyValue -Object $AudioPlan -Name "Codec" -DefaultValue $CodecProfile.DefaultAudioCodec)
     TargetBytes = $TargetBytes
+    HardCapBytes = $hardCapBytes
     Preset      = $Preset
     Mode        = $Mode
     CodecProfile = $CodecProfile
@@ -2922,7 +3209,7 @@ function New-EncodePlan {
     PreprocessTier = $preprocessLabel
     ArchetypeKey = ("{0}|{1}|{2}|{3}" -f $fpsTier, $widthTier, $audioTier, $preprocessLabel)
     PredictedTotalBytes = [long]$TargetBytes
-    PredictedFillRatio  = 1.0
+    PredictedFillRatio  = ([double]$TargetBytes / [double]$hardCapBytes)
     ReserveBytes = [long]$muxReserve
     ResolutionBiasLabel = $resolutionProfile.BiasLabel
     PreprocessLabel = $preprocessLabel
@@ -2930,6 +3217,28 @@ function New-EncodePlan {
     CropApplied = [bool](Get-ObjectPropertyValue -Object $Info -Name "CropApplied" -DefaultValue $false)
     CropSummary = Get-CropSummary -Info $Info
     VideoPrivateArgs = $videoPrivateArgs
+    OutputPixelFormat = $outputPixelFormat
+    OutputBitDepth = if ($outputPixelFormat -eq "yuv420p10le") { 10 } else { 8 }
+    SourcePixelFormat = [string]$Info.PixelFormat
+    SourceBitDepth = [int]$Info.VideoBitDepth
+    SourceColorRange = [string]$Info.ColorRange
+    SourceColorPrimaries = [string]$Info.ColorPrimaries
+    SourceColorTransfer = [string]$Info.ColorTransfer
+    SourceColorSpace = [string]$Info.ColorSpace
+    SourceChromaLocation = [string]$Info.ChromaLocation
+    SourceSampleAspectRatio = [string]$Info.SampleAspectRatio
+    SourceDisplayAspectRatio = [string]$Info.DisplayAspectRatio
+    SourceRotation = [int]$Info.Rotation
+    HdrClassification = [string]$Info.HdrClassification
+    ColorMetadataArgs = @($colorPolicy.Args)
+    ColorMetadataStatus = [string]$colorPolicy.Status
+    ColorMetadataPreserved = @($colorPolicy.Preserved)
+    ColorMetadataOmitted = @($colorPolicy.Omitted)
+    VbvMode = $VbvMode
+    VbvPeakMultiplier = if ($VbvMode -eq "Streaming" -and $CodecProfile.VideoCodec -ne "av1") { 1.5 } else { $null }
+    VbvBufferSeconds = if ($VbvMode -eq "Streaming" -and $CodecProfile.VideoCodec -ne "av1") { 2.0 } else { $null }
+    MaxrateKbps = if ($VbvMode -eq "Streaming" -and $CodecProfile.VideoCodec -ne "av1") { [int][math]::Ceiling($videoKbps * 1.5) } else { $null }
+    BufsizeKbits = if ($VbvMode -eq "Streaming" -and $CodecProfile.VideoCodec -ne "av1") { [int][math]::Ceiling($videoKbps * 1.5 * 2.0) } else { $null }
     ContentClass = [string](Get-ObjectPropertyValue -Object $Probe -Name "ContentClass" -DefaultValue "general")
     MetricModeUsed = if ($PolicyProfile) { [string](Get-ObjectPropertyValue -Object $PolicyProfile -Name "MetricModeUsed" -DefaultValue "off") } else { "off" }
     MetricScore = $null
@@ -2972,12 +3281,14 @@ function Get-AudioEncodeArgs {
 function Get-CodecPresetArgs {
   param(
     [Parameter(Mandatory = $true)]$Plan,
-    [switch]$Preview
+    [ValidateSet("FinalEncode", "SizeEstimate", "QualityMetric")]
+    [string]$Purpose = "FinalEncode"
   )
 
+  $useSpeedOverride = ($Purpose -eq "SizeEstimate")
   switch ($Plan.CodecProfile.PresetKind) {
     "svtav1" {
-      $presetValue = if ($Preview) {
+      $presetValue = if ($useSpeedOverride) {
         [int]$Plan.CodecProfile.PreviewSpeedOverride.Value
       }
       else {
@@ -2988,37 +3299,64 @@ function Get-CodecPresetArgs {
     }
 
     default {
-      $presetValue = if ($Preview) { [string]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { [string]$Plan.Preset }
+      $presetValue = if ($useSpeedOverride) { [string]$Plan.CodecProfile.PreviewSpeedOverride.Value } else { [string]$Plan.Preset }
       return @("-preset", $presetValue)
     }
+  }
+}
+
+function Get-VbvPolicy {
+  param([Parameter(Mandatory = $true)]$Plan)
+
+  $mode = [string](Get-ObjectPropertyValue -Object $Plan -Name "VbvMode" -DefaultValue "Off")
+  if ($Plan.CodecProfile.VideoCodec -eq "av1" -or $mode -eq "Off") {
+    return [PSCustomObject]@{
+      Mode = $mode
+      Args = @()
+      MaxrateKbps = $null
+      BufsizeKbits = $null
+      PeakMultiplier = $null
+      BufferSeconds = $null
+    }
+  }
+
+  $peakMultiplier = 1.5
+  $bufferSeconds = 2.0
+  $maxrateKbps = [int][math]::Ceiling([double]$Plan.VideoKbps * $peakMultiplier)
+  $bufsizeKbits = [int][math]::Ceiling([double]$maxrateKbps * $bufferSeconds)
+  return [PSCustomObject]@{
+    Mode = "Streaming"
+    Args = @("-maxrate", ("{0}k" -f $maxrateKbps), "-bufsize", ("{0}k" -f $bufsizeKbits))
+    MaxrateKbps = $maxrateKbps
+    BufsizeKbits = $bufsizeKbits
+    PeakMultiplier = $peakMultiplier
+    BufferSeconds = $bufferSeconds
   }
 }
 
 function Get-CommonVideoEncodeArgs {
   param(
     [Parameter(Mandatory = $true)]$Plan,
-    [switch]$Preview
+    [ValidateSet("FinalEncode", "SizeEstimate", "QualityMetric")]
+    [string]$Purpose = "FinalEncode"
   )
 
   $args = @()
 
-  if (-not [string]::IsNullOrWhiteSpace($Plan.VFilter)) {
-    $args += @("-vf", $Plan.VFilter)
+  $encodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
+  if (-not [string]::IsNullOrWhiteSpace($encodeFilter)) {
+    $args += @("-vf", $encodeFilter)
   }
 
   $args += @("-c:v", $Plan.CodecProfile.VideoEncoder)
-  $args += Get-CodecPresetArgs -Plan $Plan -Preview:$Preview
-  $args += @("-pix_fmt", "yuv420p")
+  $args += Get-CodecPresetArgs -Plan $Plan -Purpose $Purpose
+  $args += @("-pix_fmt", ([string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")))
+  $args += @((Get-ObjectPropertyValue -Object $Plan -Name "ColorMetadataArgs" -DefaultValue @()))
 
   $videoRate = ("{0}k" -f $Plan.VideoKbps)
-  $bufSize = ("{0}k" -f ([int][math]::Max($Plan.VideoKbps * 2, 100)))
-
-  if ($Plan.CodecProfile.VideoCodec -eq "av1") {
-    $args += @("-b:v", $videoRate)
-  }
-  else {
-    $args += @("-b:v", $videoRate, "-maxrate", $videoRate, "-bufsize", $bufSize)
-  }
+  $args += @("-b:v", $videoRate)
+  $vbvPolicy = Get-VbvPolicy -Plan $Plan
+  $args += @($vbvPolicy.Args)
 
   if ($Plan.CodecProfile.VideoCodec -eq "x264" -and -not [string]::IsNullOrWhiteSpace($Plan.VideoPrivateArgs)) {
     $args += @("-x264-params", $Plan.VideoPrivateArgs)
@@ -3049,6 +3387,22 @@ function Finalize-OutputFile {
   $args = @("-y", "-i", $InputPath) + $CodecProfile.FinalizeArgs + @($OutputPath)
   [void](Invoke-Tool -Exe "ffmpeg" -Args $args)
   return (Get-Item $OutputPath).Length
+}
+
+function Assert-FinalOutputWithinCap {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [Parameter(Mandatory = $true)][long]$HardCapBytes
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    throw "Final output is missing: $Path"
+  }
+  $size = [long](Get-Item -LiteralPath $Path).Length
+  if ($size -gt $HardCapBytes) {
+    throw "Final muxed output is $size bytes, exceeding the requested hard cap of $HardCapBytes bytes."
+  }
+  return $size
 }
 
 function Encode-Plan {
@@ -3193,26 +3547,93 @@ function Get-NormalizedMetricPreferenceScore {
   }
 }
 
+function Test-VmafNegModelAvailable {
+  if ($null -ne $script:VmafNegModelAvailable) {
+    return [bool]$script:VmafNegModelAvailable
+  }
+
+  if (-not (Test-FfmpegFilterAvailable -Filter "libvmaf")) {
+    $script:VmafNegModelAvailable = $false
+    return $false
+  }
+
+  $lavfi = "[0:v][1:v]libvmaf=model=version=vmaf_v0.6.1neg:n_threads=1:n_subsample=1"
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @(
+    "-hide_banner", "-f", "lavfi", "-i", "color=size=16x16:duration=0.05",
+    "-f", "lavfi", "-i", "color=size=16x16:duration=0.05",
+    "-lavfi", $lavfi, "-an", "-f", "null", "NUL"
+  ) -AllowFailure
+  $script:VmafNegModelAvailable = ($capture.ExitCode -eq 0)
+  return [bool]$script:VmafNegModelAvailable
+}
+
+function Get-MetricReferenceFilter {
+  param([Parameter(Mandatory = $true)]$Plan)
+
+  $geometry = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricReferenceVFilter" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "GeometryVFilter" -DefaultValue ""))
+  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
+  $parts = @()
+  if (-not [string]::IsNullOrWhiteSpace($geometry)) { $parts += $geometry }
+  $parts += ("format={0}" -f $pixelFormat)
+  $parts += "settb=AVTB"
+  $parts += "setpts=PTS-STARTPTS"
+  return ($parts -join ",")
+}
+
+function Get-MetricDistortedFilter {
+  param([Parameter(Mandatory = $true)]$Plan)
+
+  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
+  return ("format={0},settb=AVTB,setpts=PTS-STARTPTS" -f $pixelFormat)
+}
+
+function Get-DistortedMetricInputArgs {
+  param(
+    [Parameter(Mandatory = $true)][string]$PreviewPath,
+    [Parameter(Mandatory = $true)]$Window,
+    [double]$DistortedOffset = 0.0
+  )
+
+  if ($DistortedOffset -gt 0.0001) {
+    return @("-ss", "$DistortedOffset", "-t", "$($Window.Duration)", "-i", $PreviewPath)
+  }
+  return @("-i", $PreviewPath)
+}
+
 function Invoke-VmafMetric {
   param(
     [Parameter(Mandatory = $true)][string]$InputPath,
     [Parameter(Mandatory = $true)][string]$PreviewPath,
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)]$Window,
-    [Parameter(Mandatory = $true)][string]$TempDir
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [double]$DistortedOffset = 0.0
   )
 
   $logName = ("vmaf_{0}.json" -f ([guid]::NewGuid().ToString("N")))
-  $refFilter = if ([string]::IsNullOrWhiteSpace($Plan.VFilter)) {
-    "settb=AVTB,setpts=PTS-STARTPTS"
-  }
-  else {
-    "{0},settb=AVTB,setpts=PTS-STARTPTS" -f $Plan.VFilter
+  $refFilter = Get-MetricReferenceFilter -Plan $Plan
+  $distortedFilter = Get-MetricDistortedFilter -Plan $Plan
+  $modelOption = ""
+  if ([string](Get-ObjectPropertyValue -Object $Plan -Name "PreprocessLabel" -DefaultValue "none") -eq "screen-sharpen") {
+    if (-not (Test-VmafNegModelAvailable)) {
+      Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
+          MetricMode = "vmaf"
+          Reason = "vmaf-neg-unavailable-for-enhancement"
+          Window = $Window
+          PreviewPath = $PreviewPath
+          ReferenceFilter = $refFilter
+          EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
+        })
+      return $null
+    }
+    $modelOption = ":model=version=vmaf_v0.6.1neg"
   }
   $threadCount = if ($Plan.Mode -eq "ExtraQuality") { 4 } else { 2 }
   $subsample = if ($Plan.Mode -eq "ExtraQuality") { 1 } else { 2 }
-  $lavfi = "[1:v]settb=AVTB,setpts=PTS-STARTPTS[main];[0:v]{0}[ref];[main][ref]libvmaf=log_fmt=json:log_path={1}:n_threads={2}:n_subsample={3}" -f $refFilter, $logName, $threadCount, $subsample
-  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-ss", "$($Window.Start)", "-t", "$($Window.Duration)", "-i", $InputPath, "-i", $PreviewPath, "-lavfi", $lavfi, "-an", "-f", "null", "NUL") -WorkingDirectory $TempDir -AllowFailure
+  $lavfi = "[1:v]{0}[main];[0:v]{1}[ref];[main][ref]libvmaf=log_fmt=json:log_path={2}:n_threads={3}:n_subsample={4}{5}" -f $distortedFilter, $refFilter, $logName, $threadCount, $subsample, $modelOption
+  $inputArgs = @("-hide_banner", "-ss", "$($Window.Start)", "-t", "$($Window.Duration)", "-i", $InputPath)
+  $inputArgs += Get-DistortedMetricInputArgs -PreviewPath $PreviewPath -Window $Window -DistortedOffset $DistortedOffset
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + @("-lavfi", $lavfi, "-an", "-f", "null", "NUL")) -WorkingDirectory $TempDir -AllowFailure
   if ($capture.ExitCode -ne 0) {
     Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
         MetricMode = "vmaf"
@@ -3220,6 +3641,9 @@ function Invoke-VmafMetric {
         Output     = $capture.Output
         Window     = $Window
         PreviewPath = $PreviewPath
+        ReferenceFilter = $refFilter
+        DistortedFilter = $distortedFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
       })
     return $null
   }
@@ -3233,6 +3657,9 @@ function Invoke-VmafMetric {
         Window     = $Window
         PreviewPath = $PreviewPath
         Reason     = "missing-log"
+        ReferenceFilter = $refFilter
+        DistortedFilter = $distortedFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
       })
     return $null
   }
@@ -3243,6 +3670,8 @@ function Invoke-VmafMetric {
     return [PSCustomObject]@{
       Mode  = "vmaf"
       Score = [double]$score
+      Model = if ($modelOption) { "vmaf_v0.6.1neg" } else { "default" }
+      Window = $Window
     }
   }
   finally {
@@ -3256,18 +3685,17 @@ function Invoke-XpsnrMetric {
     [Parameter(Mandatory = $true)][string]$PreviewPath,
     [Parameter(Mandatory = $true)]$Plan,
     [Parameter(Mandatory = $true)]$Window,
-    [Parameter(Mandatory = $true)][string]$TempDir
+    [Parameter(Mandatory = $true)][string]$TempDir,
+    [double]$DistortedOffset = 0.0
   )
 
   $statsName = ("xpsnr_{0}.log" -f ([guid]::NewGuid().ToString("N")))
-  $refFilter = if ([string]::IsNullOrWhiteSpace($Plan.VFilter)) {
-    "settb=AVTB,setpts=PTS-STARTPTS"
-  }
-  else {
-    "{0},settb=AVTB,setpts=PTS-STARTPTS" -f $Plan.VFilter
-  }
-  $lavfi = "[0:v]{0}[ref];[1:v]settb=AVTB,setpts=PTS-STARTPTS[test];[ref][test]xpsnr=stats_file={1}" -f $refFilter, $statsName
-  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args @("-hide_banner", "-ss", "$($Window.Start)", "-t", "$($Window.Duration)", "-i", $InputPath, "-i", $PreviewPath, "-lavfi", $lavfi, "-an", "-f", "null", "NUL") -WorkingDirectory $TempDir -AllowFailure
+  $refFilter = Get-MetricReferenceFilter -Plan $Plan
+  $distortedFilter = Get-MetricDistortedFilter -Plan $Plan
+  $lavfi = "[0:v]{0}[ref];[1:v]{1}[test];[ref][test]xpsnr=stats_file={2}" -f $refFilter, $distortedFilter, $statsName
+  $inputArgs = @("-hide_banner", "-ss", "$($Window.Start)", "-t", "$($Window.Duration)", "-i", $InputPath)
+  $inputArgs += Get-DistortedMetricInputArgs -PreviewPath $PreviewPath -Window $Window -DistortedOffset $DistortedOffset
+  $capture = Invoke-ToolCapture -Exe "ffmpeg" -Args ($inputArgs + @("-lavfi", $lavfi, "-an", "-f", "null", "NUL")) -WorkingDirectory $TempDir -AllowFailure
   if ($capture.ExitCode -ne 0) {
     Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
         MetricMode = "xpsnr"
@@ -3275,6 +3703,9 @@ function Invoke-XpsnrMetric {
         Output     = $capture.Output
         Window     = $Window
         PreviewPath = $PreviewPath
+        ReferenceFilter = $refFilter
+        DistortedFilter = $distortedFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
       })
     return $null
   }
@@ -3288,6 +3719,9 @@ function Invoke-XpsnrMetric {
         Window     = $Window
         PreviewPath = $PreviewPath
         Reason     = "missing-log"
+        ReferenceFilter = $refFilter
+        DistortedFilter = $distortedFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
       })
     return $null
   }
@@ -3295,7 +3729,7 @@ function Invoke-XpsnrMetric {
   try {
     $frameScores = New-Object System.Collections.Generic.List[double]
     foreach ($line in (Get-Content -Path $statsPath)) {
-      $matches = [regex]::Matches($line, '(?i)(?:^|\s)(?:xpsnr_)?(?<plane>[yuv]|average|min)[:=](?<value>-?\d+(?:\.\d+)?)')
+      $matches = [regex]::Matches($line, '(?i)(?:^|\s)(?:xpsnr[_\s]+)?(?<plane>[yuv]|average|min)\s*[:=]\s*(?<value>-?\d+(?:\.\d+)?)')
       if ($matches.Count -eq 0) { continue }
       $values = New-Object System.Collections.Generic.List[double]
       foreach ($match in $matches) {
@@ -3320,6 +3754,8 @@ function Invoke-XpsnrMetric {
       return [PSCustomObject]@{
         Mode  = "xpsnr"
         Score = [double](($frameScores | Measure-Object -Average).Average)
+        WorstFrameScore = [double](($frameScores | Measure-Object -Minimum).Minimum)
+        Window = $Window
       }
     }
 
@@ -3346,6 +3782,8 @@ function Invoke-XpsnrMetric {
         return [PSCustomObject]@{
           Mode  = "xpsnr"
           Score = [double]$score
+          WorstFrameScore = [double]$score
+          Window = $Window
         }
       }
     }
@@ -3357,6 +3795,9 @@ function Invoke-XpsnrMetric {
         Window     = $Window
         PreviewPath = $PreviewPath
         Reason     = "no-frame-scores"
+        ReferenceFilter = $refFilter
+        DistortedFilter = $distortedFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
       })
     return $null
   }
@@ -3378,6 +3819,7 @@ function Invoke-PreviewMetric {
     return [PSCustomObject]@{
       MetricModeUsed = "off"
       MetricScore = $null
+      WorstMetricScore = $null
       MetricConfidence = 0.0
       SegmentScores = @()
     }
@@ -3386,9 +3828,10 @@ function Invoke-PreviewMetric {
   $scores = New-Object System.Collections.Generic.List[object]
   foreach ($segment in @($PreviewSegments)) {
     if (-not (Test-Path $segment.Path)) { continue }
+    $distortedOffset = [double](Get-ObjectPropertyValue -Object $segment -Name "DistortedOffset" -DefaultValue 0.0)
     $metricResult = switch ($metricMode) {
-      "vmaf"  { Invoke-VmafMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir }
-      "xpsnr" { Invoke-XpsnrMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir }
+      "vmaf"  { Invoke-VmafMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset }
+      "xpsnr" { Invoke-XpsnrMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset }
     }
 
     if ($metricResult) {
@@ -3400,6 +3843,7 @@ function Invoke-PreviewMetric {
     return [PSCustomObject]@{
       MetricModeUsed = [string]$metricMode
       MetricScore = $null
+      WorstMetricScore = $null
       MetricConfidence = 0.0
       SegmentScores = @()
     }
@@ -3410,6 +3854,7 @@ function Invoke-PreviewMetric {
   return [PSCustomObject]@{
     MetricModeUsed   = [string]$metricMode
     MetricScore      = [double]$score
+    WorstMetricScore = [double](($scores | Measure-Object -Property Score -Minimum).Minimum)
     MetricConfidence = [double]$confidence
     SegmentScores    = @($scores.ToArray())
   }
@@ -3423,6 +3868,7 @@ function Get-MetricScoreBundle {
   return [PSCustomObject]@{
     MetricModeUsed   = [string](Get-ObjectPropertyValue -Object $MetricResult -Name "MetricModeUsed" -DefaultValue "off")
     MetricScore      = (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricScore" -DefaultValue $null)
+    WorstMetricScore = (Get-ObjectPropertyValue -Object $MetricResult -Name "WorstMetricScore" -DefaultValue $null)
     MetricConfidence = [double](Get-ObjectPropertyValue -Object $MetricResult -Name "MetricConfidence" -DefaultValue 0.0)
     MetricSortScore  = if ($null -ne (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricScore" -DefaultValue $null)) {
       switch ((Get-NormalizedOptionValue -Value (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricModeUsed" -DefaultValue "off") -DefaultValue "off")) {
@@ -3447,6 +3893,7 @@ function Merge-PreviewAndMetricScore {
   $previewCopy = $Preview.PSObject.Copy()
   $previewCopy | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string]$MetricBundle.MetricModeUsed) -Force
   $previewCopy | Add-Member -NotePropertyName MetricScore -NotePropertyValue $MetricBundle.MetricScore -Force
+  $previewCopy | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue $MetricBundle.WorstMetricScore -Force
   $previewCopy | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double]$MetricBundle.MetricConfidence) -Force
   $previewCopy | Add-Member -NotePropertyName MetricSortScore -NotePropertyValue ([int]$MetricBundle.MetricSortScore) -Force
   $previewCopy | Add-Member -NotePropertyName MetricSegmentScores -NotePropertyValue @($MetricBundle.SegmentScores) -Force
@@ -3489,7 +3936,11 @@ function Get-PlanKey($Plan) {
     default { [string]$Plan.AudioPlan.Mode }
   }
 
-  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|codec={8}|container={9}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.CodecProfile.VideoCodec, $Plan.CodecProfile.Container)
+  $geometry = [string](Get-ObjectPropertyValue -Object $Plan -Name "GeometryVFilter" -DefaultValue "")
+  $encode = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
+  $pixFmt = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
+  $vbv = [string](Get-ObjectPropertyValue -Object $Plan -Name "VbvMode" -DefaultValue "Off")
+  return ("{0}x{1}@{2}|v={3}|a={4}|p={5}|pp={6}|crop={7}|codec={8}|container={9}|pix={10}|vbv={11}|g={12}|ef={13}" -f $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $audioKey, $Plan.Preset, $Plan.PreprocessLabel, [int]$Plan.CropApplied, $Plan.CodecProfile.VideoCodec, $Plan.CodecProfile.Container, $pixFmt, $vbv, $geometry, $encode)
 }
 
 function Write-PlanLogRecord {
@@ -3517,11 +3968,15 @@ function Get-PlanFeatureVector {
     [Parameter(Mandatory = $true)]$Plan
   )
 
+  $vbvPolicy = Get-VbvPolicy -Plan $Plan
+
   return [PSCustomObject]@{
     Width                 = [int]$Plan.Width
     Height                = [int]$Plan.Height
     Fps                   = [int]$Plan.Fps
     VideoKbps             = [int]$Plan.VideoKbps
+    PlanningTargetBytes   = [long](Get-ObjectPropertyValue -Object $Plan -Name "TargetBytes" -DefaultValue 0)
+    HardCapBytes          = [long](Get-ObjectPropertyValue -Object $Plan -Name "HardCapBytes" -DefaultValue $Plan.TargetBytes)
     AudioMode             = [string]$Plan.AudioPlan.Mode
     AudioKbps             = [int](Get-ObjectPropertyValue -Object $Plan.AudioPlan -Name "Kbps" -DefaultValue 0)
     Codec                 = [string]$Plan.CodecProfile.VideoCodec
@@ -3532,7 +3987,26 @@ function Get-PlanFeatureVector {
     SamplingModeUsed      = [string](Get-ObjectPropertyValue -Object $Plan -Name "SamplingModeUsed" -DefaultValue "fixed")
     MetricModeUsed        = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricModeUsed" -DefaultValue "off")
     MetricScore           = (Get-ObjectPropertyValue -Object $Plan -Name "MetricScore" -DefaultValue $null)
+    WorstMetricScore      = (Get-ObjectPropertyValue -Object $Plan -Name "WorstMetricScore" -DefaultValue $null)
     MetricConfidence      = [double](Get-ObjectPropertyValue -Object $Plan -Name "MetricConfidence" -DefaultValue 0.0)
+    PreviewRank           = [int](Get-ObjectPropertyValue -Object $Plan -Name "PreviewRank" -DefaultValue 0)
+    PreviewRatio          = (Get-ObjectPropertyValue -Object $Plan -Name "PreviewRatio" -DefaultValue $null)
+    GeometryVFilter       = [string](Get-ObjectPropertyValue -Object $Plan -Name "GeometryVFilter" -DefaultValue "")
+    PreprocessVFilter     = [string](Get-ObjectPropertyValue -Object $Plan -Name "PreprocessVFilter" -DefaultValue "")
+    EncodeVFilter         = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
+    MetricReferenceVFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricReferenceVFilter" -DefaultValue "")
+    OutputPixelFormat     = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
+    OutputBitDepth        = [int](Get-ObjectPropertyValue -Object $Plan -Name "OutputBitDepth" -DefaultValue 8)
+    SourcePixelFormat     = [string](Get-ObjectPropertyValue -Object $Plan -Name "SourcePixelFormat" -DefaultValue "")
+    SourceBitDepth        = [int](Get-ObjectPropertyValue -Object $Plan -Name "SourceBitDepth" -DefaultValue 8)
+    ColorMetadataStatus   = [string](Get-ObjectPropertyValue -Object $Plan -Name "ColorMetadataStatus" -DefaultValue "unspecified")
+    ColorMetadataPreserved = @((Get-ObjectPropertyValue -Object $Plan -Name "ColorMetadataPreserved" -DefaultValue @()))
+    ColorMetadataOmitted  = @((Get-ObjectPropertyValue -Object $Plan -Name "ColorMetadataOmitted" -DefaultValue @()))
+    VbvMode               = [string](Get-ObjectPropertyValue -Object $Plan -Name "VbvMode" -DefaultValue "Off")
+    MaxrateKbps           = $vbvPolicy.MaxrateKbps
+    BufsizeKbits          = $vbvPolicy.BufsizeKbits
+    VbvPeakMultiplier     = $vbvPolicy.PeakMultiplier
+    VbvBufferSeconds      = $vbvPolicy.BufferSeconds
     ReserveBytes          = [long](Get-ObjectPropertyValue -Object $Plan -Name "ReserveBytes" -DefaultValue 0)
     CodecPolicyReason     = [string](Get-ObjectPropertyValue -Object $Plan -Name "CodecPolicyReason" -DefaultValue "")
     ContainerPolicyReason = [string](Get-ObjectPropertyValue -Object $Plan -Name "ContainerPolicyReason" -DefaultValue "")
@@ -3734,7 +4208,7 @@ function Get-PlanPreviewResult {
   $previewSegments = New-Object System.Collections.Generic.List[object]
   $metricSegments = New-Object System.Collections.Generic.List[object]
   $idx = 0
-  $commonVideo = Get-CommonVideoEncodeArgs -Plan $Plan -Preview
+  $sizeEstimateVideo = Get-CommonVideoEncodeArgs -Plan $Plan -Purpose "SizeEstimate"
 
   foreach ($window in $sampleWindows) {
     $idx++
@@ -3742,7 +4216,7 @@ function Get-PlanPreviewResult {
     $windowDuration = [double](Get-ObjectPropertyValue -Object $window -Name "Duration" -DefaultValue $SampleSeconds)
     $outPath = Join-Path $TempDir ("preview_{0}_{1}_{2}_{3}{4}" -f $Plan.Width, $Plan.Fps, $Plan.VideoKbps, $idx, $Plan.OutputExtension)
     $args = @("-y", "-ss", "$offset", "-t", "$windowDuration", "-i", $InputPath)
-    $args += @("-an") + $commonVideo + @($outPath)
+    $args += @("-an") + $sizeEstimateVideo + @($outPath)
 
     [void](Invoke-Tool -Exe "ffmpeg" -Args $args)
     $bytes = [double](Get-Item $outPath).Length
@@ -3768,10 +4242,9 @@ function Get-PlanPreviewResult {
   }
   $predictedVideoBytes = [double]$weightedSegmentBytes * ([double]$Info.Duration / [double]$SampleSeconds)
   $metricSampling = Get-ResolvedMetricSampling -Plan $Plan -PreviewSampleSeconds $SampleSeconds
-  if (
-    (Get-NormalizedOptionValue -Value (Get-ObjectPropertyValue -Object $Plan -Name "MetricModeUsed" -DefaultValue "off") -DefaultValue "off") -ne "off" -and
-    ($metricSampling.SampleSeconds -ne $SampleSeconds -or $metricSampling.MaxSamples -ne $sampleWindows.Count)
-  ) {
+  $metricMode = Get-NormalizedOptionValue -Value (Get-ObjectPropertyValue -Object $Plan -Name "MetricModeUsed" -DefaultValue "off") -DefaultValue "off"
+  if ($metricMode -ne "off") {
+    $qualityMetricVideo = Get-CommonVideoEncodeArgs -Plan $Plan -Purpose "QualityMetric"
     $metricWindows = @(Get-PreviewSampleWindows -Info $Info -Plan $Plan -SampleSeconds $metricSampling.SampleSeconds -MaxSamples $metricSampling.MaxSamples)
     $metricIdx = 0
     foreach ($window in $metricWindows) {
@@ -3780,7 +4253,7 @@ function Get-PlanPreviewResult {
       $windowDuration = [double](Get-ObjectPropertyValue -Object $window -Name "Duration" -DefaultValue $metricSampling.SampleSeconds)
       $outPath = Join-Path $TempDir ("metricpreview_{0}_{1}_{2}_{3}{4}" -f $Plan.Width, $Plan.Fps, $Plan.VideoKbps, $metricIdx, $Plan.OutputExtension)
       $args = @("-y", "-ss", "$offset", "-t", "$windowDuration", "-i", $InputPath)
-      $args += @("-an") + $commonVideo + @($outPath)
+      $args += @("-an") + $qualityMetricVideo + @($outPath)
       [void](Invoke-Tool -Exe "ffmpeg" -Args $args)
       [void]$metricSegments.Add([PSCustomObject]@{
           Path  = $outPath
@@ -3789,16 +4262,12 @@ function Get-PlanPreviewResult {
         })
     }
   }
-  else {
-    foreach ($segment in @($previewSegments.ToArray())) {
-      [void]$metricSegments.Add($segment)
-    }
-  }
 
   $metricResult = Invoke-PreviewMetric -InputPath $InputPath -PreviewSegments @($metricSegments.ToArray()) -Plan $Plan -TempDir $TempDir
   $metricBundle = Get-MetricScoreBundle -MetricResult $metricResult
   $predictedTotalBytes = [long][math]::Floor($predictedVideoBytes + [double]$Plan.AudioPlan.EstimatedBytes + [double](Get-MuxReserveBytes -targetBytes $Plan.TargetBytes -mode $Plan.Mode -Container $Plan.CodecProfile.Container -VideoCodec $Plan.CodecProfile.VideoCodec -AudioMode $Plan.AudioPlan.Mode))
-  $predictedRatio = $predictedTotalBytes / [double]$Plan.TargetBytes
+  $hardCapBytes = [long](Get-ObjectPropertyValue -Object $Plan -Name "HardCapBytes" -DefaultValue $Plan.TargetBytes)
+  $predictedRatio = $predictedTotalBytes / [double]$hardCapBytes
 
   $previewResult = [PSCustomObject]@{
     Success    = ($predictedTotalBytes -gt 0)
@@ -3812,6 +4281,9 @@ function Get-PlanPreviewResult {
     Ratio      = $predictedRatio
     SamplingModeUsed = [string](Get-ObjectPropertyValue -Object $Plan -Name "SamplingModeUsed" -DefaultValue "fixed")
     SampleWindows = @($sampleWindows)
+    SizeEstimatePreset = ((Get-CodecPresetArgs -Plan $Plan -Purpose "SizeEstimate") -join " ")
+    QualityMetricPreset = if ($metricMode -ne "off") { ((Get-CodecPresetArgs -Plan $Plan -Purpose "QualityMetric") -join " ") } else { "off" }
+    QualityMetricPixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
   }
 
   foreach ($segment in @($previewSegments.ToArray())) {
@@ -3900,6 +4372,7 @@ function Get-PlanFinalists {
                 $selectedPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$preview.Ratio) -Force
                 $selectedPlan | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string](Get-ObjectPropertyValue -Object $preview -Name "MetricModeUsed" -DefaultValue "off")) -Force
                 $selectedPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "MetricScore" -DefaultValue $null) -Force
+                $selectedPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "WorstMetricScore" -DefaultValue $null) -Force
                 $selectedPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $preview -Name "MetricConfidence" -DefaultValue 0.0)) -Force
                 [void]$previewSelected.Add($selectedPlan)
               }
@@ -3964,6 +4437,7 @@ function Get-PlanFinalists {
           $selectedPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$preview.Ratio) -Force
           $selectedPlan | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string](Get-ObjectPropertyValue -Object $preview -Name "MetricModeUsed" -DefaultValue "off")) -Force
           $selectedPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "MetricScore" -DefaultValue $null) -Force
+          $selectedPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "WorstMetricScore" -DefaultValue $null) -Force
           $selectedPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $preview -Name "MetricConfidence" -DefaultValue 0.0)) -Force
           [void]$selectedPlans.Add($selectedPlan)
         }
@@ -4005,6 +4479,63 @@ function Initialize-PlanPassLog {
   return $passLogPath
 }
 
+function Get-FinalMetricWindows {
+  param([Parameter(Mandatory = $true)]$Plan)
+
+  $sampleSeconds = if ($MetricSampleSeconds -gt 0) { [int]$MetricSampleSeconds } else { 4 }
+  $maxSamples = if ($MetricMaxSamples -gt 0) {
+    [int]$MetricMaxSamples
+  }
+  elseif ($Plan.Mode -eq "ExtraQuality") {
+    3
+  }
+  else {
+    2
+  }
+
+  $duration = [double](Get-ObjectPropertyValue -Object $Plan -Name "DurationSeconds" -DefaultValue 0.0)
+  $windows = New-Object System.Collections.Generic.List[object]
+  foreach ($seed in @((Get-ObjectPropertyValue -Object $Plan -Name "SampleWindows" -DefaultValue @()))) {
+    if ($windows.Count -ge $maxSamples) { break }
+    $start = [double](Get-ObjectPropertyValue -Object $seed -Name "Start" -DefaultValue 0.0)
+    $available = [math]::Max(0.0, $duration - $start)
+    if ($available -le 0.05) { continue }
+    [void]$windows.Add([PSCustomObject]@{
+        Start = $start
+        Duration = [double][math]::Min($sampleSeconds, $available)
+        Source = [string](Get-ObjectPropertyValue -Object $seed -Name "Source" -DefaultValue "final")
+        Tag = [string](Get-ObjectPropertyValue -Object $seed -Name "Tag" -DefaultValue "")
+      })
+  }
+
+  if ($windows.Count -eq 0 -and $duration -gt 0.05) {
+    foreach ($window in @(Get-FixedSampleWindows -Duration $duration -SampleLength $sampleSeconds -MaxSamples $maxSamples)) {
+      [void]$windows.Add($window)
+    }
+  }
+
+  return @($windows.ToArray())
+}
+
+function Invoke-FinalOutputMetric {
+  param(
+    [Parameter(Mandatory = $true)][string]$InputPath,
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [Parameter(Mandatory = $true)]$Plan,
+    [Parameter(Mandatory = $true)][string]$TempDir
+  )
+
+  $segments = New-Object System.Collections.Generic.List[object]
+  foreach ($window in @(Get-FinalMetricWindows -Plan $Plan)) {
+    [void]$segments.Add([PSCustomObject]@{
+        Path = $OutputPath
+        Window = $window
+        DistortedOffset = [double]$window.Start
+      })
+  }
+  return (Invoke-PreviewMetric -InputPath $InputPath -PreviewSegments @($segments.ToArray()) -Plan $Plan -TempDir $TempDir)
+}
+
 function Invoke-PlanAttempt {
   param(
     [Parameter(Mandatory = $true)][string]$InputPath,
@@ -4017,27 +4548,48 @@ function Invoke-PlanAttempt {
   $tempOut = Get-PlanAttemptOutputPath -Plan $Plan -TempDir $TempDir -Attempt $Attempt
   $twoPass = ($Plan.Mode -ne "Fast")
   $size = Encode-Plan -InputPath $InputPath -OutputPath $tempOut -Plan $Plan -TempDir $TempDir -TwoPass $twoPass -PassLogPath $PassLogPath
-  $ratio = $size / [double]$Plan.TargetBytes
+  $hardCapBytes = [long](Get-ObjectPropertyValue -Object $Plan -Name "HardCapBytes" -DefaultValue $Plan.TargetBytes)
+  $ratio = $size / [double]$hardCapBytes
   $predictedTotalBytes = [long](Get-ObjectPropertyValue -Object $Plan -Name "PredictedTotalBytes" -DefaultValue $Plan.TargetBytes)
   $predictionBias = if ($predictedTotalBytes -gt 0) { [double]$size / [double]$predictedTotalBytes } else { $ratio }
+  $metricResult = $null
+  if ($size -le $hardCapBytes -and (Get-NormalizedOptionValue -Value ([string](Get-ObjectPropertyValue -Object $Plan -Name "MetricModeUsed" -DefaultValue "off")) -DefaultValue "off") -ne "off") {
+    $metricResult = Invoke-FinalOutputMetric -InputPath $InputPath -OutputPath $tempOut -Plan $Plan -TempDir $TempDir
+  }
+
+  $resultPlan = $Plan.PSObject.Copy()
+  if ($metricResult) {
+    $resultPlan | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string]$metricResult.MetricModeUsed) -Force
+    $resultPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $metricResult -Name "MetricScore" -DefaultValue $null) -Force
+    $resultPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $metricResult -Name "WorstMetricScore" -DefaultValue $null) -Force
+    $resultPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $metricResult -Name "MetricConfidence" -DefaultValue 0.0)) -Force
+  }
+  $metricSegmentScores = if ($metricResult) { @((Get-ObjectPropertyValue -Object $metricResult -Name "SegmentScores" -DefaultValue @())) } else { @() }
 
   Write-Host ("Plan try {0}: {1}x{2} @{3}fps | v={4}k | a={5} | size={6} bytes ({7:P1})" -f $Attempt, $Plan.Width, $Plan.Height, $Plan.Fps, $Plan.VideoKbps, $Plan.AudioPlan.Label, $size, $ratio)
 
-  if ($size -gt $Plan.TargetBytes) {
+  if ($size -gt $hardCapBytes) {
     if ($tempOut -and (Test-Path $tempOut)) {
       Remove-Item $tempOut -Force -ErrorAction SilentlyContinue
     }
   }
 
-  return [PSCustomObject]@{
-    Success        = ($size -le $Plan.TargetBytes)
+  $attemptResult = [PSCustomObject]@{
+    Success        = ($size -le $hardCapBytes)
     SizeBytes      = [long]$size
-    Path           = if ($size -le $Plan.TargetBytes) { $tempOut } else { $null }
-    Plan           = $Plan.PSObject.Copy()
+    Path           = if ($size -le $hardCapBytes) { $tempOut } else { $null }
+    Plan           = $resultPlan
     Ratio          = [double]$ratio
     Attempt        = [int]$Attempt
     PredictionBias = [double]$predictionBias
+    MetricModeUsed = [string](Get-ObjectPropertyValue -Object $resultPlan -Name "MetricModeUsed" -DefaultValue "off")
+    MetricScore = (Get-ObjectPropertyValue -Object $resultPlan -Name "MetricScore" -DefaultValue $null)
+    WorstMetricScore = (Get-ObjectPropertyValue -Object $resultPlan -Name "WorstMetricScore" -DefaultValue $null)
+    MetricConfidence = [double](Get-ObjectPropertyValue -Object $resultPlan -Name "MetricConfidence" -DefaultValue 0.0)
+    MetricSegmentScores = @($metricSegmentScores)
   }
+  Write-PlanLogRecord -RecordType "plan_attempt" -Data (Get-OutcomeRecord -Result $attemptResult)
+  return $attemptResult
 }
 
 function Get-RetryPlanFromResult {
@@ -4061,9 +4613,10 @@ function Get-RetryPlanFromResult {
     }
   }
 
+  $hardCapBytes = [long](Get-ObjectPropertyValue -Object $Plan -Name "HardCapBytes" -DefaultValue $Plan.TargetBytes)
   $newRate = Get-NextVideoKbpsGuess `
     -Mode $Plan.Mode `
-    -TargetBytes $Plan.TargetBytes `
+    -TargetBytes $hardCapBytes `
     -CurrentVideoKbps $Plan.VideoKbps `
     -CurrentSizeBytes $Result.SizeBytes `
     -LowerBound $lowerBound `
@@ -4075,7 +4628,7 @@ function Get-RetryPlanFromResult {
 
   $retryPlan = Apply-SizeCalibrationToPlan -Plan $Plan -Calibration (Get-ObservedSizeCalibration -ReferenceResult $Result)
   $retryPlan.VideoKbps = [int]$newRate
-  $retryPlan | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($Plan.TargetBytes * $Result.PredictionBias)) -Force
+  $retryPlan | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($hardCapBytes * $Result.PredictionBias)) -Force
   $retryPlan | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$Result.Ratio) -Force
   return $retryPlan
 }
@@ -4298,7 +4851,8 @@ function Get-CalibratedFallbackPlan {
   )
 
   $strategy = Get-ModeStrategy -Mode $CandidatePlan.Mode -Duration $CandidatePlan.DurationSeconds
-  $desiredBytes = [math]::Floor($CandidatePlan.TargetBytes * $strategy.CloseEnoughRatio)
+  $candidateHardCap = [long](Get-ObjectPropertyValue -Object $CandidatePlan -Name "HardCapBytes" -DefaultValue $CandidatePlan.TargetBytes)
+  $desiredBytes = [math]::Floor($candidateHardCap * $strategy.CloseEnoughRatio)
   $factor = [double]$desiredBytes / [double][math]::Max(1, $ReferenceResult.SizeBytes)
 
   if ($ReferenceResult.Ratio -le 1.0) {
@@ -4318,7 +4872,7 @@ function Get-CalibratedFallbackPlan {
 
   $planCopy = Apply-SizeCalibrationToPlan -Plan $CandidatePlan -Calibration (Get-ObservedSizeCalibration -ReferenceResult $ReferenceResult)
   $planCopy.VideoKbps = [int][math]::Max(35, [math]::Floor($CandidatePlan.VideoKbps * $factor))
-  $planCopy | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($CandidatePlan.TargetBytes * $ReferenceResult.PredictionBias)) -Force
+  $planCopy | Add-Member -NotePropertyName PredictedTotalBytes -NotePropertyValue ([long][math]::Floor($candidateHardCap * $ReferenceResult.PredictionBias)) -Force
   $planCopy | Add-Member -NotePropertyName PredictedFillRatio -NotePropertyValue ([double]$ReferenceResult.Ratio) -Force
   return $planCopy
 }
@@ -4886,18 +5440,106 @@ function Get-PlanPreferenceTuple {
     [Parameter(Mandatory = $true)]$Result
   )
 
+  return (Get-QualityPreferenceTuple -Result $Result -EligibilityKind "Final")
+}
+
+function Get-PreviewEligibilityClass {
+  param([Parameter(Mandatory = $true)]$Result)
+
+  $ratio = [double](Get-ObjectPropertyValue -Object $Result -Name "Ratio" -DefaultValue 0.0)
+  if ($ratio -gt 1.0) {
+    return [PSCustomObject]@{ Name = "OverCap"; Rank = 0; Ratio = $ratio }
+  }
+  if ($ratio -ge 0.96) {
+    return [PSCustomObject]@{ Name = "Eligible"; Rank = 2; Ratio = $ratio }
+  }
+  return [PSCustomObject]@{ Name = "Underfilled"; Rank = 1; Ratio = $ratio }
+}
+
+function Get-FinalEligibilityClass {
+  param([Parameter(Mandatory = $true)]$Result)
+
+  $ratio = [double](Get-ObjectPropertyValue -Object $Result -Name "Ratio" -DefaultValue 0.0)
+  $success = [bool](Get-ObjectPropertyValue -Object $Result -Name "Success" -DefaultValue $false)
+  if (-not $success -or $ratio -gt 1.0) {
+    return [PSCustomObject]@{ Name = "OverCap"; Rank = 0; Ratio = $ratio }
+  }
+  if ($ratio -ge 0.96) {
+    return [PSCustomObject]@{ Name = "Eligible"; Rank = 2; Ratio = $ratio }
+  }
+  return [PSCustomObject]@{ Name = "Underfilled"; Rank = 1; Ratio = $ratio }
+}
+
+function Get-MetricNoiseBand {
+  param([AllowEmptyString()][string]$MetricMode)
+
+  switch ((Get-NormalizedOptionValue -Value $MetricMode -DefaultValue "off")) {
+    "vmaf"  { return 0.50 }
+    "xpsnr" { return 0.25 }
+    default { return [double]::PositiveInfinity }
+  }
+}
+
+function Get-MetricMaterialityThreshold {
+  param([AllowEmptyString()][string]$MetricMode)
+
+  switch ((Get-NormalizedOptionValue -Value $MetricMode -DefaultValue "off")) {
+    "vmaf"  { return 1.00 }
+    "xpsnr" { return 0.50 }
+    default { return [double]::PositiveInfinity }
+  }
+}
+
+function Get-MetricQualitySummary {
+  param([Parameter(Mandatory = $true)]$Result)
+
   $plan = $Result.Plan
+  $mode = Get-NormalizedOptionValue -Value ([string](Get-ObjectPropertyValue -Object $Result -Name "MetricModeUsed" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricModeUsed" -DefaultValue "off"))) -DefaultValue "off"
+  $mean = Get-ObjectPropertyValue -Object $Result -Name "MetricScore" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricScore" -DefaultValue $null)
+  $worst = Get-ObjectPropertyValue -Object $Result -Name "WorstMetricScore" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "WorstMetricScore" -DefaultValue $mean)
+  $confidence = [double](Get-ObjectPropertyValue -Object $Result -Name "MetricConfidence" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricConfidence" -DefaultValue 0.0))
+  $available = ($mode -in @("vmaf", "xpsnr") -and $null -ne $mean)
+  if (-not $available) {
+    return [PSCustomObject]@{ Available = $false; Mode = $mode; Mean = $null; Worst = $null; Composite = $null; Confidence = 0.0; NoiseBand = [double]::PositiveInfinity }
+  }
+
+  $meanValue = [double]$mean
+  $worstValue = if ($null -ne $worst) { [double]$worst } else { $meanValue }
+  $tailPenalty = [math]::Max(0.0, $meanValue - $worstValue) * 0.35
+  return [PSCustomObject]@{
+    Available = $true
+    Mode = $mode
+    Mean = $meanValue
+    Worst = $worstValue
+    Composite = ($meanValue - $tailPenalty)
+    Confidence = $confidence
+    NoiseBand = Get-MetricNoiseBand -MetricMode $mode
+  }
+}
+
+function Get-QualityPreferenceTuple {
+  param(
+    [Parameter(Mandatory = $true)]$Result,
+    [ValidateSet("Preview", "Final")][string]$EligibilityKind = "Final"
+  )
+
+  $plan = $Result.Plan
+  $eligibility = if ($EligibilityKind -eq "Preview") { Get-PreviewEligibilityClass -Result $Result } else { Get-FinalEligibilityClass -Result $Result }
+  $quality = Get-MetricQualitySummary -Result $Result
   $audioRank = if ($plan.AudioPlan -and $plan.AudioPlan.Rank) { [int]$plan.AudioPlan.Rank } else { 0 }
   $fillScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs(1.0 - $Result.Ratio) * 1000)))
   $widthFitScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs([math]::Log([math]::Max(0.001, $plan.WidthRatio))) * 1000)))
   $previewRank = [int](Get-ObjectPropertyValue -Object $plan -Name "PreviewRank" -DefaultValue 1)
   $previewRankScore = [int](1000 - [math]::Min(999, (($previewRank - 1) * 100)))
-  $metricScore = Get-NormalizedMetricPreferenceScore -Result $Result
-  $metricConfidence = [int][math]::Round([double](Get-ObjectPropertyValue -Object $Result -Name "MetricConfidence" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricConfidence" -DefaultValue 0.0)) * 1000.0)
+  $metricScale = if ($quality.Mode -eq "xpsnr") { 20.0 } else { 10.0 }
+  $metricScore = if ($quality.Available) { [int][math]::Round([double]$quality.Composite * $metricScale) } else { 0 }
+  $worstMetricScore = if ($quality.Available) { [int][math]::Round([double]$quality.Worst * $metricScale) } else { 0 }
+  $metricConfidence = [int][math]::Round([double]$quality.Confidence * 1000.0)
 
   switch ($plan.Mode) {
     "Fast" {
       return @(
+        [int]$eligibility.Rank,
         [int]$plan.Fps,
         $fillScore,
         [int]$audioRank,
@@ -4909,31 +5551,37 @@ function Get-PlanPreferenceTuple {
 
     "Balanced" {
       return @(
-        $previewRankScore,
-        $fillScore,
-        $metricScore,
+        [int]$eligibility.Rank,
+        [int][bool]$quality.Available,
         $metricConfidence,
+        $metricScore,
+        $worstMetricScore,
         [int]$audioRank,
+        $fillScore,
         $widthFitScore,
         [int]$plan.Fps,
         [int]$plan.Width,
-        [int]$plan.VideoKbps
+        [int]$plan.VideoKbps,
+        $previewRankScore
       )
     }
 
     "ExtraQuality" {
       $presetRank = Get-X264PresetRank -preset $plan.Preset
       return @(
-        $previewRankScore,
-        $fillScore,
-        $metricScore,
+        [int]$eligibility.Rank,
+        [int][bool]$quality.Available,
         $metricConfidence,
+        $metricScore,
+        $worstMetricScore,
         [int]$audioRank,
+        $fillScore,
         $widthFitScore,
         [int]$plan.Fps,
         [int]$plan.Width,
         [int]$plan.VideoKbps,
-        [int]$presetRank
+        [int]$presetRank,
+        $previewRankScore
       )
     }
   }
@@ -4944,55 +5592,101 @@ function Get-PreviewPreferenceTuple {
     [Parameter(Mandatory = $true)]$Result
   )
 
-  $plan = $Result.Plan
-  $audioRank = if ($plan.AudioPlan -and $plan.AudioPlan.Rank) { [int]$plan.AudioPlan.Rank } else { 0 }
-  $fillScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs(1.0 - $Result.Ratio) * 1000)))
-  $widthFitScore = [int](1000 - [math]::Min(999, [math]::Round([math]::Abs([math]::Log([math]::Max(0.001, $plan.WidthRatio))) * 1000)))
-  $metricScore = Get-NormalizedMetricPreferenceScore -Result $Result
-  $metricConfidence = [int][math]::Round([double](Get-ObjectPropertyValue -Object $Result -Name "MetricConfidence" -DefaultValue 0.0) * 1000.0)
+  return (Get-QualityPreferenceTuple -Result $Result -EligibilityKind "Preview")
+}
 
-  switch ($plan.Mode) {
-    "Fast" {
-      return @(
-        [int]$plan.Fps,
-        $fillScore,
-        [int]$audioRank,
-        $widthFitScore,
-        [int]$plan.Width,
-        [int]$plan.VideoKbps
-      )
+function Test-UnderfillQualityOverride {
+  param(
+    [Parameter(Mandatory = $true)]$Underfilled,
+    [Parameter(Mandatory = $true)]$Eligible
+  )
+
+  $underQuality = Get-MetricQualitySummary -Result $Underfilled
+  $eligibleQuality = Get-MetricQualitySummary -Result $Eligible
+  if (-not $underQuality.Available -or -not $eligibleQuality.Available -or $underQuality.Mode -ne $eligibleQuality.Mode) {
+    return $false
+  }
+  $underRatio = [double](Get-ObjectPropertyValue -Object $Underfilled -Name "Ratio" -DefaultValue 0.0)
+  $underfillScale = if ($underQuality.Mode -eq "vmaf") { 10.0 } else { 5.0 }
+  $extraUnderfillPenalty = [math]::Max(0.0, 0.96 - $underRatio) * $underfillScale
+  $requiredAdvantage = (Get-MetricMaterialityThreshold -MetricMode $underQuality.Mode) + $extraUnderfillPenalty
+  return (([double]$underQuality.Composite - [double]$eligibleQuality.Composite) -ge $requiredAdvantage)
+}
+
+function Compare-QualityResults {
+  param(
+    [Parameter(Mandatory = $true)]$Candidate,
+    [Parameter(Mandatory = $true)]$Current,
+    [ValidateSet("Preview", "Final")][string]$EligibilityKind
+  )
+
+  $candidatePlan = $Candidate.Plan
+  if ($candidatePlan.Mode -eq "Fast") {
+    $candidateTuple = Get-QualityPreferenceTuple -Result $Candidate -EligibilityKind $EligibilityKind
+    $currentTuple = Get-QualityPreferenceTuple -Result $Current -EligibilityKind $EligibilityKind
+    for ($i = 0; $i -lt $candidateTuple.Count; $i++) {
+      if ($candidateTuple[$i] -gt $currentTuple[$i]) { return [PSCustomObject]@{ Better = $true; DecidedBy = "fast_tuple_$i"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple } }
+      if ($candidateTuple[$i] -lt $currentTuple[$i]) { return [PSCustomObject]@{ Better = $false; DecidedBy = "fast_tuple_$i"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple } }
     }
+    return [PSCustomObject]@{ Better = $false; DecidedBy = "stable_tie"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple }
+  }
 
-    "Balanced" {
-      return @(
-        $fillScore,
-        $metricScore,
-        $metricConfidence,
-        [int]$audioRank,
-        $widthFitScore,
-        [int]$plan.Fps,
-        [int]$plan.Width,
-        [int]$plan.VideoKbps,
-        [int]$plan.Score
-      )
+  $candidateEligibility = if ($EligibilityKind -eq "Preview") { Get-PreviewEligibilityClass -Result $Candidate } else { Get-FinalEligibilityClass -Result $Candidate }
+  $currentEligibility = if ($EligibilityKind -eq "Preview") { Get-PreviewEligibilityClass -Result $Current } else { Get-FinalEligibilityClass -Result $Current }
+
+  if ($candidateEligibility.Name -eq "OverCap" -and $currentEligibility.Name -ne "OverCap") {
+    return [PSCustomObject]@{ Better = $false; DecidedBy = "eligibility"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+  }
+  if ($currentEligibility.Name -eq "OverCap" -and $candidateEligibility.Name -ne "OverCap") {
+    return [PSCustomObject]@{ Better = $true; DecidedBy = "eligibility"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+  }
+  if ($candidateEligibility.Name -ne $currentEligibility.Name) {
+    if ($candidateEligibility.Name -eq "Underfilled" -and $currentEligibility.Name -eq "Eligible") {
+      $override = Test-UnderfillQualityOverride -Underfilled $Candidate -Eligible $Current
+      return [PSCustomObject]@{ Better = [bool]$override; DecidedBy = if ($override) { "underfill_material_quality" } else { "eligibility" }; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
     }
-
-    "ExtraQuality" {
-      $presetRank = Get-X264PresetRank -preset $plan.Preset
-      return @(
-        $fillScore,
-        $metricScore,
-        $metricConfidence,
-        [int]$audioRank,
-        $widthFitScore,
-        [int]$plan.Fps,
-        [int]$plan.Width,
-        [int]$plan.VideoKbps,
-        [int]$plan.Score,
-        [int]$presetRank
-      )
+    if ($candidateEligibility.Name -eq "Eligible" -and $currentEligibility.Name -eq "Underfilled") {
+      $keepUnderfilled = Test-UnderfillQualityOverride -Underfilled $Current -Eligible $Candidate
+      return [PSCustomObject]@{ Better = (-not $keepUnderfilled); DecidedBy = if ($keepUnderfilled) { "underfill_material_quality" } else { "eligibility" }; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
     }
   }
+
+  $candidateQuality = Get-MetricQualitySummary -Result $Candidate
+  $currentQuality = Get-MetricQualitySummary -Result $Current
+  if ($candidateQuality.Available -ne $currentQuality.Available) {
+    return [PSCustomObject]@{ Better = [bool]$candidateQuality.Available; DecidedBy = "metric_availability"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+  }
+
+  if ($candidateQuality.Available -and $candidateQuality.Mode -eq $currentQuality.Mode) {
+    $confidenceDelta = [double]$candidateQuality.Confidence - [double]$currentQuality.Confidence
+    if ([math]::Abs($confidenceDelta) -ge 0.10) {
+      return [PSCustomObject]@{ Better = ($confidenceDelta -gt 0); DecidedBy = "metric_confidence"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+    }
+    $qualityDelta = [double]$candidateQuality.Composite - [double]$currentQuality.Composite
+    if ([math]::Abs($qualityDelta) -gt [double]$candidateQuality.NoiseBand) {
+      return [PSCustomObject]@{ Better = ($qualityDelta -gt 0); DecidedBy = "perceptual_quality"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+    }
+  }
+
+  $candidateAudio = [int](Get-ObjectPropertyValue -Object $Candidate.Plan.AudioPlan -Name "Rank" -DefaultValue 0)
+  $currentAudio = [int](Get-ObjectPropertyValue -Object $Current.Plan.AudioPlan -Name "Rank" -DefaultValue 0)
+  if ($candidateAudio -ne $currentAudio) {
+    return [PSCustomObject]@{ Better = ($candidateAudio -gt $currentAudio); DecidedBy = "audio_rank"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+  }
+
+  $candidateFill = [math]::Abs(1.0 - [double]$Candidate.Ratio)
+  $currentFill = [math]::Abs(1.0 - [double]$Current.Ratio)
+  if ([math]::Abs($candidateFill - $currentFill) -gt 0.000001) {
+    return [PSCustomObject]@{ Better = ($candidateFill -lt $currentFill); DecidedBy = "fill_within_quality_neighborhood"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+  }
+
+  $candidateTuple = Get-QualityPreferenceTuple -Result $Candidate -EligibilityKind $EligibilityKind
+  $currentTuple = Get-QualityPreferenceTuple -Result $Current -EligibilityKind $EligibilityKind
+  for ($i = 7; $i -lt $candidateTuple.Count; $i++) {
+    if ($candidateTuple[$i] -gt $currentTuple[$i]) { return [PSCustomObject]@{ Better = $true; DecidedBy = "late_tiebreak_$i"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple } }
+    if ($candidateTuple[$i] -lt $currentTuple[$i]) { return [PSCustomObject]@{ Better = $false; DecidedBy = "late_tiebreak_$i"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple } }
+  }
+  return [PSCustomObject]@{ Better = $false; DecidedBy = "stable_tie"; CandidateTuple = $candidateTuple; CurrentTuple = $currentTuple }
 }
 
 function Test-IsBetterPreviewResult {
@@ -5001,15 +5695,9 @@ function Test-IsBetterPreviewResult {
     [Parameter(Mandatory = $true)]$Current
   )
 
-  $candTuple = Get-PreviewPreferenceTuple -Result $Candidate
-  $currTuple = Get-PreviewPreferenceTuple -Result $Current
-
-  for ($i = 0; $i -lt $candTuple.Count; $i++) {
-    if ($candTuple[$i] -gt $currTuple[$i]) { return $true }
-    if ($candTuple[$i] -lt $currTuple[$i]) { return $false }
-  }
-
-  return $false
+  $comparison = Compare-QualityResults -Candidate $Candidate -Current $Current -EligibilityKind "Preview"
+  Write-PlanLogRecord -RecordType "selection_comparison" -Data ([PSCustomObject]@{ Kind = "preview"; DecidedBy = $comparison.DecidedBy; CandidateTuple = $comparison.CandidateTuple; CurrentTuple = $comparison.CurrentTuple; CandidatePlanKey = (Get-PlanKey -Plan $Candidate.Plan); CurrentPlanKey = (Get-PlanKey -Plan $Current.Plan) })
+  return [bool]$comparison.Better
 }
 
 function Test-IsBetterResult {
@@ -5018,15 +5706,9 @@ function Test-IsBetterResult {
     [Parameter(Mandatory = $true)]$Current
   )
 
-  $candTuple = Get-PlanPreferenceTuple -Result $Candidate
-  $currTuple = Get-PlanPreferenceTuple -Result $Current
-
-  for ($i = 0; $i -lt $candTuple.Count; $i++) {
-    if ($candTuple[$i] -gt $currTuple[$i]) { return $true }
-    if ($candTuple[$i] -lt $currTuple[$i]) { return $false }
-  }
-
-  return $false
+  $comparison = Compare-QualityResults -Candidate $Candidate -Current $Current -EligibilityKind "Final"
+  Write-PlanLogRecord -RecordType "selection_comparison" -Data ([PSCustomObject]@{ Kind = "final"; DecidedBy = $comparison.DecidedBy; CandidateTuple = $comparison.CandidateTuple; CurrentTuple = $comparison.CurrentTuple; CandidatePlanKey = (Get-PlanKey -Plan $Candidate.Plan); CurrentPlanKey = (Get-PlanKey -Plan $Current.Plan) })
+  return [bool]$comparison.Better
 }
 
 function Update-BestResult {
@@ -5363,6 +6045,10 @@ function Get-BestResult {
   return $result
 }
 
+if ($env:COMPRESS_INTERNAL_TEST_MODE -eq "1") {
+  return
+}
+
 Require-Tool "ffmpeg"
 Require-Tool "ffprobe"
 Assert-TargetArguments
@@ -5378,7 +6064,9 @@ if ([string]::IsNullOrWhiteSpace($Preset)) {
 }
 
 $info = Get-ProbeInfo -path $inputFull
+Assert-SdrInputSupported -Info $info
 $targetRequestBytes = Get-RequestedTargetBytes
+$script:RequestedHardCapBytes = [long]$targetRequestBytes
 $hasExplicitTarget = ($null -ne $targetRequestBytes)
 $usableTargetBytes = if ($hasExplicitTarget) { [long][math]::Floor($targetRequestBytes * $SafetyMarginPercent) } else { 0L }
 $totalKbps = if ($hasExplicitTarget) { (($usableTargetBytes * 8.0) / $info.Duration) / 1000.0 } else { 0.0 }
@@ -5441,6 +6129,9 @@ Write-PlanLogRecord -RecordType "job_start" -Data ([PSCustomObject]@{
     MetricMaxSamples     = $MetricMaxSamples
     CropMode             = $CropMode
     PreprocessProfile    = $PreprocessProfile
+    VbvMode              = $VbvMode
+    OutputBitDepth       = $OutputBitDepth
+    SourceTechnicalMetadata = $info
   })
 
 Write-Host "Input:            $inputFull"
@@ -5448,6 +6139,10 @@ Write-Host "Duration:         $([math]::Round($info.Duration, 2)) s"
 Write-Host "Source:           $($info.Width)x$($info.Height) @ $([math]::Round($info.Fps, 3)) fps"
 Write-Host "Planning frame:   $(Get-PlanningWidth -Info $info)x$(Get-PlanningHeight -Info $info)"
 Write-Host "Source codec:     $($info.VideoCodec)"
+Write-Host "Source pixel fmt: $($info.PixelFormat) ($($info.VideoBitDepth)-bit)"
+Write-Host "Source color:     range=$($info.ColorRange), primaries=$($info.ColorPrimaries), transfer=$($info.ColorTransfer), matrix=$($info.ColorSpace)"
+Write-Host "Source geometry:  SAR=$($info.SampleAspectRatio), DAR=$($info.DisplayAspectRatio), rotation=$($info.Rotation)"
+Write-Host "HDR policy:       $($info.HdrClassification) ($($info.HdrReason))"
 Write-Host "Video bitrate:    $(if ($info.VideoBitrateKbps) { "$($info.VideoBitrateKbps) kbps" } else { 'unknown' })"
 Write-Host "Audio codec:      $(if ($info.HasAudio) { $info.AudioCodec } else { 'none' })"
 Write-Host "Audio bitrate:    $(if ($info.AudioBitrateKbps) { "$($info.AudioBitrateKbps) kbps" } else { 'unknown' })"
@@ -5474,6 +6169,8 @@ Write-Host "Preset:           $Preset"
 Write-Host "Crop mode:        $CropMode"
 Write-Host "Crop detect:      $(Get-CropSummary -Info $info)"
 Write-Host "Preprocess:       $PreprocessProfile"
+Write-Host "VBV mode:         $VbvMode"
+Write-Host "Output bit depth: $OutputBitDepth"
 Write-Host "Codec reason:     $($policyProfile.CodecPolicyReason)"
 Write-Host "Container reason: $($policyProfile.ContainerPolicyReason)"
 if ($EnablePlanLogging) {
@@ -5535,6 +6232,13 @@ try {
   }
 
   $winner.SizeBytes = Finalize-OutputFile -InputPath $winner.Path -OutputPath $OutputFile -CodecProfile $codecProfile
+  try {
+    $winner.SizeBytes = Assert-FinalOutputWithinCap -Path $OutputFile -HardCapBytes ([long]$targetRequestBytes)
+  }
+  catch {
+    Remove-Item -LiteralPath $OutputFile -Force -ErrorAction SilentlyContinue
+    throw
+  }
   Write-PlanLogRecord -RecordType "final_output" -Data (Get-OutcomeRecord -Result $winner)
 
   Write-Host ""
@@ -5550,6 +6254,9 @@ try {
   Write-Host "Chosen CRF:       $($winner.Plan.Crf)"
   Write-Host "Chosen audio:     $($winner.Plan.AudioPlan.Label)"
   Write-Host "Chosen preset:    $($winner.Plan.Preset)"
+  Write-Host "Pixel format:     $($winner.Plan.OutputPixelFormat)"
+  Write-Host "VBV mode:         $($winner.Plan.VbvMode)"
+  Write-Host "VBV max/buffer:   $(if ($winner.Plan.VbvMode -eq 'Streaming') { "$($winner.Plan.MaxrateKbps)k / $($winner.Plan.BufsizeKbits)k" } else { '(off)' })"
   Write-Host "Width origin:     $($winner.Plan.WidthOrigin)"
   Write-Host "Crop state:       $($winner.Plan.CropSummary)"
   Write-Host "Preprocess:       $($winner.Plan.PreprocessLabel)"
@@ -5561,7 +6268,10 @@ try {
   Write-Host "Resolution bias:  $($winner.Plan.ResolutionBiasLabel)"
   Write-Host "Predicted bpppf:  $('{0:N4}' -f $winner.Plan.Bpppf)"
   Write-Host "Video args:       $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VideoPrivateArgs)) { '(default)' } else { $winner.Plan.VideoPrivateArgs })"
-  Write-Host "Video filter:     $(if ([string]::IsNullOrWhiteSpace($winner.Plan.VFilter)) { '(none)' } else { $winner.Plan.VFilter })"
+  Write-Host "Geometry filter:  $(if ([string]::IsNullOrWhiteSpace($winner.Plan.GeometryVFilter)) { '(none)' } else { $winner.Plan.GeometryVFilter })"
+  Write-Host "Preprocess filt:  $(if ([string]::IsNullOrWhiteSpace($winner.Plan.PreprocessVFilter)) { '(none)' } else { $winner.Plan.PreprocessVFilter })"
+  Write-Host "Encode filter:    $(if ([string]::IsNullOrWhiteSpace($winner.Plan.EncodeVFilter)) { '(none)' } else { $winner.Plan.EncodeVFilter })"
+  Write-Host "Metric ref filt:  $(if ([string]::IsNullOrWhiteSpace($winner.Plan.MetricReferenceVFilter)) { '(none)' } else { $winner.Plan.MetricReferenceVFilter })"
   if ($winner.SearchStats) {
     Write-Host "Probe samples:    $($winner.SearchStats.ProbeSamplesUsed)"
     Write-Host "Previews run:     $($winner.SearchStats.PreviewsRun)"
