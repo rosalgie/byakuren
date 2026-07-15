@@ -11,6 +11,8 @@ namespace Byakuren.Metrics;
 
 public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
 {
+    private readonly Dictionary<string, MotionRegion?> motionRegionCache = new(StringComparer.Ordinal);
+
     public static string ReferenceFilter(CanonicalCanvas canvas) =>
         $"setsar=1,scale={canvas.Width}:{canvas.Height}:flags=lanczos,fps={Number(canvas.Fps)}:round=near,format={canvas.PixelFormat}";
 
@@ -59,6 +61,9 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         foreach (SampleWindow window in windows)
         {
             double duration = Math.Min(window.DurationSeconds, Math.Max(0.25, media.DurationSeconds - window.StartSeconds));
+            MotionRegion? motionRegion = distortedIsPreview
+                ? await ResolveMotionRegionAsync(request, media, plan, window.StartSeconds, duration, cancellationToken).ConfigureAwait(false)
+                : null;
             double? vmafNeg = null;
             double? standardVMAF = null;
             double? xpsnr = null;
@@ -66,8 +71,15 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
             if (mode is MetricMode.VMAF or MetricMode.Ensemble)
             {
                 (vmafNeg, standardVMAF, string? error) = await RunVMAFAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, distortedIsPreview, cancellationToken).ConfigureAwait(false);
-                if (standardVMAF.HasValue) standardScores.Add(standardVMAF.Value);
                 if (!string.IsNullOrWhiteSpace(error)) errors.Add(error);
+                if (motionRegion is not null)
+                {
+                    (double? regionVMAFNeg, double? regionStandardVMAF, string? regionError) = await RunVMAFAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index + 1000, distortedIsPreview, cancellationToken, motionRegion).ConfigureAwait(false);
+                    vmafNeg = Blend(vmafNeg, regionVMAFNeg);
+                    standardVMAF = Blend(standardVMAF, regionStandardVMAF);
+                    if (!string.IsNullOrWhiteSpace(regionError) && !vmafNeg.HasValue) errors.Add(regionError);
+                }
+                if (standardVMAF.HasValue) standardScores.Add(standardVMAF.Value);
                 if (collectCAMBI)
                 {
                     (cambi, string? cambiError) = await RunCAMBIAsync(request, media, plan, outputPath, tempDirectory, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, index, distortedIsPreview, cancellationToken).ConfigureAwait(false);
@@ -78,6 +90,12 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
             {
                 (xpsnr, string? error) = await RunXPSNRAsync(request, media, plan, outputPath, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, distortedIsPreview, cancellationToken).ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(error)) errors.Add(error);
+                if (motionRegion is not null)
+                {
+                    (double? regionXPSNR, string? regionError) = await RunXPSNRAsync(request, media, plan, outputPath, window.StartSeconds, distortedIsPreview ? 0 : window.StartSeconds, duration, distortedIsPreview, cancellationToken, motionRegion).ConfigureAwait(false);
+                    xpsnr = Blend(xpsnr, regionXPSNR);
+                    if (!string.IsNullOrWhiteSpace(regionError) && !xpsnr.HasValue) errors.Add(regionError);
+                }
             }
             metricWindows.Add(new MetricWindow(index++, window.StartSeconds, window.StartSeconds + duration, vmafNeg, xpsnr, cambi));
         }
@@ -115,10 +133,11 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         double duration,
         int index,
         bool selectionTimeline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        MotionRegion? motionRegion = null)
     {
         string logPath = Path.Combine(tempDirectory, $"vmaf-{Guid.NewGuid():N}-{index}.json");
-        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline);
+        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline, motionRegion);
         string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];" +
                         $"[dist][ref]libvmaf=log_fmt=json:log_path='{EscapeFilterPath(logPath)}':model='version=vmaf_v0.6.1neg\\:name=vmaf_neg|version=vmaf_v0.6.1\\:name=vmaf'";
         ProcessResult result = await runner.RunAsync(request.FFmpegPath,
@@ -148,9 +167,10 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         double distortedStart,
         double duration,
         bool selectionTimeline,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        MotionRegion? motionRegion = null)
     {
-        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline);
+        (string referenceFilter, string distortedFilter) = MetricFilters(plan, selectionTimeline, motionRegion);
         string filter = $"[0:v]{referenceFilter},setpts=PTS-STARTPTS[ref];[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];[dist][ref]xpsnr=stats_file=-";
         ProcessResult result = await runner.RunAsync(request.FFmpegPath,
         [
@@ -215,25 +235,78 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         return source.Take(maxSamples).Select(window => window with { DurationSeconds = Math.Min(window.DurationSeconds, sampleSeconds) }).ToArray();
     }
 
-    private static (string Reference, string Distorted) MetricFilters(CompressionPlan plan, bool selectionTimeline)
+    private async Task<MotionRegion?> ResolveMotionRegionAsync(
+        CompressionRequest request,
+        MediaInfo media,
+        CompressionPlan plan,
+        double startSeconds,
+        double durationSeconds,
+        CancellationToken cancellationToken)
     {
+        string crop = plan.CropAnalysis?.Filter ?? "";
+        string key = $"{media.Path}|{startSeconds:0.###}|{durationSeconds:0.###}|{crop}";
+        if (motionRegionCache.TryGetValue(key, out MotionRegion? cached)) return cached;
+
+        MotionRegion? best = null;
+        double probeDuration = Math.Min(2, durationSeconds);
+        for (int row = 0; row < 3; row++)
+        {
+            for (int column = 0; column < 3; column++)
+            {
+                string tile = $"scale=384:216:flags=bilinear,fps=8,crop=128:72:{column * 128}:{row * 72},signalstats,metadata=print:file=-";
+                string filter = string.Join(',', new[] { crop, tile }.Where(value => !string.IsNullOrWhiteSpace(value)));
+                ProcessResult result = await runner.RunAsync(request.FFmpegPath,
+                [
+                    "-v", "error", "-ss", Number(startSeconds), "-t", Number(probeDuration), "-i", media.Path,
+                    "-vf", filter, "-an", "-sn", "-dn", "-f", "null", "-"
+                ], cancellationToken).ConfigureAwait(false);
+                if (result.ExitCode != 0) continue;
+                double[] differences = Regex.Matches(result.CombinedOutput, @"lavfi\.signalstats\.YDIF=(?<value>\d+(?:\.\d+)?)", RegexOptions.IgnoreCase)
+                    .Select(match => double.Parse(match.Groups["value"].Value, CultureInfo.InvariantCulture))
+                    .OrderBy(value => value)
+                    .ToArray();
+                if (differences.Length == 0) continue;
+                // Favor recurring or peak motion without letting a single noisy frame choose the tile.
+                int upperQuartile = Math.Clamp((int)Math.Floor(differences.Length * 0.75), 0, differences.Length - 1);
+                double score = differences[upperQuartile..].Average();
+                if (best is null || score > best.Score) best = new MotionRegion(row, column, score);
+            }
+        }
+
+        motionRegionCache[key] = best;
+        return best;
+    }
+
+    private static (string Reference, string Distorted) MetricFilters(CompressionPlan plan, bool selectionTimeline, MotionRegion? motionRegion = null)
+    {
+        (string reference, string distorted) filters;
         if (!selectionTimeline)
         {
             string canonicalReference = string.IsNullOrWhiteSpace(plan.MetricReferenceFilter)
                 ? ReferenceFilter(plan.CanonicalCanvas)
                 : plan.MetricReferenceFilter;
-            return (canonicalReference, DistortedFilter(plan.CanonicalCanvas));
+            filters = (canonicalReference, DistortedFilter(plan.CanonicalCanvas));
+        }
+        else
+        {
+            // Candidate selection measures spatial damage at the candidate cadence.
+            // Final reporting still uses the canonical source timeline above.
+            CanonicalCanvas selectionCanvas = plan.CanonicalCanvas with
+            {
+                Fps = Math.Min(plan.CanonicalCanvas.Fps, plan.Fps)
+            };
+            string crop = plan.CropAnalysis?.Filter ?? "";
+            string selectionReference = string.Join(',', new[] { crop, ReferenceFilter(selectionCanvas) }.Where(filter => !string.IsNullOrWhiteSpace(filter)));
+            filters = (selectionReference, DistortedFilter(selectionCanvas));
         }
 
-        // Candidate selection measures spatial damage at the candidate cadence.
-        // Final reporting still uses the canonical source timeline above.
-        CanonicalCanvas selectionCanvas = plan.CanonicalCanvas with
-        {
-            Fps = Math.Min(plan.CanonicalCanvas.Fps, plan.Fps)
-        };
-        string crop = plan.CropAnalysis?.Filter ?? "";
-        string selectionReference = string.Join(',', new[] { crop, ReferenceFilter(selectionCanvas) }.Where(filter => !string.IsNullOrWhiteSpace(filter)));
-        return (selectionReference, DistortedFilter(selectionCanvas));
+        if (motionRegion is null) return filters;
+        int tileWidth = Math.Max(2, plan.CanonicalCanvas.Width / 3 / 2 * 2);
+        int tileHeight = Math.Max(2, plan.CanonicalCanvas.Height / 3 / 2 * 2);
+        int x = Math.Min(plan.CanonicalCanvas.Width - tileWidth, motionRegion.Column * tileWidth);
+        int y = Math.Min(plan.CanonicalCanvas.Height - tileHeight, motionRegion.Row * tileHeight);
+        string regionCrop = $"crop={tileWidth}:{tileHeight}:{x}:{y}";
+        return ($"{filters.reference},{regionCrop}", $"{filters.distorted},{regionCrop}");
     }
 
     private static double? Mean(JsonElement pooled, string name) =>
@@ -241,8 +314,12 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
     private static double? Average(IEnumerable<double?> values) { double[] available = values.Where(value => value.HasValue).Select(value => value!.Value).ToArray(); return available.Length == 0 ? null : available.Average(); }
     private static double? Minimum(IEnumerable<double?> values) { double[] available = values.Where(value => value.HasValue).Select(value => value!.Value).ToArray(); return available.Length == 0 ? null : available.Min(); }
     private static double? Maximum(IEnumerable<double?> values) { double[] available = values.Where(value => value.HasValue).Select(value => value!.Value).ToArray(); return available.Length == 0 ? null : available.Max(); }
+    // Motion evidence influences preview selection only; final reporting remains whole-frame and canonical.
+    private static double? Blend(double? wholeFrame, double? motionRegion) => wholeFrame.HasValue && motionRegion.HasValue ? wholeFrame.Value * 0.65 + motionRegion.Value * 0.35 : wholeFrame ?? motionRegion;
     private static string Number(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
     private static string EscapeFilterPath(string value) => value.Replace("\\", "/").Replace(":", "\\:").Replace("'", "\\'");
     private static string? LastUsefulError(IEnumerable<string> errors) => errors.SelectMany(error => error.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries)).LastOrDefault()?.Trim();
     private static void TryDelete(string path) { try { File.Delete(path); } catch { } }
+
+    private sealed record MotionRegion(int Row, int Column, double Score);
 }

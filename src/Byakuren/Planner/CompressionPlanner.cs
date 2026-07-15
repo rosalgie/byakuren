@@ -110,7 +110,7 @@ public sealed class CompressionPlanner
                         bool lowMotion = complexity.MotionBucket is "VeryLow" or "Low";
                         double fpsWeight = request.Mode == CompressionMode.Fast || !lowMotion ? 80 : 8;
                         double gameplayMotionBonus = contentClass == "gameplay" && !lowMotion && fpsRetention > 0.99 ? 10 : 0;
-                        double spatialQuality = Math.Min(100, bpppf * 1000);
+                        double spatialQuality = SpatialQualityScore(request.Mode, complexity.DetailBucket, tunedProfile.VideoCodec, bpppf);
                         double heuristic = widthScore + fpsRetention * fpsWeight + spatialQuality + gameplayMotionBonus + audio.Plan.Rank * 0.35 + TuningBonus(tunedProfile, profile);
                         plans.Add(new CompressionPlan
                         {
@@ -172,6 +172,37 @@ public sealed class CompressionPlanner
         CompressionPlan[] ordered = candidates.OrderByDescending(plan => plan.HeuristicScore).ToArray();
         List<CompressionPlan> selected = [ordered[0]];
         HashSet<string> identities = new(StringComparer.Ordinal) { ordered[0].Identity };
+
+        if (limit > 1 && IsSpatiallyAtRisk(ordered[0]))
+        {
+            long primaryPixels = (long)ordered[0].Width * ordered[0].Height;
+            CompressionPlan? spatialSafety = ordered
+                .Where(candidate => !identities.Contains(candidate.Identity))
+                .Where(candidate => candidate.Profile.Backend == ordered[0].Profile.Backend)
+                .Where(candidate => Math.Abs(candidate.Fps - ordered[0].Fps) < 0.1)
+                .Where(candidate => (long)candidate.Width * candidate.Height <= primaryPixels * 0.75)
+                .OrderByDescending(candidate => candidate.HeuristicScore)
+                .FirstOrDefault();
+            if (spatialSafety is not null)
+            {
+                selected.Add(spatialSafety);
+                identities.Add(spatialSafety.Identity);
+            }
+        }
+
+        if (selected.Count == 1 && limit > 1)
+        {
+            CompressionPlan? meaningfulChallenger = ordered
+                .Where(candidate => !identities.Contains(candidate.Identity))
+                .Where(candidate => IsMeaningfullyDifferent(candidate, ordered[0]))
+                .OrderByDescending(candidate => candidate.HeuristicScore)
+                .FirstOrDefault();
+            if (meaningfulChallenger is not null)
+            {
+                selected.Add(meaningfulChallenger);
+                identities.Add(meaningfulChallenger.Identity);
+            }
+        }
 
         while (selected.Count < limit)
         {
@@ -327,6 +358,59 @@ public sealed class CompressionPlanner
         if (selected.All(plan => plan.Preprocess != candidate.Preprocess)) score += 40;
         if (selected.All(plan => !plan.Profile.PrivateArguments.SequenceEqual(candidate.Profile.PrivateArguments))) score += 20;
         return score;
+    }
+
+    private static bool IsMeaningfullyDifferent(CompressionPlan candidate, CompressionPlan primary)
+    {
+        if (candidate.Profile.Backend != primary.Profile.Backend) return true;
+        if (Math.Abs(candidate.Fps - primary.Fps) > 0.1) return true;
+        long candidatePixels = (long)candidate.Width * candidate.Height;
+        long primaryPixels = (long)primary.Width * primary.Height;
+        double areaRatio = candidatePixels / (double)Math.Max(1, primaryPixels);
+        return areaRatio <= 0.80 || areaRatio >= 1.25 ||
+               candidate.Preprocess != primary.Preprocess ||
+               !candidate.Profile.PrivateArguments.SequenceEqual(primary.Profile.PrivateArguments);
+    }
+
+    private static double SpatialQualityScore(CompressionMode mode, string detailBucket, string codec, double bpppf)
+    {
+        // Bits per pixel have diminishing value beyond a codec- and content-aware soft knee.
+        double target = SpatialDensityTarget(mode, detailBucket, codec);
+        if (bpppf <= target) return bpppf * 1000;
+        double surplusRatio = bpppf / target - 1;
+        return target * 1000 + 30 * (1 - Math.Exp(-surplusRatio));
+    }
+
+    private static bool IsSpatiallyAtRisk(CompressionPlan plan)
+    {
+        string detailBucket = plan.ComplexityAnalysis?.DetailBucket ?? "Medium";
+        double target = SpatialDensityTarget(plan.Mode, detailBucket, plan.Profile.VideoCodec);
+        return plan.BitsPerPixelPerFrame < target * 0.90;
+    }
+
+    private static double SpatialDensityTarget(CompressionMode mode, string detailBucket, string codec)
+    {
+        double detailTarget = detailBucket switch
+        {
+            "VeryLow" => 0.070,
+            "Low" => 0.090,
+            "High" => 0.140,
+            "VeryHigh" => 0.160,
+            _ => 0.115
+        };
+        double modeFactor = mode switch
+        {
+            CompressionMode.Fast => 1.10,
+            CompressionMode.ExtraQuality => 0.90,
+            _ => 1.0
+        };
+        double codecFactor = codec switch
+        {
+            "av1" => 0.82,
+            "x265" or "vp9" => 0.90,
+            _ => 1.0
+        };
+        return detailTarget * modeFactor * codecFactor;
     }
 
     private static IReadOnlyList<(int Width, string Origin, double Score)> WidthCandidates(

@@ -357,7 +357,13 @@ public static class Program
         Equal(30.0, balancedPlans[0].Fps, "Balanced primary FPS");
         Equal(2, shortlist.Count, "Balanced shortlist size");
         Equal(true, shortlist.Any(plan => Math.Abs(plan.Fps - 30) < 0.1), "Balanced 30 FPS finalist");
-        Equal(true, shortlist.Any(plan => Math.Abs(plan.Fps - 60) < 0.1), "Balanced 60 FPS challenger");
+        CompressionPlan primary = shortlist[0];
+        CompressionPlan challenger = shortlist[1];
+        double areaRatio = challenger.Width * (double)challenger.Height / (primary.Width * (double)primary.Height);
+        bool meaningfulAllocationChange = Math.Abs(challenger.Fps - primary.Fps) > 0.1 || areaRatio <= 0.80 || areaRatio >= 1.25;
+        Equal(true, meaningfulAllocationChange, "Balanced allocation challenger");
+        if (Math.Abs(challenger.Fps - primary.Fps) < 0.1 && areaRatio < 1)
+            Equal(true, challenger.BitsPerPixelPerFrame > primary.BitsPerPixelPerFrame, "spatial safety density");
         Equal(true, shortlist.Select(plan => plan.Identity).Distinct().Count() == shortlist.Count, "structurally distinct previews");
 
         CompressionRequest fastRequest = balancedRequest with { Mode = CompressionMode.Fast };
