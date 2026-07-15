@@ -29,7 +29,7 @@ param(
 
   [int]$ProbeSampleSeconds = 6,
 
-  [ValidateSet("off", "xpsnr", "vmaf", "auto")]
+  [ValidateSet("off", "xpsnr", "vmaf", "ensemble", "auto")]
   [string]$MetricMode = "auto",
 
   [ValidateSet("fixed", "sceneaware", "auto")]
@@ -302,7 +302,7 @@ function Get-RuntimeCapabilities {
     SupportsX264Mp4        = [bool]($x264Available -and $mp4Available -and $aacAvailable)
     SupportsX265Mp4        = [bool]($x265Available -and $mp4Available -and $aacAvailable)
     SupportsAv1Webm        = [bool]($av1Available -and $webmAvailable -and $opusAvailable)
-    PreferredMetricMode    = if ($hasVmaf) { "vmaf" } elseif ($hasXpsnr) { "xpsnr" } else { "off" }
+    PreferredMetricMode    = if ($hasVmaf -and $hasXpsnr) { "ensemble" } elseif ($hasVmaf) { "vmaf" } elseif ($hasXpsnr) { "xpsnr" } else { "off" }
     PreferredSamplingMode  = if ($hasScdet) { "sceneaware" } else { "fixed" }
   }
 
@@ -354,7 +354,14 @@ function Resolve-PolicyProfile {
   $codecReason = if ($codecPinned) { "pinned" } else { "" }
   $containerReason = if ($containerPinned) { "pinned" } else { "" }
 
-  if (-not $codecPinned -or -not $containerPinned) {
+  # A pinned codec is an explicit compatibility decision. Resolve its default
+  # container directly instead of filtering it through automatic policy
+  # candidates, which intentionally omit slower codecs in Fast mode.
+  if ($codecPinned -and -not $containerPinned) {
+    $selectedContainer = Get-ResolvedContainer -VideoCodec $selectedCodec -Container "auto"
+    $containerReason = "codec-default"
+  }
+  elseif (-not $codecPinned -or -not $containerPinned) {
     $pairs = New-Object System.Collections.Generic.List[object]
     switch ($compatibility) {
       "modern" {
@@ -1203,15 +1210,70 @@ function Build-EncodeFilterChain {
   return ($parts -join ",")
 }
 
+function Get-CanonicalMetricProfile {
+  param([Parameter(Mandatory = $true)]$Info)
+
+  $sourceWidth = [int](Get-PlanningWidth -Info $Info)
+  $sourceHeight = [int](Get-PlanningHeight -Info $Info)
+  if ($sourceWidth -lt 2 -or $sourceHeight -lt 2) {
+    throw "Cannot build a canonical metric profile for invalid source geometry ${sourceWidth}x${sourceHeight}."
+  }
+
+  $scale = [math]::Min(1.0, [math]::Min(1920.0 / [double]$sourceWidth, 1920.0 / [double]$sourceHeight))
+  $canvasWidth = [int]([math]::Floor(([double]$sourceWidth * $scale) / 2.0) * 2)
+  $canvasHeight = [int]([math]::Floor(([double]$sourceHeight * $scale) / 2.0) * 2)
+  $canvasWidth = [int][math]::Max(2, [math]::Min($sourceWidth, $canvasWidth))
+  $canvasHeight = [int][math]::Max(2, [math]::Min($sourceHeight, $canvasHeight))
+
+  $sourceFps = [double](Get-ObjectPropertyValue -Object $Info -Name "Fps" -DefaultValue 30.0)
+  if ($sourceFps -le 0.0) { $sourceFps = 30.0 }
+  $metricFps = [math]::Min(60.0, $sourceFps)
+  $sourceBitDepth = [int](Get-ObjectPropertyValue -Object $Info -Name "VideoBitDepth" -DefaultValue 8)
+  $metricBitDepth = if ($sourceBitDepth -gt 8) { 10 } else { 8 }
+
+  return [PSCustomObject]@{
+    EvaluatorVersion = "canonical-v1"
+    Width            = $canvasWidth
+    Height           = $canvasHeight
+    Fps              = [double]$metricFps
+    BitDepth         = $metricBitDepth
+    PixelFormat      = if ($metricBitDepth -eq 10) { "yuv420p10le" } else { "yuv420p" }
+    SourceWidth      = $sourceWidth
+    SourceHeight     = $sourceHeight
+  }
+}
+
 function Build-MetricReferenceFilterChain {
   param(
     [Parameter(Mandatory = $true)]$Info,
-    [Parameter(Mandatory = $true)][int]$TargetWidth,
-    [Parameter(Mandatory = $true)][double]$TargetFps,
+    [int]$TargetWidth = 0,
+    [double]$TargetFps = 0,
     [string]$ScaleFlags = "lanczos"
   )
 
-  return (Build-GeometryFilterChain -Info $Info -TargetWidth $TargetWidth -TargetFps $TargetFps -ScaleFlags $ScaleFlags)
+  # TargetWidth and TargetFps remain accepted for call-site compatibility, but
+  # metric geometry is derived only from the source so every candidate is
+  # evaluated on one common display canvas and timeline.
+  $profile = Get-CanonicalMetricProfile -Info $Info
+  $parts = @()
+  $cropFilter = Get-CropFilterString -Info $Info
+  if (-not [string]::IsNullOrWhiteSpace($cropFilter)) {
+    $parts += $cropFilter
+  }
+
+  $sar = Get-DisplaySampleAspectRatio -Info $Info
+  if ([math]::Abs($sar - 1.0) -gt 0.0001) {
+    $sarText = $sar.ToString("0.########", [Globalization.CultureInfo]::InvariantCulture)
+    $parts += ("scale=trunc(iw*{0}/2)*2:ih:flags={1}" -f $sarText, $ScaleFlags)
+  }
+  $parts += "setsar=1"
+
+  # Run both sides through an explicit scaler, even at 1:1, so colorspace and
+  # chroma-siting behavior are identical between reference and distortion.
+  $parts += ("scale={0}:{1}:flags={2}" -f $profile.Width, $profile.Height, $ScaleFlags)
+  $fpsText = $profile.Fps.ToString("0.########", [Globalization.CultureInfo]::InvariantCulture)
+  $parts += ("fps={0}:round=near" -f $fpsText)
+  return ($parts -join ",")
 }
 
 function Build-Vf {
@@ -3121,6 +3183,7 @@ function New-EncodePlan {
   $preprocessVf = Build-PreprocessFilterChain -PreprocessProfileName $preprocessLabel
   $encodeVf = Build-EncodeFilterChain -Info $Info -TargetWidth $Width -TargetFps $Fps -PreprocessProfileName $preprocessLabel
   $metricReferenceVf = Build-MetricReferenceFilterChain -Info $Info -TargetWidth $Width -TargetFps $Fps
+  $metricProfile = Get-CanonicalMetricProfile -Info $Info
   $outputPixelFormat = Get-OutputPixelFormat -Info $Info -CodecProfile $CodecProfile -Compatibility $CompatibilityMode -RequestedBitDepth $OutputBitDepth
   $colorPolicy = Get-ColorMetadataPolicy -Info $Info
   $hardCapBytes = if ($null -ne $script:RequestedHardCapBytes) { [long]$script:RequestedHardCapBytes } else { [long]$TargetBytes }
@@ -3180,6 +3243,12 @@ function New-EncodePlan {
     PreprocessVFilter = $preprocessVf
     EncodeVFilter = $encodeVf
     MetricReferenceVFilter = $metricReferenceVf
+    EvaluatorVersion = [string]$metricProfile.EvaluatorVersion
+    MetricCanvasWidth = [int]$metricProfile.Width
+    MetricCanvasHeight = [int]$metricProfile.Height
+    MetricFps = [double]$metricProfile.Fps
+    MetricPixelFormat = [string]$metricProfile.PixelFormat
+    MetricBitDepth = [int]$metricProfile.BitDepth
     VideoKbps   = $videoKbps
     EffectiveVideoKbps = $effectiveVideoKbps
     Crf         = $crf
@@ -3241,8 +3310,15 @@ function New-EncodePlan {
     BufsizeKbits = if ($VbvMode -eq "Streaming" -and $CodecProfile.VideoCodec -ne "av1") { [int][math]::Ceiling($videoKbps * 1.5 * 2.0) } else { $null }
     ContentClass = [string](Get-ObjectPropertyValue -Object $Probe -Name "ContentClass" -DefaultValue "general")
     MetricModeUsed = if ($PolicyProfile) { [string](Get-ObjectPropertyValue -Object $PolicyProfile -Name "MetricModeUsed" -DefaultValue "off") } else { "off" }
+    PrimaryMetricMode = "off"
     MetricScore = $null
+    WorstMetricScore = $null
     MetricConfidence = 0.0
+    VmafNegScore = $null
+    WorstVmafNegScore = $null
+    StandardVmafScore = $null
+    XpsnrScore = $null
+    WorstXpsnrScore = $null
     SamplingModeUsed = [string](Get-ObjectPropertyValue -Object $Probe -Name "SamplingModeUsed" -DefaultValue "fixed")
     SampleWindows = @((Get-ObjectPropertyValue -Object $Probe -Name "SampleWindows" -DefaultValue @()))
     CodecPolicyReason = if ($PolicyProfile) { [string](Get-ObjectPropertyValue -Object $PolicyProfile -Name "CodecPolicyReason" -DefaultValue "explicit") } else { "explicit" }
@@ -3542,6 +3618,7 @@ function Get-NormalizedMetricPreferenceScore {
   $metricScore = [double](Get-ObjectPropertyValue -Object $Result -Name "MetricScore" -DefaultValue 0.0)
   switch ($metricMode) {
     "vmaf"  { return [int][math]::Round($metricScore * 10.0) }
+    "ensemble" { return [int][math]::Round($metricScore * 10.0) }
     "xpsnr" { return [int][math]::Round($metricScore * 20.0) }
     default { return 0 }
   }
@@ -3571,7 +3648,7 @@ function Get-MetricReferenceFilter {
   param([Parameter(Mandatory = $true)]$Plan)
 
   $geometry = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricReferenceVFilter" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "GeometryVFilter" -DefaultValue ""))
-  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
+  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricPixelFormat" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p"))
   $parts = @()
   if (-not [string]::IsNullOrWhiteSpace($geometry)) { $parts += $geometry }
   $parts += ("format={0}" -f $pixelFormat)
@@ -3583,8 +3660,22 @@ function Get-MetricReferenceFilter {
 function Get-MetricDistortedFilter {
   param([Parameter(Mandatory = $true)]$Plan)
 
-  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
-  return ("format={0},settb=AVTB,setpts=PTS-STARTPTS" -f $pixelFormat)
+  $pixelFormat = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricPixelFormat" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p"))
+  $canvasWidth = [int](Get-ObjectPropertyValue -Object $Plan -Name "MetricCanvasWidth" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "Width" -DefaultValue 0))
+  $canvasHeight = [int](Get-ObjectPropertyValue -Object $Plan -Name "MetricCanvasHeight" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "Height" -DefaultValue 0))
+  $metricFps = [double](Get-ObjectPropertyValue -Object $Plan -Name "MetricFps" -DefaultValue (Get-ObjectPropertyValue -Object $Plan -Name "Fps" -DefaultValue 30.0))
+  $parts = @("setsar=1")
+  if ($canvasWidth -gt 0 -and $canvasHeight -gt 0) {
+    $parts += ("scale={0}:{1}:flags=lanczos" -f $canvasWidth, $canvasHeight)
+  }
+  if ($metricFps -gt 0.0) {
+    $fpsText = $metricFps.ToString("0.########", [Globalization.CultureInfo]::InvariantCulture)
+    $parts += ("fps={0}:round=near" -f $fpsText)
+  }
+  $parts += ("format={0}" -f $pixelFormat)
+  $parts += "settb=AVTB"
+  $parts += "setpts=PTS-STARTPTS"
+  return ($parts -join ",")
 }
 
 function Get-DistortedMetricInputArgs {
@@ -3597,7 +3688,7 @@ function Get-DistortedMetricInputArgs {
   if ($DistortedOffset -gt 0.0001) {
     return @("-ss", "$DistortedOffset", "-t", "$($Window.Duration)", "-i", $PreviewPath)
   }
-  return @("-i", $PreviewPath)
+  return @("-t", "$($Window.Duration)", "-i", $PreviewPath)
 }
 
 function Invoke-VmafMetric {
@@ -3613,21 +3704,20 @@ function Invoke-VmafMetric {
   $logName = ("vmaf_{0}.json" -f ([guid]::NewGuid().ToString("N")))
   $refFilter = Get-MetricReferenceFilter -Plan $Plan
   $distortedFilter = Get-MetricDistortedFilter -Plan $Plan
-  $modelOption = ""
-  if ([string](Get-ObjectPropertyValue -Object $Plan -Name "PreprocessLabel" -DefaultValue "none") -eq "screen-sharpen") {
-    if (-not (Test-VmafNegModelAvailable)) {
-      Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
-          MetricMode = "vmaf"
-          Reason = "vmaf-neg-unavailable-for-enhancement"
-          Window = $Window
-          PreviewPath = $PreviewPath
-          ReferenceFilter = $refFilter
-          EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
-        })
-      return $null
-    }
-    $modelOption = ":model=version=vmaf_v0.6.1neg"
+  if (-not (Test-VmafNegModelAvailable)) {
+    Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
+        MetricMode = "vmaf"
+        Reason = "vmaf-neg-unavailable"
+        Window = $Window
+        PreviewPath = $PreviewPath
+        ReferenceFilter = $refFilter
+        EncodeFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
+      })
+    return $null
   }
+  # NEG is the primary encoder-comparison model. The standard model is emitted
+  # alongside it as supplemental evidence from the exact same decoded frames.
+  $modelOption = ":model='version=vmaf_v0.6.1neg\:name=vmaf_neg|version=vmaf_v0.6.1\:name=vmaf_standard'"
   $threadCount = if ($Plan.Mode -eq "ExtraQuality") { 4 } else { 2 }
   $subsample = if ($Plan.Mode -eq "ExtraQuality") { 1 } else { 2 }
   $lavfi = "[1:v]{0}[main];[0:v]{1}[ref];[main][ref]libvmaf=log_fmt=json:log_path={2}:n_threads={3}:n_subsample={4}{5}" -f $distortedFilter, $refFilter, $logName, $threadCount, $subsample, $modelOption
@@ -3666,12 +3756,29 @@ function Invoke-VmafMetric {
 
   try {
     $json = Get-Content -Path $logPath -Raw | ConvertFrom-Json
-    $score = [double](Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object (Get-ObjectPropertyValue -Object $json -Name "pooled_metrics" -DefaultValue $null) -Name "vmaf" -DefaultValue $null) -Name "mean" -DefaultValue 0.0)
+    $pooled = Get-ObjectPropertyValue -Object $json -Name "pooled_metrics" -DefaultValue $null
+    $negMetric = Get-ObjectPropertyValue -Object $pooled -Name "vmaf_neg" -DefaultValue (Get-ObjectPropertyValue -Object $pooled -Name "vmaf" -DefaultValue $null)
+    $standardMetric = Get-ObjectPropertyValue -Object $pooled -Name "vmaf_standard" -DefaultValue $null
+    $scoreValue = Get-ObjectPropertyValue -Object $negMetric -Name "mean" -DefaultValue $null
+    if ($null -eq $scoreValue) {
+      Write-PlanLogRecord -RecordType "metric_failure" -Data ([PSCustomObject]@{
+          MetricMode = "vmaf"
+          Reason = "missing-vmaf-neg-score"
+          Window = $Window
+          PreviewPath = $PreviewPath
+        })
+      return $null
+    }
+    $score = [double]$scoreValue
+    $standardScore = Get-ObjectPropertyValue -Object $standardMetric -Name "mean" -DefaultValue $null
     return [PSCustomObject]@{
-      Mode  = "vmaf"
-      Score = [double]$score
-      Model = if ($modelOption) { "vmaf_v0.6.1neg" } else { "default" }
-      Window = $Window
+      Mode              = "vmaf"
+      Score             = [double]$score
+      VmafNegScore      = [double]$score
+      StandardVmafScore = if ($null -ne $standardScore) { [double]$standardScore } else { $null }
+      Model             = "vmaf_v0.6.1neg"
+      SupplementalModel = "vmaf_v0.6.1"
+      Window            = $Window
     }
   }
   finally {
@@ -3829,13 +3936,26 @@ function Invoke-PreviewMetric {
   foreach ($segment in @($PreviewSegments)) {
     if (-not (Test-Path $segment.Path)) { continue }
     $distortedOffset = [double](Get-ObjectPropertyValue -Object $segment -Name "DistortedOffset" -DefaultValue 0.0)
-    $metricResult = switch ($metricMode) {
-      "vmaf"  { Invoke-VmafMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset }
-      "xpsnr" { Invoke-XpsnrMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset }
+    $vmafResult = if ($metricMode -in @("vmaf", "ensemble")) {
+      Invoke-VmafMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset
     }
+    else { $null }
+    $xpsnrResult = if ($metricMode -in @("xpsnr", "ensemble")) {
+      Invoke-XpsnrMetric -InputPath $InputPath -PreviewPath $segment.Path -Plan $Plan -Window $segment.Window -TempDir $TempDir -DistortedOffset $distortedOffset
+    }
+    else { $null }
 
-    if ($metricResult) {
-      [void]$scores.Add($metricResult)
+    if ($vmafResult -or $xpsnrResult) {
+      [void]$scores.Add([PSCustomObject]@{
+          Mode = $metricMode
+          Score = if ($vmafResult) { [double]$vmafResult.Score } else { [double]$xpsnrResult.Score }
+          PrimaryMetricMode = if ($vmafResult) { "vmaf" } else { "xpsnr" }
+          VmafNegScore = if ($vmafResult) { [double]$vmafResult.VmafNegScore } else { $null }
+          StandardVmafScore = if ($vmafResult) { Get-ObjectPropertyValue -Object $vmafResult -Name "StandardVmafScore" -DefaultValue $null } else { $null }
+          XpsnrScore = if ($xpsnrResult) { [double]$xpsnrResult.Score } else { $null }
+          XpsnrWorstFrameScore = if ($xpsnrResult) { Get-ObjectPropertyValue -Object $xpsnrResult -Name "WorstFrameScore" -DefaultValue $null } else { $null }
+          Window = $segment.Window
+        })
     }
   }
 
@@ -3849,13 +3969,28 @@ function Invoke-PreviewMetric {
     }
   }
 
-  $score = [double](($scores | Measure-Object -Property Score -Average).Average)
-  $confidence = if ($scores.Count -ge 3) { 0.95 } elseif ($scores.Count -eq 2) { 0.88 } else { 0.75 }
+  $vmafScores = @($scores | Where-Object { $null -ne $_.VmafNegScore })
+  $xpsnrScores = @($scores | Where-Object { $null -ne $_.XpsnrScore })
+  if ($vmafScores.Count -gt 0) {
+    $primaryScores = @($vmafScores)
+  }
+  else {
+    $primaryScores = @($xpsnrScores)
+  }
+  $primaryMode = if ($vmafScores.Count -gt 0) { "vmaf" } else { "xpsnr" }
+  $score = [double](($primaryScores | Measure-Object -Property Score -Average).Average)
+  $confidence = if ($primaryScores.Count -ge 3) { 0.95 } elseif ($primaryScores.Count -eq 2) { 0.88 } else { 0.75 }
   return [PSCustomObject]@{
     MetricModeUsed   = [string]$metricMode
+    PrimaryMetricMode = $primaryMode
     MetricScore      = [double]$score
-    WorstMetricScore = [double](($scores | Measure-Object -Property Score -Minimum).Minimum)
+    WorstMetricScore = [double](($primaryScores | Measure-Object -Property Score -Minimum).Minimum)
     MetricConfidence = [double]$confidence
+    VmafNegScore = if ($vmafScores.Count -gt 0) { [double](($vmafScores | Measure-Object -Property VmafNegScore -Average).Average) } else { $null }
+    WorstVmafNegScore = if ($vmafScores.Count -gt 0) { [double](($vmafScores | Measure-Object -Property VmafNegScore -Minimum).Minimum) } else { $null }
+    StandardVmafScore = if (@($vmafScores | Where-Object { $null -ne $_.StandardVmafScore }).Count -gt 0) { [double](($vmafScores | Where-Object { $null -ne $_.StandardVmafScore } | Measure-Object -Property StandardVmafScore -Average).Average) } else { $null }
+    XpsnrScore = if ($xpsnrScores.Count -gt 0) { [double](($xpsnrScores | Measure-Object -Property XpsnrScore -Average).Average) } else { $null }
+    WorstXpsnrScore = if ($xpsnrScores.Count -gt 0) { [double](($xpsnrScores | Measure-Object -Property XpsnrScore -Minimum).Minimum) } else { $null }
     SegmentScores    = @($scores.ToArray())
   }
 }
@@ -3867,12 +4002,19 @@ function Get-MetricScoreBundle {
 
   return [PSCustomObject]@{
     MetricModeUsed   = [string](Get-ObjectPropertyValue -Object $MetricResult -Name "MetricModeUsed" -DefaultValue "off")
+    PrimaryMetricMode = [string](Get-ObjectPropertyValue -Object $MetricResult -Name "PrimaryMetricMode" -DefaultValue (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricModeUsed" -DefaultValue "off"))
     MetricScore      = (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricScore" -DefaultValue $null)
     WorstMetricScore = (Get-ObjectPropertyValue -Object $MetricResult -Name "WorstMetricScore" -DefaultValue $null)
     MetricConfidence = [double](Get-ObjectPropertyValue -Object $MetricResult -Name "MetricConfidence" -DefaultValue 0.0)
+    VmafNegScore     = (Get-ObjectPropertyValue -Object $MetricResult -Name "VmafNegScore" -DefaultValue $null)
+    WorstVmafNegScore = (Get-ObjectPropertyValue -Object $MetricResult -Name "WorstVmafNegScore" -DefaultValue $null)
+    StandardVmafScore = (Get-ObjectPropertyValue -Object $MetricResult -Name "StandardVmafScore" -DefaultValue $null)
+    XpsnrScore       = (Get-ObjectPropertyValue -Object $MetricResult -Name "XpsnrScore" -DefaultValue $null)
+    WorstXpsnrScore  = (Get-ObjectPropertyValue -Object $MetricResult -Name "WorstXpsnrScore" -DefaultValue $null)
     MetricSortScore  = if ($null -ne (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricScore" -DefaultValue $null)) {
       switch ((Get-NormalizedOptionValue -Value (Get-ObjectPropertyValue -Object $MetricResult -Name "MetricModeUsed" -DefaultValue "off") -DefaultValue "off")) {
         "vmaf"  { [int][math]::Round([double]$MetricResult.MetricScore * 10.0) }
+        "ensemble" { [int][math]::Round([double]$MetricResult.MetricScore * 10.0) }
         "xpsnr" { [int][math]::Round([double]$MetricResult.MetricScore * 20.0) }
         default { 0 }
       }
@@ -3892,11 +4034,15 @@ function Merge-PreviewAndMetricScore {
 
   $previewCopy = $Preview.PSObject.Copy()
   $previewCopy | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string]$MetricBundle.MetricModeUsed) -Force
+  $previewCopy | Add-Member -NotePropertyName PrimaryMetricMode -NotePropertyValue ([string]$MetricBundle.PrimaryMetricMode) -Force
   $previewCopy | Add-Member -NotePropertyName MetricScore -NotePropertyValue $MetricBundle.MetricScore -Force
   $previewCopy | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue $MetricBundle.WorstMetricScore -Force
   $previewCopy | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double]$MetricBundle.MetricConfidence) -Force
   $previewCopy | Add-Member -NotePropertyName MetricSortScore -NotePropertyValue ([int]$MetricBundle.MetricSortScore) -Force
   $previewCopy | Add-Member -NotePropertyName MetricSegmentScores -NotePropertyValue @($MetricBundle.SegmentScores) -Force
+  foreach ($metricProperty in @("VmafNegScore", "WorstVmafNegScore", "StandardVmafScore", "XpsnrScore", "WorstXpsnrScore")) {
+    $previewCopy | Add-Member -NotePropertyName $metricProperty -NotePropertyValue (Get-ObjectPropertyValue -Object $MetricBundle -Name $metricProperty -DefaultValue $null) -Force
+  }
   return $previewCopy
 }
 
@@ -3986,15 +4132,26 @@ function Get-PlanFeatureVector {
     ContentClass          = [string](Get-ObjectPropertyValue -Object $Plan -Name "ContentClass" -DefaultValue "general")
     SamplingModeUsed      = [string](Get-ObjectPropertyValue -Object $Plan -Name "SamplingModeUsed" -DefaultValue "fixed")
     MetricModeUsed        = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricModeUsed" -DefaultValue "off")
+    PrimaryMetricMode     = [string](Get-ObjectPropertyValue -Object $Plan -Name "PrimaryMetricMode" -DefaultValue "off")
     MetricScore           = (Get-ObjectPropertyValue -Object $Plan -Name "MetricScore" -DefaultValue $null)
     WorstMetricScore      = (Get-ObjectPropertyValue -Object $Plan -Name "WorstMetricScore" -DefaultValue $null)
     MetricConfidence      = [double](Get-ObjectPropertyValue -Object $Plan -Name "MetricConfidence" -DefaultValue 0.0)
+    VmafNegScore          = (Get-ObjectPropertyValue -Object $Plan -Name "VmafNegScore" -DefaultValue $null)
+    WorstVmafNegScore     = (Get-ObjectPropertyValue -Object $Plan -Name "WorstVmafNegScore" -DefaultValue $null)
+    StandardVmafScore     = (Get-ObjectPropertyValue -Object $Plan -Name "StandardVmafScore" -DefaultValue $null)
+    XpsnrScore            = (Get-ObjectPropertyValue -Object $Plan -Name "XpsnrScore" -DefaultValue $null)
+    WorstXpsnrScore       = (Get-ObjectPropertyValue -Object $Plan -Name "WorstXpsnrScore" -DefaultValue $null)
     PreviewRank           = [int](Get-ObjectPropertyValue -Object $Plan -Name "PreviewRank" -DefaultValue 0)
     PreviewRatio          = (Get-ObjectPropertyValue -Object $Plan -Name "PreviewRatio" -DefaultValue $null)
     GeometryVFilter       = [string](Get-ObjectPropertyValue -Object $Plan -Name "GeometryVFilter" -DefaultValue "")
     PreprocessVFilter     = [string](Get-ObjectPropertyValue -Object $Plan -Name "PreprocessVFilter" -DefaultValue "")
     EncodeVFilter         = [string](Get-ObjectPropertyValue -Object $Plan -Name "EncodeVFilter" -DefaultValue $Plan.VFilter)
     MetricReferenceVFilter = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricReferenceVFilter" -DefaultValue "")
+    EvaluatorVersion       = [string](Get-ObjectPropertyValue -Object $Plan -Name "EvaluatorVersion" -DefaultValue "")
+    MetricCanvasWidth      = [int](Get-ObjectPropertyValue -Object $Plan -Name "MetricCanvasWidth" -DefaultValue 0)
+    MetricCanvasHeight     = [int](Get-ObjectPropertyValue -Object $Plan -Name "MetricCanvasHeight" -DefaultValue 0)
+    MetricFps              = [double](Get-ObjectPropertyValue -Object $Plan -Name "MetricFps" -DefaultValue 0.0)
+    MetricPixelFormat      = [string](Get-ObjectPropertyValue -Object $Plan -Name "MetricPixelFormat" -DefaultValue "")
     OutputPixelFormat     = [string](Get-ObjectPropertyValue -Object $Plan -Name "OutputPixelFormat" -DefaultValue "yuv420p")
     OutputBitDepth        = [int](Get-ObjectPropertyValue -Object $Plan -Name "OutputBitDepth" -DefaultValue 8)
     SourcePixelFormat     = [string](Get-ObjectPropertyValue -Object $Plan -Name "SourcePixelFormat" -DefaultValue "")
@@ -4374,6 +4531,9 @@ function Get-PlanFinalists {
                 $selectedPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "MetricScore" -DefaultValue $null) -Force
                 $selectedPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "WorstMetricScore" -DefaultValue $null) -Force
                 $selectedPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $preview -Name "MetricConfidence" -DefaultValue 0.0)) -Force
+                foreach ($metricProperty in @("PrimaryMetricMode", "VmafNegScore", "WorstVmafNegScore", "StandardVmafScore", "XpsnrScore", "WorstXpsnrScore")) {
+                  $selectedPlan | Add-Member -NotePropertyName $metricProperty -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name $metricProperty -DefaultValue $null) -Force
+                }
                 [void]$previewSelected.Add($selectedPlan)
               }
 
@@ -4439,6 +4599,9 @@ function Get-PlanFinalists {
           $selectedPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "MetricScore" -DefaultValue $null) -Force
           $selectedPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name "WorstMetricScore" -DefaultValue $null) -Force
           $selectedPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $preview -Name "MetricConfidence" -DefaultValue 0.0)) -Force
+          foreach ($metricProperty in @("PrimaryMetricMode", "VmafNegScore", "WorstVmafNegScore", "StandardVmafScore", "XpsnrScore", "WorstXpsnrScore")) {
+            $selectedPlan | Add-Member -NotePropertyName $metricProperty -NotePropertyValue (Get-ObjectPropertyValue -Object $preview -Name $metricProperty -DefaultValue $null) -Force
+          }
           [void]$selectedPlans.Add($selectedPlan)
         }
       }
@@ -4560,9 +4723,13 @@ function Invoke-PlanAttempt {
   $resultPlan = $Plan.PSObject.Copy()
   if ($metricResult) {
     $resultPlan | Add-Member -NotePropertyName MetricModeUsed -NotePropertyValue ([string]$metricResult.MetricModeUsed) -Force
+    $resultPlan | Add-Member -NotePropertyName PrimaryMetricMode -NotePropertyValue ([string](Get-ObjectPropertyValue -Object $metricResult -Name "PrimaryMetricMode" -DefaultValue $metricResult.MetricModeUsed)) -Force
     $resultPlan | Add-Member -NotePropertyName MetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $metricResult -Name "MetricScore" -DefaultValue $null) -Force
     $resultPlan | Add-Member -NotePropertyName WorstMetricScore -NotePropertyValue (Get-ObjectPropertyValue -Object $metricResult -Name "WorstMetricScore" -DefaultValue $null) -Force
     $resultPlan | Add-Member -NotePropertyName MetricConfidence -NotePropertyValue ([double](Get-ObjectPropertyValue -Object $metricResult -Name "MetricConfidence" -DefaultValue 0.0)) -Force
+    foreach ($metricProperty in @("VmafNegScore", "WorstVmafNegScore", "StandardVmafScore", "XpsnrScore", "WorstXpsnrScore")) {
+      $resultPlan | Add-Member -NotePropertyName $metricProperty -NotePropertyValue (Get-ObjectPropertyValue -Object $metricResult -Name $metricProperty -DefaultValue $null) -Force
+    }
   }
   $metricSegmentScores = if ($metricResult) { @((Get-ObjectPropertyValue -Object $metricResult -Name "SegmentScores" -DefaultValue @())) } else { @() }
 
@@ -5475,6 +5642,7 @@ function Get-MetricNoiseBand {
 
   switch ((Get-NormalizedOptionValue -Value $MetricMode -DefaultValue "off")) {
     "vmaf"  { return 0.50 }
+    "ensemble" { return 0.50 }
     "xpsnr" { return 0.25 }
     default { return [double]::PositiveInfinity }
   }
@@ -5485,6 +5653,7 @@ function Get-MetricMaterialityThreshold {
 
   switch ((Get-NormalizedOptionValue -Value $MetricMode -DefaultValue "off")) {
     "vmaf"  { return 1.00 }
+    "ensemble" { return 1.00 }
     "xpsnr" { return 0.50 }
     default { return [double]::PositiveInfinity }
   }
@@ -5495,12 +5664,14 @@ function Get-MetricQualitySummary {
 
   $plan = $Result.Plan
   $mode = Get-NormalizedOptionValue -Value ([string](Get-ObjectPropertyValue -Object $Result -Name "MetricModeUsed" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricModeUsed" -DefaultValue "off"))) -DefaultValue "off"
+  $primaryMode = Get-NormalizedOptionValue -Value ([string](Get-ObjectPropertyValue -Object $Result -Name "PrimaryMetricMode" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "PrimaryMetricMode" -DefaultValue $mode))) -DefaultValue $mode
   $mean = Get-ObjectPropertyValue -Object $Result -Name "MetricScore" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricScore" -DefaultValue $null)
   $worst = Get-ObjectPropertyValue -Object $Result -Name "WorstMetricScore" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "WorstMetricScore" -DefaultValue $mean)
   $confidence = [double](Get-ObjectPropertyValue -Object $Result -Name "MetricConfidence" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "MetricConfidence" -DefaultValue 0.0))
-  $available = ($mode -in @("vmaf", "xpsnr") -and $null -ne $mean)
+  $xpsnr = Get-ObjectPropertyValue -Object $Result -Name "XpsnrScore" -DefaultValue (Get-ObjectPropertyValue -Object $plan -Name "XpsnrScore" -DefaultValue $null)
+  $available = ($mode -in @("vmaf", "xpsnr", "ensemble") -and $primaryMode -in @("vmaf", "xpsnr") -and $null -ne $mean)
   if (-not $available) {
-    return [PSCustomObject]@{ Available = $false; Mode = $mode; Mean = $null; Worst = $null; Composite = $null; Confidence = 0.0; NoiseBand = [double]::PositiveInfinity }
+    return [PSCustomObject]@{ Available = $false; Mode = $mode; PrimaryMode = $primaryMode; Mean = $null; Worst = $null; Composite = $null; Confidence = 0.0; NoiseBand = [double]::PositiveInfinity; Xpsnr = $null }
   }
 
   $meanValue = [double]$mean
@@ -5509,11 +5680,13 @@ function Get-MetricQualitySummary {
   return [PSCustomObject]@{
     Available = $true
     Mode = $mode
+    PrimaryMode = $primaryMode
     Mean = $meanValue
     Worst = $worstValue
     Composite = ($meanValue - $tailPenalty)
     Confidence = $confidence
     NoiseBand = Get-MetricNoiseBand -MetricMode $mode
+    Xpsnr = if ($null -ne $xpsnr) { [double]$xpsnr } else { $null }
   }
 }
 
@@ -5662,9 +5835,29 @@ function Compare-QualityResults {
     if ([math]::Abs($confidenceDelta) -ge 0.10) {
       return [PSCustomObject]@{ Better = ($confidenceDelta -gt 0); DecidedBy = "metric_confidence"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
     }
-    $qualityDelta = [double]$candidateQuality.Composite - [double]$currentQuality.Composite
-    if ([math]::Abs($qualityDelta) -gt [double]$candidateQuality.NoiseBand) {
-      return [PSCustomObject]@{ Better = ($qualityDelta -gt 0); DecidedBy = "perceptual_quality"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+
+    if ($null -ne $candidateQuality.Xpsnr -and $null -ne $currentQuality.Xpsnr) {
+      $xpsnrDelta = [double]$candidateQuality.Xpsnr - [double]$currentQuality.Xpsnr
+      if ($xpsnrDelta -le -0.50) {
+        return [PSCustomObject]@{ Better = $false; DecidedBy = "xpsnr_regression_guard"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+      }
+    }
+
+    $meanDelta = [double]$candidateQuality.Mean - [double]$currentQuality.Mean
+    if ([math]::Abs($meanDelta) -gt [double]$candidateQuality.NoiseBand) {
+      return [PSCustomObject]@{ Better = ($meanDelta -gt 0); DecidedBy = "perceptual_quality"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+    }
+
+    $worstDelta = [double]$candidateQuality.Worst - [double]$currentQuality.Worst
+    if ([math]::Abs($worstDelta) -gt [double]$candidateQuality.NoiseBand) {
+      return [PSCustomObject]@{ Better = ($worstDelta -gt 0); DecidedBy = "worst_window_quality"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+    }
+
+    if ($null -ne $candidateQuality.Xpsnr -and $null -ne $currentQuality.Xpsnr) {
+      $xpsnrDelta = [double]$candidateQuality.Xpsnr - [double]$currentQuality.Xpsnr
+      if ([math]::Abs($xpsnrDelta) -gt 0.25) {
+        return [PSCustomObject]@{ Better = ($xpsnrDelta -gt 0); DecidedBy = "xpsnr_quality"; CandidateTuple = (Get-QualityPreferenceTuple $Candidate $EligibilityKind); CurrentTuple = (Get-QualityPreferenceTuple $Current $EligibilityKind) }
+      }
     }
   }
 
