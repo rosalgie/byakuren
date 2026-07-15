@@ -56,7 +56,7 @@ public sealed class CompressionPlanner
         int bias = priorityBias + complexityBias;
         int channelFloor = media.AudioChannels >= 6 ? 128 : media.AudioChannels > 2 ? 96 : 32;
         int[] rates = baseRates.Select(rate => Math.Max(channelFloor, rate + bias)).Distinct().ToArray();
-        int retain = request.Mode switch { CompressionMode.Fast => 1, CompressionMode.Balanced => 2, _ => 3 };
+        int retain = request.Mode switch { CompressionMode.Fast => 2, CompressionMode.Balanced => 2, _ => 3 };
         List<AudioPlan> plans = new List<AudioPlan>();
         int rank = 100;
         if (media.AudioCodec.Equals(profile.AudioCodec, StringComparison.OrdinalIgnoreCase) && media.AudioBitrateKbps > 0 && rates.Any(rate => media.AudioBitrateKbps <= rate))
@@ -179,14 +179,15 @@ public sealed class CompressionPlanner
 
     public int CorrectBitrate(CompressionPlan plan, EncodeAttempt current, IReadOnlyList<CorrectionPoint> history)
     {
-        long targetPayload = Math.Max(25_000, plan.WorkingTargetBytes - current.AudioPayloadBytes - current.MuxOverheadBytes);
+        long correctionTargetBytes = plan.Mode == CompressionMode.Fast
+            ? Math.Min(plan.WorkingTargetBytes, (long)Math.Floor(plan.HardCapBytes * 0.992))
+            : plan.WorkingTargetBytes;
+        long targetPayload = Math.Max(25_000, correctionTargetBytes - current.AudioPayloadBytes - current.MuxOverheadBytes);
         CorrectionPoint? lower = history.Where(point => point.VideoPayloadBytes <= targetPayload).OrderByDescending(point => point.VideoPayloadBytes).FirstOrDefault();
         CorrectionPoint? upper = history.Where(point => point.VideoPayloadBytes >= targetPayload).OrderBy(point => point.VideoPayloadBytes).FirstOrDefault();
         double guess = lower is not null && upper is not null && upper.VideoKbps != lower.VideoKbps && upper.VideoPayloadBytes != lower.VideoPayloadBytes
             ? lower.VideoKbps + (targetPayload - lower.VideoPayloadBytes) / (double)(upper.VideoPayloadBytes - lower.VideoPayloadBytes) * (upper.VideoKbps - lower.VideoKbps)
             : plan.VideoKbps * targetPayload / (double)Math.Max(1, current.VideoPayloadBytes);
-        if (history.Count == 1 && plan.Profile.Backend == "svtav1" && current.VideoPayloadBytes > targetPayload)
-            guess *= 1.03;
         double minimum = Math.Max(35, plan.VideoKbps * 0.35);
         double maximum = Math.Max(minimum, plan.VideoKbps * 1.35);
         int minStep = plan.Mode switch { CompressionMode.Fast => 12, CompressionMode.Balanced => 8, _ => 5 };

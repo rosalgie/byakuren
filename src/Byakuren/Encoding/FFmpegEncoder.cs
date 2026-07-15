@@ -45,16 +45,18 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
         MediaInfo media,
         CompressionPlan plan,
         AudioArtifact audio,
+        IReadOnlyList<AudioArtifact> fallbackAudio,
         string tempDirectory,
         int attempt,
         string hardwareDevice,
         CancellationToken cancellationToken)
     {
         string videoPath = Path.Combine(tempDirectory, $"video-{attempt}.mkv");
-        string candidatePath = Path.Combine(tempDirectory, $"candidate-{attempt}{plan.Profile.Extension}");
         IReadOnlyList<string> common = BuildVideoArguments(plan, hardwareDevice);
 
-        if (plan.Mode != CompressionMode.Fast && plan.Profile.RequiredPasses >= 2)
+        bool useTwoPass = plan.Profile.RequiredPasses >= 2 &&
+                          (plan.Mode != CompressionMode.Fast || plan.Profile.Backend is "svtav1" or "aom" or "vpx");
+        if (useTwoPass)
         {
             if (!_passLogs.TryGetValue(plan.Identity, out string? passLog))
             {
@@ -82,34 +84,57 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
 
         long videoPayload = await probe.GetPacketPayloadBytesAsync(request.FFprobePath, videoPath, "v:0", cancellationToken).ConfigureAwait(false);
         if (videoPayload <= 0) videoPayload = new FileInfo(videoPath).Length;
-        List<string> mux = new List<string> { "-y", "-i", videoPath };
-        if (audio.Path is not null)
-            mux.AddRange(["-i", audio.Path, "-map", "0:v:0", "-map", "1:a:0"]);
-        else
-            mux.AddRange(["-map", "0:v:0"]);
-        mux.AddRange(["-c", "copy"]);
-        if (plan.Profile.Container == "mp4") mux.AddRange(["-movflags", "+faststart"]);
-        mux.Add(candidatePath);
-        await runner.RunCheckedAsync(request.FFmpegPath, mux, cancellationToken).ConfigureAwait(false);
-
-        long size = new FileInfo(candidatePath).Length;
-        long overhead = Math.Max(0, size - videoPayload - audio.PayloadBytes);
-        try { File.Delete(videoPath); } catch { }
-        string? eligiblePath = candidatePath;
-        if (size > plan.HardCapBytes)
+        AudioArtifact[] muxAudioCandidates = new[] { audio }
+            .Concat(fallbackAudio.Where(candidate => candidate.PayloadBytes < audio.PayloadBytes))
+            .DistinctBy(candidate => candidate.Plan.Identity)
+            .OrderByDescending(candidate => candidate.PayloadBytes)
+            .ToArray();
+        List<(string Path, long Size, long Overhead, AudioArtifact Audio)> muxedCandidates = new List<(string, long, long, AudioArtifact)>();
+        int muxIndex = 0;
+        foreach (AudioArtifact muxAudio in muxAudioCandidates)
         {
-            File.Delete(candidatePath);
+            string candidatePath = Path.Combine(tempDirectory, $"candidate-{attempt}-{muxIndex++}{plan.Profile.Extension}");
+            List<string> mux = new List<string> { "-y", "-i", videoPath };
+            if (muxAudio.Path is not null)
+                mux.AddRange(["-i", muxAudio.Path, "-map", "0:v:0", "-map", "1:a:0"]);
+            else
+                mux.AddRange(["-map", "0:v:0"]);
+            mux.AddRange(["-c", "copy"]);
+            if (plan.Profile.Container == "mp4") mux.AddRange(["-movflags", "+faststart"]);
+            mux.Add(candidatePath);
+            await runner.RunCheckedAsync(request.FFmpegPath, mux, cancellationToken).ConfigureAwait(false);
+            long candidateSize = new FileInfo(candidatePath).Length;
+            long candidateOverhead = Math.Max(0, candidateSize - videoPayload - muxAudio.PayloadBytes);
+            muxedCandidates.Add((candidatePath, candidateSize, candidateOverhead, muxAudio));
+        }
+
+        double fillGate = Planner.CompressionPlanner.Strategy(plan.Mode).FillGate;
+        (string Path, long Size, long Overhead, AudioArtifact Audio)? eligible = muxedCandidates
+            .Where(candidate => candidate.Size <= plan.HardCapBytes && candidate.Size / (double)plan.HardCapBytes >= fillGate)
+            .OrderByDescending(candidate => candidate.Size)
+            .Cast<(string Path, long Size, long Overhead, AudioArtifact Audio)?>()
+            .FirstOrDefault();
+        (string Path, long Size, long Overhead, AudioArtifact Audio) selected = eligible ?? muxedCandidates[0];
+        foreach ((string path, _, _, _) in muxedCandidates)
+            if (!path.Equals(selected.Path, StringComparison.OrdinalIgnoreCase)) TryDelete(path);
+        try { File.Delete(videoPath); } catch { }
+        string? eligiblePath = selected.Path;
+        if (selected.Size > plan.HardCapBytes)
+        {
+            File.Delete(selected.Path);
             eligiblePath = null;
         }
+
+        CompressionPlan selectedPlan = plan with { AudioPlan = selected.Audio.Plan, AudioKbps = selected.Audio.Plan.Kbps };
 
         return new EncodeAttempt
         {
             Attempt = attempt,
-            Plan = plan,
-            SizeBytes = size,
+            Plan = selectedPlan,
+            SizeBytes = selected.Size,
             VideoPayloadBytes = videoPayload,
-            AudioPayloadBytes = audio.PayloadBytes,
-            MuxOverheadBytes = overhead,
+            AudioPayloadBytes = selected.Audio.PayloadBytes,
+            MuxOverheadBytes = selected.Overhead,
             OutputPath = eligiblePath
         };
     }
@@ -151,4 +176,5 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
 
     private static string Sanitize(string value) => string.Concat(value.Select(character => char.IsLetterOrDigit(character) ? character : '_'));
     private static string Number(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
+    private static void TryDelete(string path) { try { File.Delete(path); } catch { } }
 }

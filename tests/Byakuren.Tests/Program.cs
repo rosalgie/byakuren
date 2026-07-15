@@ -221,7 +221,7 @@ public static class Program
 
         int corrected = new CompressionPlanner().CorrectBitrate(plan, attempt, [point]);
 
-        Equal(662, corrected, "corrected bitrate");
+        Equal(660, corrected, "corrected bitrate");
     }
 
     private static void TestCLIAliases()

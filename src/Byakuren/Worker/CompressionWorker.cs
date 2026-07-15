@@ -150,8 +150,13 @@ public sealed class CompressionWorker
                 attemptsOnCurrentPlan++;
                 CapabilityProbeResult capability = CapabilityFor(currentPlan, viablePolicies);
                 AudioArtifact audio = AudioFor(currentPlan, audioArtifacts);
+                IReadOnlyList<AudioArtifact> fallbackAudio = audioArtifacts
+                    .Where(pair => pair.Key.StartsWith(currentPlan.Profile.AudioEncoder + "|", StringComparison.Ordinal))
+                    .Select(pair => pair.Value)
+                    .ToArray();
                 progress?.Report($"Encode {attemptNumber}/{strategy.MaxFullEncodes}: {currentPlan.Width}x{currentPlan.Height}@{currentPlan.Fps:0.###}, {currentPlan.VideoKbps} kbps, {currentPlan.Profile.Backend}, {currentPlan.AudioPlan.Label}");
-                EncodeAttempt attempt = await _encoder.EncodeAttemptAsync(request, media, currentPlan, audio, tempDirectory, attemptNumber, capability.Device, cancellationToken).ConfigureAwait(false);
+                EncodeAttempt attempt = await _encoder.EncodeAttemptAsync(request, media, currentPlan, audio, fallbackAudio, tempDirectory, attemptNumber, capability.Device, cancellationToken).ConfigureAwait(false);
+                currentPlan = attempt.Plan;
                 CorrectionPoint correctionPoint = new CorrectionPoint(attemptNumber, currentPlan.VideoKbps, attempt.VideoPayloadBytes, attempt.AudioPayloadBytes, attempt.MuxOverheadBytes, attempt.SizeBytes);
                 corrections.Add(correctionPoint);
                 string currentKey = PlanKey(currentPlan);
