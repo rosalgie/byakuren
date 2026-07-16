@@ -104,6 +104,18 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
     {
         if (!features.Available) return "general";
 
+        bool localizedHighFpsGameplay = media.Fps >= 50.0 && media.HasAudio &&
+                                        AtLeast(features.EdgeDensity, 0.018) &&
+                                        AtLeast(features.UIPersistence, 0.58) &&
+                                        AtMost(features.TemporalDifference, 0.020) &&
+                                        AtMost(features.SceneCut, 0.010) &&
+                                        AtMost(features.Noise, 0.018) &&
+                                        (AtLeast(features.TemporalDifference, 0.002) ||
+                                         AtMost(features.FlatAreaRatio, 0.930));
+        bool conventionalGameplay = media.Fps >= 50.0 && AtLeast(features.EdgeDensity, 0.045) &&
+                                    AtMost(features.FlatAreaRatio, 0.910) && AtLeast(features.UIPersistence, 0.45);
+        if (localizedHighFpsGameplay || conventionalGameplay) return "gameplay";
+
         bool screenMotion = AtMost(features.TemporalDifference, 0.030) &&
                             AtLeast(features.Noise, 0.012) &&
                             AtLeast(features.EdgeDensity, 0.025);
@@ -114,10 +126,6 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
 
         if (AtLeast(features.Noise, 0.015) && AtLeast(features.TemporalDifference, 0.035))
             return "noisy_camera";
-
-        if (media.Fps >= 50.0 && AtLeast(features.EdgeDensity, 0.045) &&
-            AtMost(features.FlatAreaRatio, 0.910) && AtLeast(features.UIPersistence, 0.45))
-            return "gameplay";
 
         if (AtLeast(features.FlatAreaRatio, 0.86) && AtLeast(features.EdgeDensity, 0.025) &&
             AtMost(features.Noise, 0.012))

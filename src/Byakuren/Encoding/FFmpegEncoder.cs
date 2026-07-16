@@ -108,13 +108,15 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
             muxedCandidates.Add((candidatePath, candidateSize, candidateOverhead, muxAudio));
         }
 
-        double fillGate = Planner.CompressionPlanner.Strategy(plan.Mode).FillGate;
+        ModeStrategy strategy = Planner.CompressionPlanner.Strategy(plan.Mode);
+        double fillGate = strategy.FillGate;
         (string Path, long Size, long Overhead, AudioArtifact Audio)? eligible = muxedCandidates
             .Where(candidate => candidate.Size <= plan.HardCapBytes && candidate.Size / (double)plan.HardCapBytes >= fillGate)
             .OrderByDescending(candidate => candidate.Size)
             .Cast<(string Path, long Size, long Overhead, AudioArtifact Audio)?>()
             .FirstOrDefault();
-        (string Path, long Size, long Overhead, AudioArtifact Audio) selected = eligible ?? muxedCandidates[0];
+        (string Path, long Size, long Overhead, AudioArtifact Audio) selected =
+            attempt >= strategy.MaxFullEncodes && eligible.HasValue ? eligible.Value : muxedCandidates[0];
         foreach ((string path, _, _, _) in muxedCandidates)
             if (!path.Equals(selected.Path, StringComparison.OrdinalIgnoreCase)) TryDelete(path);
         try { File.Delete(videoPath); } catch { }

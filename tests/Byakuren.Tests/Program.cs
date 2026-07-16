@@ -33,6 +33,8 @@ public static class Program
         Run("planner retains structural sentinels and reference isolation", TestPlannerCandidates);
         Run("planner balances temporal and spatial candidates", TestTemporalSpatialPlanning);
         Run("audio priorities change payload allocation", TestAudioPriorities);
+        Run("gameplay retains high-refresh localized motion", TestGameplayRetention);
+        Run("gameplay preserves reasonable source audio", TestGameplayAudio);
         Run("result schema uses byakuren identity", () => Equal("byakuren.compress.result.v1", ResultContract.SchemaVersion, "schema"));
 
         if (arguments.Contains("--media", StringComparer.OrdinalIgnoreCase))
@@ -192,6 +194,21 @@ public static class Program
             SourceCompression = 0.5
         };
         Equal("screen", ContentAnalyzer.Classify(screenMedia, screenFeatures), "screen class");
+
+        MediaInfo sparseGameplayMedia = TestMedia(60, hasAudio: true);
+        ContentFeatures sparseGameplayFeatures = new ContentFeatures
+        {
+            Available = true,
+            UIPersistence = 0.61,
+            EdgeDensity = 0.025,
+            Entropy = 0.345,
+            FlatAreaRatio = 0.950,
+            TemporalDifference = 0.006,
+            Noise = 0.004,
+            SceneCut = 0.002,
+            SourceCompression = 0.4
+        };
+        Equal("gameplay", ContentAnalyzer.Classify(sparseGameplayMedia, sparseGameplayFeatures), "sparse gameplay class");
     }
 
     private static void TestPayloadCorrection()
@@ -319,6 +336,72 @@ public static class Program
         int visualKbps = planner.CreateAudioPlans(visual, media, profile, complexity, "general").First(plan => plan.Mode == "encode").Kbps;
         int speechKbps = planner.CreateAudioPlans(speech, media, profile, complexity, "general").First(plan => plan.Mode == "encode").Kbps;
         Equal(true, speechKbps > visualKbps, "speech audio allocation");
+    }
+
+    private static void TestGameplayAudio()
+    {
+        CompressionPlanner planner = new CompressionPlanner();
+        EncoderProfile profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4");
+        MediaInfo media = TestMedia(60, hasAudio: true) with
+        {
+            DurationSeconds = 36.9,
+            Width = 1280,
+            Height = 720,
+            AudioCodec = "aac",
+            AudioBitrateKbps = 140,
+            AudioChannels = 2
+        };
+        CompressionRequest request = new() { InputPath = "input", TargetBytes = 10 * 1024 * 1024 };
+        ComplexityAnalysis complexity = new() { DetailBucket = "Low", MotionBucket = "VeryLow" };
+
+        IReadOnlyList<AudioPlan> gameplay = planner.CreateAudioPlans(request, media, profile, complexity, "gameplay");
+        IReadOnlyList<AudioPlan> general = planner.CreateAudioPlans(request, media, profile, complexity, "general");
+
+        Equal(true, gameplay.Any(plan => plan.Mode == "copy" && plan.Kbps == 140), "reasonable gameplay audio copy");
+        Equal(false, general.Any(plan => plan.Mode == "copy"), "general audio policy unchanged");
+        Equal(true, gameplay.First(plan => plan.Mode == "encode").Kbps > general.First(plan => plan.Mode == "encode").Kbps, "gameplay audio premium");
+
+        ContentAnalysis content = new("gameplay", new ContentFeatures { Available = true });
+        CropAnalysis crop = new() { Width = media.Width, Height = media.Height };
+        IReadOnlyList<CompressionPlan> copyPlans = planner.CreateCandidatePlans(
+            request, media, profile, new AudioArtifact(null, 647_604, gameplay.First(plan => plan.Mode == "copy")),
+            content, complexity, crop, []);
+        AudioPlan lowerAudio = gameplay.First(plan => plan.Mode == "encode" && plan.Kbps == 112);
+        IReadOnlyList<CompressionPlan> lowerAudioPlans = planner.CreateCandidatePlans(
+            request, media, profile, new AudioArtifact(null, 451_778, lowerAudio),
+            content, complexity, crop, []);
+        CompressionPlan preferred = copyPlans.Concat(lowerAudioPlans).OrderByDescending(plan => plan.HeuristicScore).First();
+        Equal("copy", preferred.AudioPlan.Mode, "source audio wins over marginal gameplay video gain");
+    }
+
+    private static void TestGameplayRetention()
+    {
+        CompressionPlanner planner = new CompressionPlanner();
+        EncoderProfile profile = CompressionPolicy.CreateProfile("x264", "libx264", "mp4");
+        MediaInfo media = TestMedia(60, hasAudio: true) with { DurationSeconds = 36.9 };
+        ComplexityAnalysis complexity = new() { DetailBucket = "Low", MotionBucket = "VeryLow" };
+        CropAnalysis crop = new() { Width = media.Width, Height = media.Height };
+        ContentAnalysis gameplay = new("gameplay", new ContentFeatures { Available = true });
+        AudioPlan audioPlan = new("copy", 140, "aac", "copy source audio", 101);
+        AudioArtifact audio = new(null, 646_000, audioPlan);
+        CompressionRequest request = new()
+        {
+            InputPath = "input",
+            TargetBytes = 10 * 1024 * 1024,
+            Mode = CompressionMode.Balanced
+        };
+
+        IReadOnlyList<CompressionPlan> plans = planner.CreateCandidatePlans(
+            request, media, profile, audio, gameplay, complexity, crop, []);
+
+        Equal(true, plans.Count > 0, "gameplay plans created");
+        Equal(true, plans.All(plan => Math.Abs(plan.Fps - 60) < 0.1), "healthy-budget gameplay FPS");
+        Equal(true, plans.All(plan => plan.Preprocess != "mild-denoise"), "gameplay thin-detail preservation");
+
+        IReadOnlyList<CompressionPlan> tightPlans = planner.CreateCandidatePlans(
+            request with { TargetBytes = 2 * 1024 * 1024 }, media with { DurationSeconds = 120 }, profile,
+            audio with { PayloadBytes = 720_000 }, gameplay, complexity, crop, []);
+        Equal(true, tightPlans.All(plan => Math.Abs(plan.Fps - 30) < 0.1 || Math.Abs(plan.Fps - 24) < 0.1), "tight-budget gameplay FPS fallback");
     }
 
     private static void TestTemporalSpatialPlanning()

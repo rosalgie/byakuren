@@ -49,6 +49,7 @@ public sealed class CompressionPlanner
         {
             (AudioPriority.Speech, _) => 12,
             (AudioPriority.Visual, _) => -8,
+            (AudioPriority.Balanced, "gameplay") => 16,
             (_, "talking_head") => 8,
             _ => 0
         };
@@ -59,7 +60,10 @@ public sealed class CompressionPlanner
         int retain = request.Mode switch { CompressionMode.Fast => 2, CompressionMode.Balanced => 2, _ => 3 };
         List<AudioPlan> plans = [];
         int rank = 100;
-        if (media.AudioCodec.Equals(profile.AudioCodec, StringComparison.OrdinalIgnoreCase) && media.AudioBitrateKbps > 0 && rates.Any(rate => media.AudioBitrateKbps <= rate))
+        int copyCeiling = contentClass == "gameplay"
+            ? totalKbps switch { < 300 => 64, < 420 => 72, < 650 => 96, < 950 => 128, _ => 160 }
+            : rates.Max();
+        if (media.AudioCodec.Equals(profile.AudioCodec, StringComparison.OrdinalIgnoreCase) && media.AudioBitrateKbps > 0 && media.AudioBitrateKbps <= copyCeiling)
             plans.Add(new AudioPlan("copy", media.AudioBitrateKbps, media.AudioCodec, $"copy original audio ({media.AudioBitrateKbps}k)", rank + 1));
         foreach (int rate in rates.Take(retain))
             plans.Add(new AudioPlan("encode", rate, profile.AudioCodec, $"{profile.AudioCodec} {rate}k", rank--));
@@ -86,7 +90,7 @@ public sealed class CompressionPlanner
         (int sourceWidth, int sourceHeight) = DisplayGeometry(media, crop);
         double aspect = sourceWidth / (double)sourceHeight;
         CanonicalCanvas canvas = GetCanonicalCanvas(media, crop);
-        IReadOnlyList<double> fpsCandidates = TargetFpsCandidates(request.Mode, media.Fps, media.DurationSeconds, totalKbps, complexity, profile);
+        IReadOnlyList<double> fpsCandidates = TargetFpsCandidates(request.Mode, media.Fps, media.DurationSeconds, totalKbps, contentClass, complexity, profile);
         List<CompressionPlan> plans = [];
 
         foreach (EncoderProfile tunedProfile in TuningProfiles(profile, request.Mode, contentClass, totalKbps))
@@ -108,10 +112,11 @@ public sealed class CompressionPlanner
                         int? bufsize = maxrate.HasValue ? maxrate.Value * 2 : null;
                         double fpsRetention = Math.Min(1, fps / Math.Max(1, Math.Min(60, media.Fps)));
                         bool lowMotion = complexity.MotionBucket is "VeryLow" or "Low";
-                        double fpsWeight = request.Mode == CompressionMode.Fast || !lowMotion ? 80 : 8;
-                        double gameplayMotionBonus = contentClass == "gameplay" && !lowMotion && fpsRetention > 0.99 ? 10 : 0;
+                        double fpsWeight = request.Mode == CompressionMode.Fast || !lowMotion || contentClass == "gameplay" ? 80 : 8;
+                        double gameplayMotionBonus = contentClass == "gameplay" && fpsRetention > 0.99 ? 10 : 0;
                         double spatialQuality = SpatialQualityScore(request.Mode, complexity.DetailBucket, tunedProfile.VideoCodec, bpppf);
-                        double heuristic = widthScore + fpsRetention * fpsWeight + spatialQuality + gameplayMotionBonus + audio.Plan.Rank * 0.35 + TuningBonus(tunedProfile, profile);
+                        double audioWeight = contentClass == "gameplay" ? 0.75 : 0.35;
+                        double heuristic = widthScore + fpsRetention * fpsWeight + spatialQuality + gameplayMotionBonus + audio.Plan.Rank * audioWeight + TuningBonus(tunedProfile, profile);
                         plans.Add(new CompressionPlan
                         {
                             Profile = tunedProfile,
@@ -258,6 +263,7 @@ public sealed class CompressionPlanner
         double sourceFps,
         double durationSeconds,
         double totalKbps,
+        string contentClass,
         ComplexityAnalysis complexity,
         EncoderProfile profile)
     {
@@ -266,6 +272,12 @@ public sealed class CompressionPlanner
         bool veryLowMotion = complexity.MotionBucket == "VeryLow";
         bool lowMotion = complexity.MotionBucket is "VeryLow" or "Low";
         bool lowDetail = complexity.DetailBucket is "VeryLow" or "Low";
+        if (contentClass == "gameplay" && sourceFps > 50)
+        {
+            if (totalKbps >= 900) return [source];
+            if (totalKbps >= 650) return [source, 30];
+            return totalKbps < 330 ? [30, 24] : [30];
+        }
         if (mode == CompressionMode.Fast)
         {
             if (sourceFps > 50)
@@ -465,7 +477,7 @@ public sealed class CompressionPlanner
         List<(string, string)> candidates = [("none", "")];
         if (mode == CompressionMode.Fast) return candidates;
         if (contentClass == "noisy_camera" && (totalKbps < 1100 || bpppf < 0.055)) candidates.Add(("temporal-denoise", "hqdn3d=1.8:1.4:4.5:4.5"));
-        else if (contentClass is not ("screen" or "anime") && (totalKbps < 700 || bpppf < 0.028)) candidates.Add(("mild-denoise", "hqdn3d=1.2:1.0:3.0:3.0"));
+        else if (contentClass is not ("screen" or "anime" or "gameplay") && (totalKbps < 700 || bpppf < 0.028)) candidates.Add(("mild-denoise", "hqdn3d=1.2:1.0:3.0:3.0"));
         if (contentClass is "anime" or "noisy_camera" && (totalKbps < 950 || bpppf < 0.040)) candidates.Add(("deband", "deband=1thr=0.02:2thr=0.02:3thr=0.02:4thr=0.02:range=12:blur=1"));
         if (contentClass == "screen" && totalKbps >= 350) candidates.Add(("screen-sharpen", "unsharp=3:3:0.25:3:3:0.00"));
         if (contentClass is "anime" or "noisy_camera" && totalKbps < 700) candidates.Add(("ringing-reduction", "hqdn3d=0.8:0.6:2.0:2.0,smartblur=1.0:-0.25"));
