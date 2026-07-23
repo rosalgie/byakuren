@@ -54,9 +54,10 @@ public sealed class CompressionWorker
 
         _runner.WarningObserver = progress is null ? null : progress.Report;
 
-        if (request.VerboseCommands)
+        if (request.Verbose)
         {
             _runner.CommandObserver = command => progress?.Report(command);
+            _runner.OutputObserver = output => progress?.Report(output);
         }
 
         try
@@ -136,6 +137,7 @@ public sealed class CompressionWorker
         finally
         {
             _runner.CommandObserver = null;
+            _runner.OutputObserver = null;
             _runner.WarningObserver = null;
         }
     }

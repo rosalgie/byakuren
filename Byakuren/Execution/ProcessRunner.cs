@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Diagnostics;
+using System.Text;
 
 namespace Byakuren.Execution;
 
@@ -11,6 +12,7 @@ public sealed record ProcessResult(int ExitCode, string StandardOutput, string S
 public sealed class ProcessRunner
 {
     public Action<string>? CommandObserver { get; set; }
+    public Action<string>? OutputObserver { get; set; }
     public Action<string>? WarningObserver { get; set; }
 
     public static ProcessStartInfo CreateStartInfo(
@@ -44,8 +46,14 @@ public sealed class ProcessRunner
         if (!process.Start())
             throw new InvalidOperationException($"Could not start '{fileName}'.");
 
-        Task<string> stdoutTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
-        Task<string> stderrTask = process.StandardError.ReadToEndAsync(cancellationToken);
+        Task<string> stdoutTask = ReadOutputAsync(
+            process.StandardOutput,
+            OutputObserver,
+            cancellationToken);
+        Task<string> stderrTask = ReadOutputAsync(
+            process.StandardError,
+            OutputObserver,
+            cancellationToken);
         try
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
@@ -74,6 +82,21 @@ public sealed class ProcessRunner
         string standardOutput = await stdoutTask.ConfigureAwait(false);
         string standardError = await stderrTask.ConfigureAwait(false);
         return new ProcessResult(process.ExitCode, standardOutput, standardError);
+    }
+
+    private static async Task<string> ReadOutputAsync(
+        StreamReader reader,
+        Action<string>? observer,
+        CancellationToken cancellationToken)
+    {
+        StringBuilder output = new();
+        while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
+        {
+            output.AppendLine(line);
+            observer?.Invoke(line);
+        }
+
+        return output.ToString();
     }
 
     public async Task<ProcessResult> RunCheckedAsync(

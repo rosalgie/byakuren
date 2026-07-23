@@ -172,9 +172,9 @@ public sealed class CLIOptions
         Description = "Path for the planning event log"
     };
 
-    private readonly Option<bool> _verboseCommands = new("--verbose-commands", "-VerboseCommands")
+    private readonly Option<bool> _verbose = new("--verbose", "-v")
     {
-        Description = "Print external commands before running them"
+        Description = "Print external commands and stream their output"
     };
 
     private readonly Option<string?> _ffmpeg = new("--ffmpeg", "-FFmpeg")
@@ -242,7 +242,7 @@ public sealed class CLIOptions
         command.Options.Add(_metricMaxSamples);
         command.Options.Add(_enablePlanLogging);
         command.Options.Add(_planLogPath);
-        command.Options.Add(_verboseCommands);
+        command.Options.Add(_verbose);
         command.Options.Add(_ffmpeg);
         command.Options.Add(_ffprobe);
     }
@@ -293,7 +293,7 @@ public sealed class CLIOptions
             MetricMaxSamples = GetNonNegativeValue(parseResult.GetValue(_metricMaxSamples), 0, 0, "--metric-max-samples"),
             EnablePlanLogging = parseResult.GetValue(_enablePlanLogging),
             PlanLogPath = parseResult.GetValue(_planLogPath),
-            VerboseCommands = parseResult.GetValue(_verboseCommands),
+            Verbose = parseResult.GetValue(_verbose),
             FFmpegPath = parseResult.GetValue(_ffmpeg) ?? "ffmpeg",
             FFprobePath = parseResult.GetValue(_ffprobe) ?? "ffprobe"
         };

@@ -94,7 +94,7 @@ public sealed record CompressionRequest
     public int MetricMaxSamples { get; init; }
     public bool EnablePlanLogging { get; init; }
     public string? PlanLogPath { get; init; }
-    public bool VerboseCommands { get; init; }
+    public bool Verbose { get; init; }
     public string FFmpegPath { get; init; } = "ffmpeg";
     public string FFprobePath { get; init; } = "ffprobe";
 }
