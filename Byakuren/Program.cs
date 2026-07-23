@@ -57,7 +57,9 @@ public static class Program
             stopwatch.Stop();
 
             Console.WriteLine($"Output: {outcome.OutputPath}");
-            Console.WriteLine($"Compression time: {stopwatch.Elapsed:hh\\:mm\\:ss}");
+            Console.WriteLine(
+                $"Compression time: {(int)stopwatch.Elapsed.TotalHours:00}:{stopwatch.Elapsed:mm\\:ss\\.fff}"
+            );
             return 0;
         }
         catch (OperationCanceledException)
