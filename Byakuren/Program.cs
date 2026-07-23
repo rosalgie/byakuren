@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using Byakuren.CLI;
 using Byakuren.Models;
@@ -49,11 +50,14 @@ public static class Program
         {
             CompressionWorker worker = new();
             Progress<string> progress = new(Console.WriteLine);
+            Stopwatch stopwatch = Stopwatch.StartNew();
             CompressionOutcome outcome = await worker
                 .RunAsync(request, progress, cancellationToken)
                 .ConfigureAwait(false);
+            stopwatch.Stop();
 
             Console.WriteLine($"Output: {outcome.OutputPath}");
+            Console.WriteLine($"Compression time: {stopwatch.Elapsed:hh\\:mm\\:ss}");
             return 0;
         }
         catch (OperationCanceledException)
