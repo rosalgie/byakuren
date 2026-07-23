@@ -25,6 +25,9 @@ public static class Program
         {
             CLIOptions options = new();
             RootCommand command = options.CreateRootCommand(RunCompressionAsync);
+            if (args.Length == 0)
+                args = ["--help"];
+
             ParseResult parseResult = command.Parse(args);
 
             InvocationConfiguration configuration = new();
