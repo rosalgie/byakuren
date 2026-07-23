@@ -272,7 +272,7 @@ public sealed record MetricWindow(
 
 public sealed record ContentFeatures
 {
-    public const string ClassifierVersion = "direct-core-v1";
+    public const string ClassifierVersion = "kasumi-core-v1";
     public bool Available { get; init; }
     public double? EdgeDensity { get; init; }
     public double? FlatAreaRatio { get; init; }
