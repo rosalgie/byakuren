@@ -15,7 +15,7 @@ public sealed class CLIOptions
         Description = "Absolute output size cap in bytes"
     };
 
-    private readonly Option<double?> _targetMegabytes = new("--target-mb", "-TargetMB")
+    private readonly Option<double?> _targetMegabytes = new("--target-mb", "-t", "-TargetMB")
     {
         Description = "Output size cap in MiB, or MB when --target-unit is DecimalMB"
     };
