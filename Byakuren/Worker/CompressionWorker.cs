@@ -1,6 +1,8 @@
+using System.ComponentModel;
 using Byakuren.Analysis;
 using Byakuren.Encoding;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Metrics;
 using Byakuren.Models;
 using Byakuren.Planner;
@@ -48,6 +50,8 @@ public sealed class CompressionWorker
     {
         DateTimeOffset started = DateTimeOffset.UtcNow;
         Validate(request);
+
+        _runner.WarningObserver = progress is null ? null : progress.Report;
 
         if (request.VerboseCommands)
         {
@@ -122,18 +126,16 @@ public sealed class CompressionWorker
             }
             finally
             {
-                try
-                {
-                    Directory.Delete(tempDirectory, recursive: true);
-                }
-                catch
-                {
-                }
+                FileSystemCleanup.DeleteDirectory(
+                    tempDirectory,
+                    recursive: true,
+                    _runner.ReportWarning);
             }
         }
         finally
         {
             _runner.CommandObserver = null;
+            _runner.WarningObserver = null;
         }
     }
 
@@ -615,7 +617,7 @@ public sealed class CompressionWorker
         CopyExact(encoding.Best.OutputPath!, outputPath);
         if (new FileInfo(outputPath).Length > request.TargetBytes)
         {
-            TryDelete(outputPath);
+            FileSystemCleanup.DeleteFile(outputPath, _runner.ReportWarning);
             throw new InvalidOperationException("Final mux exceeded the requested hard byte cap.");
         }
 
@@ -664,7 +666,7 @@ public sealed class CompressionWorker
         return new CompressionOutcome(outputPath, result);
     }
 
-    private static EncodeAttempt? KeepBetterAttempt(
+    private EncodeAttempt? KeepBetterAttempt(
         EncodeAttempt attempt,
         EncodeAttempt? best,
         IReadOnlyDictionary<string, int> priority)
@@ -673,7 +675,7 @@ public sealed class CompressionWorker
         {
             if (best?.OutputPath is not null)
             {
-                TryDelete(best.OutputPath);
+                FileSystemCleanup.DeleteFile(best.OutputPath, _runner.ReportWarning);
             }
 
             return attempt;
@@ -681,7 +683,7 @@ public sealed class CompressionWorker
 
         if (attempt.OutputPath is not null && !ReferenceEquals(best, attempt))
         {
-            TryDelete(attempt.OutputPath);
+            FileSystemCleanup.DeleteFile(attempt.OutputPath, _runner.ReportWarning);
         }
 
         return best;
@@ -723,7 +725,7 @@ public sealed class CompressionWorker
         }
         catch
         {
-            TryDelete(outputPath);
+            FileSystemCleanup.DeleteFile(outputPath, _runner.ReportWarning);
             throw;
         }
     }
@@ -802,7 +804,7 @@ public sealed class CompressionWorker
                         window,
                         cancellationToken).ConfigureAwait(false);
                     windowMetrics.Add(metrics);
-                    TryDelete(path);
+                    FileSystemCleanup.DeleteFile(path, _runner.ReportWarning);
                 }
                 MetricEnsemble merged = MergeMetrics(windowMetrics);
                 PlanPreview preview = new(
@@ -824,14 +826,19 @@ public sealed class CompressionWorker
                     .WriteAsync("preview-complete", previewLog, cancellationToken)
                     .ConfigureAwait(false);
             }
-            catch (Exception exception) when (exception is not OperationCanceledException)
+            catch (Exception exception) when (
+                exception is Win32Exception or
+                    IOException or
+                    UnauthorizedAccessException or
+                    InvalidOperationException or
+                    NotSupportedException)
             {
                 object failureLog = new { Plan = plan, Error = exception.Message };
                 await logger
                     .WriteAsync("preview-failed", failureLog, cancellationToken)
                     .ConfigureAwait(false);
                 if (!string.IsNullOrWhiteSpace(lastPath))
-                    TryDelete(lastPath);
+                    FileSystemCleanup.DeleteFile(lastPath, _runner.ReportWarning);
             }
         }
         return previews;
@@ -1089,17 +1096,6 @@ public sealed class CompressionWorker
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(destination))!);
         if (!Path.GetFullPath(source).Equals(Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
             File.Copy(source, destination, overwrite: true);
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
     }
 
     private sealed record ViablePolicy(

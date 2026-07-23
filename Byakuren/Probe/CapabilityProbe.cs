@@ -1,7 +1,9 @@
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text.Json;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Models;
 
 namespace Byakuren.Probe;
@@ -118,19 +120,13 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
                 throw new InvalidOperationException(decoded.StandardError);
             success = true;
         }
-        catch (Exception exception) when (exception is not OperationCanceledException)
+        catch (Exception exception) when (IsRecoverableProbeFailure(exception))
         {
             error = LastUsefulLine(exception.Message);
         }
         finally
         {
-            try
-            {
-                Directory.Delete(temp, recursive: true);
-            }
-            catch
-            {
-            }
+            FileSystemCleanup.DeleteDirectory(temp, recursive: true, runner.ReportWarning);
         }
 
         CapabilityProbeResult result = new()
@@ -205,15 +201,32 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
                 cancellationToken).ConfigureAwait(false);
             if (result.ExitCode == 0)
                 return Hash(result.CombinedOutput);
+
+            runner.ReportWarning(
+                $"Could not query the driver for device '{device}'; using a device-file fingerprint instead.",
+                new InvalidOperationException(LastUsefulLine(result.StandardError)));
         }
-        catch
+        catch (Exception exception) when (IsRecoverableProbeFailure(exception))
         {
+            runner.ReportWarning(
+                $"Could not query the driver for device '{device}'; using a device-file fingerprint instead.",
+                exception);
         }
 
         if (!File.Exists(device))
             return "device-unavailable";
 
-        return $"device:{new FileInfo(device).Length}:{File.GetLastWriteTimeUtc(device):O}";
+        try
+        {
+            return $"device:{new FileInfo(device).Length}:{File.GetLastWriteTimeUtc(device):O}";
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
+        {
+            runner.ReportWarning(
+                $"Could not read metadata for device '{device}'; capability caching will use a fallback key.",
+                exception);
+            return "device-metadata-unavailable";
+        }
     }
 
     private static string ResolveHardwareDevice(string requested)
@@ -246,7 +259,7 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
     private static string CachePath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Byakuren", "encoder-capabilities-v2.json");
 
-    private static async Task<Dictionary<string, CapabilityProbeResult>> LoadCacheAsync(CancellationToken cancellationToken)
+    private async Task<Dictionary<string, CapabilityProbeResult>> LoadCacheAsync(CancellationToken cancellationToken)
     {
         try
         {
@@ -262,24 +275,31 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
 
             return cache ?? new();
         }
-        catch
+        catch (Exception exception) when (
+            exception is IOException or UnauthorizedAccessException or JsonException)
         {
+            runner.ReportWarning($"Could not read capability cache '{CachePath}'; probing again.", exception);
             return new();
         }
     }
 
-    private static async Task SaveCacheAsync(Dictionary<string, CapabilityProbeResult> cache, CancellationToken cancellationToken)
+    private async Task SaveCacheAsync(Dictionary<string, CapabilityProbeResult> cache, CancellationToken cancellationToken)
     {
+        string temporary = CachePath + $".{Guid.NewGuid():N}.tmp";
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(CachePath)!);
-            string temporary = CachePath + $".{Guid.NewGuid():N}.tmp";
             await using (FileStream stream = File.Create(temporary))
                 await JsonSerializer.SerializeAsync(stream, cache, JsonOptions, cancellationToken).ConfigureAwait(false);
             File.Move(temporary, CachePath, overwrite: true);
         }
-        catch
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
         {
+            runner.ReportWarning($"Could not update capability cache '{CachePath}'.", exception);
+        }
+        finally
+        {
+            FileSystemCleanup.DeleteFile(temporary, runner.ReportWarning);
         }
     }
 
@@ -297,4 +317,11 @@ public sealed class CapabilityProbe(ProcessRunner runner, FFmpegProbe ffmpegProb
             .LastOrDefault()
             ?.Trim() ?? "functional probe failed";
     }
+
+    private static bool IsRecoverableProbeFailure(Exception exception) =>
+        exception is Win32Exception or
+            IOException or
+            UnauthorizedAccessException or
+            InvalidOperationException or
+            NotSupportedException;
 }

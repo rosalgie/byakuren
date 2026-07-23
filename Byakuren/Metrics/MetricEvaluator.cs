@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Byakuren.Analysis;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Models;
 using Byakuren.Planner;
 using Byakuren.Probe;
@@ -303,31 +304,39 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
             $"[dist][ref]libvmaf=log_fmt=json:log_path='{EscapeFilterPath(logPath)}':" +
             "model='version=vmaf_v0.6.1neg\\:name=vmaf_neg|" +
             "version=vmaf_v0.6.1\\:name=vmaf'";
-        ProcessResult result = await runner.RunAsync(request.FFmpegPath,
-        [
-            "-v", "error", "-ss", Number(referenceStart), "-t", Number(duration), "-i", media.Path,
-            "-ss", Number(distortedStart), "-t", Number(duration), "-i", outputPath,
-            "-filter_complex", filter, "-f", "null", "-"
-        ], cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 || !File.Exists(logPath))
-            return (null, null, result.StandardError);
         try
         {
-            string json = await File
-                .ReadAllTextAsync(logPath, cancellationToken)
-                .ConfigureAwait(false);
-            using JsonDocument document = JsonDocument.Parse(json);
-            JsonElement pooled = document.RootElement.GetProperty("pooled_metrics");
-            double? standard = Mean(pooled, "vmaf");
-            return (Mean(pooled, "vmaf_neg") ?? standard, standard, null);
-        }
-        catch (Exception exception)
-        {
-            return (null, null, exception.Message);
+            ProcessResult result = await runner.RunAsync(request.FFmpegPath,
+            [
+                "-v", "error", "-ss", Number(referenceStart), "-t", Number(duration), "-i", media.Path,
+                "-ss", Number(distortedStart), "-t", Number(duration), "-i", outputPath,
+                "-filter_complex", filter, "-f", "null", "-"
+            ], cancellationToken).ConfigureAwait(false);
+            if (result.ExitCode != 0 || !File.Exists(logPath))
+                return (null, null, result.StandardError);
+            try
+            {
+                string json = await File
+                    .ReadAllTextAsync(logPath, cancellationToken)
+                    .ConfigureAwait(false);
+                using JsonDocument document = JsonDocument.Parse(json);
+                JsonElement pooled = document.RootElement.GetProperty("pooled_metrics");
+                double? standard = Mean(pooled, "vmaf");
+                return (Mean(pooled, "vmaf_neg") ?? standard, standard, null);
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                    UnauthorizedAccessException or
+                    JsonException or
+                    KeyNotFoundException or
+                    InvalidOperationException)
+            {
+                return (null, null, exception.Message);
+            }
         }
         finally
         {
-            TryDelete(logPath);
+            FileSystemCleanup.DeleteFile(logPath, runner.ReportWarning);
         }
     }
 
@@ -391,30 +400,38 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
             $"[1:v]{distortedFilter},setpts=PTS-STARTPTS[dist];" +
             $"[dist][ref]libvmaf=log_fmt=json:log_path='{EscapeFilterPath(logPath)}':" +
             "feature='name=cambi'";
-        ProcessResult result = await runner.RunAsync(request.FFmpegPath,
-        [
-            "-v", "error", "-ss", Number(referenceStart), "-t", Number(duration), "-i", media.Path,
-            "-ss", Number(distortedStart), "-t", Number(duration), "-i", outputPath,
-            "-filter_complex", filter, "-f", "null", "-"
-        ], cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 || !File.Exists(logPath))
-            return (null, result.StandardError);
         try
         {
-            string json = await File
-                .ReadAllTextAsync(logPath, cancellationToken)
-                .ConfigureAwait(false);
-            using JsonDocument document = JsonDocument.Parse(json);
-            JsonElement pooledMetrics = document.RootElement.GetProperty("pooled_metrics");
-            return (Mean(pooledMetrics, "cambi"), null);
-        }
-        catch (Exception exception)
-        {
-            return (null, exception.Message);
+            ProcessResult result = await runner.RunAsync(request.FFmpegPath,
+            [
+                "-v", "error", "-ss", Number(referenceStart), "-t", Number(duration), "-i", media.Path,
+                "-ss", Number(distortedStart), "-t", Number(duration), "-i", outputPath,
+                "-filter_complex", filter, "-f", "null", "-"
+            ], cancellationToken).ConfigureAwait(false);
+            if (result.ExitCode != 0 || !File.Exists(logPath))
+                return (null, result.StandardError);
+            try
+            {
+                string json = await File
+                    .ReadAllTextAsync(logPath, cancellationToken)
+                    .ConfigureAwait(false);
+                using JsonDocument document = JsonDocument.Parse(json);
+                JsonElement pooledMetrics = document.RootElement.GetProperty("pooled_metrics");
+                return (Mean(pooledMetrics, "cambi"), null);
+            }
+            catch (Exception exception) when (
+                exception is IOException or
+                    UnauthorizedAccessException or
+                    JsonException or
+                    KeyNotFoundException or
+                    InvalidOperationException)
+            {
+                return (null, exception.Message);
+            }
         }
         finally
         {
-            TryDelete(logPath);
+            FileSystemCleanup.DeleteFile(logPath, runner.ReportWarning);
         }
     }
 
@@ -640,17 +657,6 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
                 StringSplitOptions.RemoveEmptyEntries))
             .LastOrDefault()
             ?.Trim();
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
     }
 
     private sealed record WindowEvaluation(

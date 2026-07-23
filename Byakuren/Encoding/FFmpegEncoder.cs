@@ -1,5 +1,6 @@
 using System.Text;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Models;
 using Byakuren.Probe;
 
@@ -152,8 +153,8 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
 
         foreach ((string path, _, _, _) in muxedCandidates)
             if (!path.Equals(selected.Path, StringComparison.OrdinalIgnoreCase))
-                TryDelete(path);
-        TryDelete(videoPath);
+                FileSystemCleanup.DeleteFile(path, runner.ReportWarning);
+        FileSystemCleanup.DeleteFile(videoPath, runner.ReportWarning);
 
         string? eligiblePath = selected.Path;
         if (selected.Size > plan.HardCapBytes)
@@ -266,21 +267,10 @@ public sealed class FFmpegEncoder(ProcessRunner runner, FFmpegProbe probe)
     }
 
     private static string Number(double value) => value.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture);
-    private static void CleanupPassLog(string passLog)
+    private void CleanupPassLog(string passLog)
     {
         string directory = Path.GetDirectoryName(passLog)!;
         string pattern = Path.GetFileName(passLog) + "*";
-        foreach (string path in Directory.GetFiles(directory, pattern))
-            TryDelete(path);
-    }
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
+        FileSystemCleanup.DeleteFiles(directory, pattern, runner.ReportWarning);
     }
 }

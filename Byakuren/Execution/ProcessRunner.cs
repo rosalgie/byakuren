@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics;
 
 namespace Byakuren.Execution;
@@ -10,6 +11,7 @@ public sealed record ProcessResult(int ExitCode, string StandardOutput, string S
 public sealed class ProcessRunner
 {
     public Action<string>? CommandObserver { get; set; }
+    public Action<string>? WarningObserver { get; set; }
 
     public static ProcessStartInfo CreateStartInfo(
         string fileName,
@@ -48,14 +50,22 @@ public sealed class ProcessRunner
         {
             await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
         }
-        catch (OperationCanceledException)
+        catch (OperationCanceledException cancellationException)
         {
             try
             {
-                process.Kill(entireProcessTree: true);
+                if (!process.HasExited)
+                    process.Kill(entireProcessTree: true);
             }
-            catch
+            catch (Exception terminationException) when (
+                terminationException is InvalidOperationException or
+                    NotSupportedException or
+                    Win32Exception)
             {
+                cancellationException.Data["ProcessTerminationException"] = terminationException;
+                ReportWarning(
+                    $"Could not terminate process '{fileName}' after cancellation.",
+                    terminationException);
             }
 
             throw;
@@ -85,6 +95,18 @@ public sealed class ProcessRunner
 
     private static string LastUsefulLine(string value) =>
         value.Split(['\r', '\n'], StringSplitOptions.RemoveEmptyEntries).LastOrDefault()?.Trim() ?? "no diagnostic output";
+
+    internal void ReportWarning(string message, Exception exception)
+    {
+        string detail = string.IsNullOrWhiteSpace(exception.Message)
+            ? exception.GetType().Name
+            : $"{exception.GetType().Name}: {exception.Message}";
+        string warning = $"Warning: {message} {detail}";
+        if (WarningObserver is not null)
+            WarningObserver(warning);
+        else
+            Console.Error.WriteLine(warning);
+    }
 
     private static string FormatCommand(string fileName, IEnumerable<string> arguments)
     {

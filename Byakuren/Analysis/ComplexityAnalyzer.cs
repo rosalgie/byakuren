@@ -1,5 +1,6 @@
 using System.Globalization;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Models;
 
 namespace Byakuren.Analysis;
@@ -104,18 +105,24 @@ public sealed class ComplexityAnalyzer(ProcessRunner runner)
         foreach (SampleWindow window in windows)
         {
             string path = Path.Combine(tempDirectory, $"probe-{name}-{index++}.mp4");
-            ProcessResult result = await runner.RunAsync(request.FFmpegPath,
-            [
-                "-y", "-ss", Number(window.StartSeconds), "-t", Number(window.DurationSeconds), "-i", media.Path,
-                "-vf", $"setsar=1,scale={width}:-2:flags=bicubic,fps={fps}", "-an",
-                "-c:v", "libx264", "-preset", preset, "-crf", crf.ToString(CultureInfo.InvariantCulture), path
-            ], cancellationToken).ConfigureAwait(false);
-            if (result.ExitCode == 0 && File.Exists(path))
+            try
             {
-                long bytes = new FileInfo(path).Length;
-                values.Add(bytes * 8.0 / Math.Max(0.25, window.DurationSeconds) / 1000.0);
+                ProcessResult result = await runner.RunAsync(request.FFmpegPath,
+                [
+                    "-y", "-ss", Number(window.StartSeconds), "-t", Number(window.DurationSeconds), "-i", media.Path,
+                    "-vf", $"setsar=1,scale={width}:-2:flags=bicubic,fps={fps}", "-an",
+                    "-c:v", "libx264", "-preset", preset, "-crf", crf.ToString(CultureInfo.InvariantCulture), path
+                ], cancellationToken).ConfigureAwait(false);
+                if (result.ExitCode == 0 && File.Exists(path))
+                {
+                    long bytes = new FileInfo(path).Length;
+                    values.Add(bytes * 8.0 / Math.Max(0.25, window.DurationSeconds) / 1000.0);
+                }
             }
-            TryDelete(path);
+            finally
+            {
+                FileSystemCleanup.DeleteFile(path, runner.ReportWarning);
+            }
         }
         return values;
     }
@@ -168,14 +175,4 @@ public sealed class ComplexityAnalyzer(ProcessRunner runner)
         return sorted[index];
     }
     private static string Number(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
-    }
 }

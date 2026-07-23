@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.Diagnostics.CodeAnalysis;
 using Byakuren.CLI;
 using Byakuren.Models;
 using Byakuren.Worker;
@@ -36,6 +37,10 @@ public static class Program
         }
     }
 
+    [SuppressMessage(
+        "Design",
+        "CA1031:Do not catch general exception types",
+        Justification = "This is the application boundary that translates unhandled failures into a nonzero exit code.")]
     private static async Task<int> RunCompressionAsync(
         CompressionRequest request,
         CancellationToken cancellationToken)

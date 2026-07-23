@@ -15,3 +15,5 @@ csharp_style_expression_bodied_operators = false:suggestion
 csharp_style_prefer_switch_expression = true:suggestion
 dotnet_style_prefer_conditional_expression_over_assignment = false:suggestion
 dotnet_style_prefer_conditional_expression_over_return = false:suggestion
+
+dotnet_diagnostic.CA1031.severity = error

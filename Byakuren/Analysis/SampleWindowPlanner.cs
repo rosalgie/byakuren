@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.RegularExpressions;
 using Byakuren.Execution;
+using Byakuren.IO;
 using Byakuren.Models;
 
 namespace Byakuren.Analysis;
@@ -139,17 +140,23 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
         double duration = Math.Min(2, window.DurationSeconds);
         int width = media.Width >= 854 ? 320 : Math.Min(media.Width, 240);
         int fps = media.Fps > 24.5 ? 18 : Math.Max(12, (int)Math.Round(media.Fps));
-        ProcessResult result = await runner.RunAsync(request.FFmpegPath,
-        [
-            "-y", "-ss", Number(window.StartSeconds), "-t", Number(duration), "-i", media.Path,
-            "-vf", $"setsar=1,scale={width}:-2:flags=bicubic,fps={fps}", "-an",
-            "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", path
-        ], cancellationToken).ConfigureAwait(false);
-        if (result.ExitCode != 0 || !File.Exists(path))
-            return 0;
-        long bytes = new FileInfo(path).Length;
-        TryDelete(path);
-        return Math.Round(bytes * 8.0 / Math.Max(0.25, duration) / 1000.0, 2);
+        try
+        {
+            ProcessResult result = await runner.RunAsync(request.FFmpegPath,
+            [
+                "-y", "-ss", Number(window.StartSeconds), "-t", Number(duration), "-i", media.Path,
+                "-vf", $"setsar=1,scale={width}:-2:flags=bicubic,fps={fps}", "-an",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", path
+            ], cancellationToken).ConfigureAwait(false);
+            if (result.ExitCode != 0 || !File.Exists(path))
+                return 0;
+            long bytes = new FileInfo(path).Length;
+            return Math.Round(bytes * 8.0 / Math.Max(0.25, duration) / 1000.0, 2);
+        }
+        finally
+        {
+            FileSystemCleanup.DeleteFile(path, runner.ReportWarning);
+        }
     }
 
     private static List<SampleWindow> Deduplicate(IEnumerable<SampleWindow> windows, int sampleSeconds)
@@ -207,14 +214,4 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
     }
 
     private static string Number(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            File.Delete(path);
-        }
-        catch
-        {
-        }
-    }
 }
