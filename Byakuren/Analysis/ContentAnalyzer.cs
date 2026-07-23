@@ -7,12 +7,15 @@ namespace Byakuren.Analysis;
 
 public sealed class ContentAnalyzer(ProcessRunner runner)
 {
+    public const double DarkLuminanceThreshold = 0.18;
+
     public async Task<ContentAnalysis> AnalyzeAsync(
         CompressionRequest request,
         MediaInfo media,
         CancellationToken cancellationToken)
     {
         List<double> entropyValues = [];
+        List<double> luminanceValues = [];
         List<double> temporalValues = [];
         List<double> noiseValues = [];
         List<double> edgeValues = [];
@@ -41,6 +44,10 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             ], cancellationToken).ConfigureAwait(false);
             if (baseProbe.ExitCode == 0)
             {
+                double? luminance = MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.YAVG");
+                if (luminance.HasValue)
+                    luminanceValues.Add(luminance.Value / 255.0);
+
                 AddIfAvailable(
                     entropyValues,
                     MetadataAverage(
@@ -112,6 +119,7 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         {
             Available = edgeValues.Count > 0 && flatValues.Count > 0 && entropyValues.Count > 0 &&
                         temporalValues.Count > 0 && noiseValues.Count > 0 && sceneValues.Count > 0,
+            LuminanceMean = Rounded(Average(luminanceValues)),
             EdgeDensity = Rounded(edgeDensity),
             FlatAreaRatio = Rounded(Average(flatValues)),
             Entropy = Rounded(Average(entropyValues)),
@@ -123,7 +131,18 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             Error = errors.Count == 0 ? null : LastUsefulError(errors)
         };
         string contentClass = Classify(media, features);
-        return new ContentAnalysis(contentClass, features);
+        return new ContentAnalysis(contentClass, features)
+        {
+            Traits = ClassifyTraits(features)
+        };
+    }
+
+    public static IReadOnlyList<string> ClassifyTraits(ContentFeatures features)
+    {
+        List<string> traits = [];
+        if (AtMost(features.LuminanceMean, DarkLuminanceThreshold))
+            traits.Add("dark");
+        return traits;
     }
 
     public static string Classify(MediaInfo media, ContentFeatures features)

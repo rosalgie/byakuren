@@ -272,8 +272,9 @@ public sealed record MetricWindow(
 
 public sealed record ContentFeatures
 {
-    public const string ClassifierVersion = "kasumi-core-v1";
+    public const string ClassifierVersion = "kasumi-core-v2";
     public bool Available { get; init; }
+    public double? LuminanceMean { get; init; }
     public double? EdgeDensity { get; init; }
     public double? FlatAreaRatio { get; init; }
     public double? Entropy { get; init; }
@@ -285,7 +286,10 @@ public sealed record ContentFeatures
     public string? Error { get; init; }
 }
 
-public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features);
+public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
+{
+    public IReadOnlyList<string> Traits { get; init; } = [];
+}
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);
 

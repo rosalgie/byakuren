@@ -15,6 +15,8 @@ namespace Byakuren.Worker;
 
 public sealed class CompressionWorker
 {
+    private const double AdaptiveXpsnrConfidenceMargin = 0.25;
+
     private readonly ProcessRunner _runner;
     private readonly CompressionPolicy _policy;
     private readonly CompressionPlanner _planner;
@@ -261,7 +263,7 @@ public sealed class CompressionWorker
             planLogger,
             cancellationToken).ConfigureAwait(false);
 
-        IReadOnlyList<PlanPreview> previews = await PreviewCandidatesAsync(
+        PreviewEvaluation previewEvaluation = await PreviewCandidatesAsync(
             request,
             media,
             candidates.Plans,
@@ -271,6 +273,7 @@ public sealed class CompressionWorker
             progress,
             planLogger,
             cancellationToken).ConfigureAwait(false);
+        IReadOnlyList<PlanPreview> previews = previewEvaluation.Previews;
 
         CompressionPlan selectedPlan = SelectPlan(candidates.Plans, previews);
         List<CompressionPlan> encodeOrder = BuildEncodeOrder(
@@ -281,6 +284,7 @@ public sealed class CompressionWorker
         object selectionLog = new
         {
             Selected = selectedPlan,
+            AdaptiveMetric = previewEvaluation.Decision,
             Previews = previews.Select(preview => new
             {
                 preview.Plan.Identity,
@@ -313,6 +317,7 @@ public sealed class CompressionWorker
             viablePolicies,
             encoding,
             tempDirectory,
+            previewEvaluation.FinalMetricMode,
             planLogger,
             cancellationToken).ConfigureAwait(false);
     }
@@ -355,8 +360,11 @@ public sealed class CompressionWorker
 
         if (content is not null)
         {
+            string traits = content.Traits.Count == 0
+                ? ""
+                : $" [{string.Join(", ", content.Traits)}]";
             progress?.Report(
-                $"Content classification: {content.ContentClass} " +
+                $"Content classification: {content.ContentClass}{traits} " +
                 $"({ContentFeatures.ClassifierVersion})");
         }
 
@@ -608,6 +616,7 @@ public sealed class CompressionWorker
         IReadOnlyList<ViablePolicy> viablePolicies,
         EncodingResult encoding,
         string tempDirectory,
+        MetricMode finalMetricMode,
         PlanLogger planLogger,
         CancellationToken cancellationToken)
     {
@@ -627,7 +636,7 @@ public sealed class CompressionWorker
         await VerifyOutputAsync(request, outputPath, cancellationToken).ConfigureAwait(false);
 
         MetricEnsemble metrics = await _metrics.EvaluateAsync(
-            request,
+            request with { MetricMode = finalMetricMode },
             media,
             finalPlan,
             outputPath,
@@ -733,7 +742,7 @@ public sealed class CompressionWorker
         }
     }
 
-    private async Task<IReadOnlyList<PlanPreview>> PreviewCandidatesAsync(
+    private async Task<PreviewEvaluation> PreviewCandidatesAsync(
         CompressionRequest request,
         MediaInfo media,
         IReadOnlyList<CompressionPlan> candidates,
@@ -745,16 +754,42 @@ public sealed class CompressionWorker
         CancellationToken cancellationToken)
     {
         if (strategy.PreviewTop <= 0 || request.MetricMode == MetricMode.Off)
-            return [];
-        bool metricAvailable = request.MetricMode != MetricMode.Auto ||
-            await _probe.HasFilterAsync(request.FFmpegPath, "libvmaf", cancellationToken).ConfigureAwait(false) ||
-            await _probe.HasFilterAsync(request.FFmpegPath, "xpsnr", cancellationToken).ConfigureAwait(false);
-        if (!metricAvailable)
-            return [];
+        {
+            return new PreviewEvaluation(
+                [],
+                request.MetricMode,
+                AdaptiveMetricDecision.Disabled("preview-disabled"));
+        }
+
+        bool hasVmaf = true;
+        bool hasXpsnr = true;
+        MetricMode initialMetricMode = request.MetricMode;
+        if (request.MetricMode == MetricMode.Auto)
+        {
+            hasVmaf = await _probe
+                .HasFilterAsync(request.FFmpegPath, "libvmaf", cancellationToken)
+                .ConfigureAwait(false);
+            hasXpsnr = await _probe
+                .HasFilterAsync(request.FFmpegPath, "xpsnr", cancellationToken)
+                .ConfigureAwait(false);
+            initialMetricMode = hasXpsnr
+                ? MetricMode.XPSNR
+                : hasVmaf
+                    ? MetricMode.VMAF
+                    : MetricMode.Off;
+        }
+
+        if (initialMetricMode == MetricMode.Off)
+        {
+            return new PreviewEvaluation(
+                [],
+                MetricMode.Off,
+                AdaptiveMetricDecision.Disabled("no-metric-filter"));
+        }
 
         IReadOnlyList<CompressionPlan> previewPlans = _planner.CreatePreviewShortlist(candidates, strategy.PreviewTop);
 
-        List<PlanPreview> previews = [];
+        List<PreviewWork> work = [];
         int previewNumber = 0;
         foreach (CompressionPlan plan in previewPlans.Take(strategy.PreviewTop))
         {
@@ -764,7 +799,7 @@ public sealed class CompressionWorker
                 $"Preview {previewNumber}/{previewCount}: {plan.Profile.Backend} " +
                 $"{plan.Width}x{plan.Height}@{plan.Fps:0.###} {plan.Preprocess}");
             DateTimeOffset started = DateTimeOffset.UtcNow;
-            List<MetricEnsemble> windowMetrics = [];
+            List<PreviewSample> samples = [];
             long bytes = 0;
             string lastPath = "";
             try
@@ -799,35 +834,20 @@ public sealed class CompressionWorker
                     lastPath = path;
                     bytes += new FileInfo(path).Length;
                     MetricEnsemble metrics = await _metrics.EvaluatePreviewAsync(
-                        request,
+                        request with { MetricMode = initialMetricMode },
                         media,
                         plan,
                         path,
                         tempDirectory,
                         window,
                         cancellationToken).ConfigureAwait(false);
-                    windowMetrics.Add(metrics);
-                    FileSystemCleanup.DeleteFile(path, _runner.ReportWarning);
+                    samples.Add(new PreviewSample(window, path, metrics));
                 }
-                MetricEnsemble merged = MergeMetrics(windowMetrics);
-                PlanPreview preview = new(
+                work.Add(new PreviewWork(
                     plan,
-                    merged,
-                    lastPath,
+                    samples,
                     bytes,
-                    (DateTimeOffset.UtcNow - started).TotalSeconds);
-                previews.Add(preview);
-
-                object previewLog = new
-                {
-                    Plan = plan,
-                    Metrics = merged,
-                    Bytes = bytes,
-                    preview.RuntimeSeconds
-                };
-                await logger
-                    .WriteAsync("preview-complete", previewLog, cancellationToken)
-                    .ConfigureAwait(false);
+                    (DateTimeOffset.UtcNow - started).TotalSeconds));
             }
             catch (Exception exception) when (
                 exception is Win32Exception or
@@ -840,11 +860,241 @@ public sealed class CompressionWorker
                 await logger
                     .WriteAsync("preview-failed", failureLog, cancellationToken)
                     .ConfigureAwait(false);
-                if (!string.IsNullOrWhiteSpace(lastPath))
+                foreach (PreviewSample sample in samples)
+                    FileSystemCleanup.DeleteFile(sample.Path, _runner.ReportWarning);
+                if (!string.IsNullOrWhiteSpace(lastPath) &&
+                    samples.All(sample => !sample.Path.Equals(lastPath, StringComparison.OrdinalIgnoreCase)))
+                {
                     FileSystemCleanup.DeleteFile(lastPath, _runner.ReportWarning);
+                }
             }
         }
-        return previews;
+
+        IReadOnlyList<PlanPreview> initialPreviews = CreatePreviews(work);
+        AdaptiveMetricDecision decision = ResolveAdaptiveMetricDecision(
+            request,
+            hasVmaf,
+            hasXpsnr,
+            initialPreviews);
+        bool evaluateVmafFallback = decision.UseVmafFallback &&
+            initialMetricMode == MetricMode.XPSNR &&
+            hasVmaf;
+        MetricMode finalMetricMode = evaluateVmafFallback
+            ? MetricMode.Ensemble
+            : initialMetricMode;
+
+        try
+        {
+            if (evaluateVmafFallback)
+            {
+                for (int candidateIndex = work.Count - 1; candidateIndex >= 0; candidateIndex--)
+                {
+                    PreviewWork candidate = work[candidateIndex];
+                    DateTimeOffset fallbackStarted = DateTimeOffset.UtcNow;
+                    try
+                    {
+                        foreach (PreviewSample sample in candidate.Samples)
+                        {
+                            MetricEnsemble vmaf = await _metrics.EvaluatePreviewAsync(
+                                request with { MetricMode = MetricMode.VMAF },
+                                media,
+                                candidate.Plan,
+                                sample.Path,
+                                tempDirectory,
+                                sample.Window,
+                                cancellationToken).ConfigureAwait(false);
+                            sample.Metrics = CombineMetricModes(vmaf, sample.Metrics);
+                        }
+                        candidate.RuntimeSeconds +=
+                            (DateTimeOffset.UtcNow - fallbackStarted).TotalSeconds;
+                    }
+                    catch (Exception exception) when (
+                        exception is Win32Exception or
+                            IOException or
+                            UnauthorizedAccessException or
+                            InvalidOperationException or
+                            NotSupportedException)
+                    {
+                        object failureLog = new
+                        {
+                            Plan = candidate.Plan,
+                            Stage = "vmaf-fallback",
+                            Error = exception.Message
+                        };
+                        await logger
+                            .WriteAsync("preview-failed", failureLog, cancellationToken)
+                            .ConfigureAwait(false);
+                        foreach (PreviewSample sample in candidate.Samples)
+                            FileSystemCleanup.DeleteFile(sample.Path, _runner.ReportWarning);
+                        work.RemoveAt(candidateIndex);
+                    }
+                }
+            }
+
+            IReadOnlyList<PlanPreview> previews = CreatePreviews(work);
+            if (request.MetricMode == MetricMode.Auto)
+            {
+                await logger
+                    .WriteAsync("adaptive-metric-decision", decision, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            foreach (PlanPreview preview in previews)
+            {
+                object previewLog = new
+                {
+                    Plan = preview.Plan,
+                    preview.Metrics,
+                    Bytes = preview.OutputBytes,
+                    preview.RuntimeSeconds
+                };
+                await logger
+                    .WriteAsync("preview-complete", previewLog, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            return new PreviewEvaluation(previews, finalMetricMode, decision);
+        }
+        finally
+        {
+            foreach (PreviewSample sample in work.SelectMany(candidate => candidate.Samples))
+                FileSystemCleanup.DeleteFile(sample.Path, _runner.ReportWarning);
+        }
+    }
+
+    private static IReadOnlyList<PlanPreview> CreatePreviews(IReadOnlyList<PreviewWork> work)
+    {
+        return work
+            .Select(candidate => new PlanPreview(
+                candidate.Plan,
+                MergeMetrics(candidate.Samples.Select(sample => sample.Metrics).ToArray()),
+                candidate.Samples.LastOrDefault()?.Path ?? "",
+                candidate.Bytes,
+                candidate.RuntimeSeconds))
+            .ToArray();
+    }
+
+    private static AdaptiveMetricDecision ResolveAdaptiveMetricDecision(
+        CompressionRequest request,
+        bool hasVmaf,
+        bool hasXpsnr,
+        IReadOnlyList<PlanPreview> previews)
+    {
+        if (request.MetricMode != MetricMode.Auto)
+            return AdaptiveMetricDecision.Disabled("explicit-metric-mode");
+        if (!hasXpsnr)
+            return AdaptiveMetricDecision.Fallback("xpsnr-unavailable");
+        if (!hasVmaf)
+            return AdaptiveMetricDecision.Fast("vmaf-unavailable");
+
+        PlanPreview[] ranked = previews
+            .Where(preview => preview.Metrics.XPSNR.HasValue)
+            .OrderByDescending(preview => preview.Metrics.XPSNR)
+            .ThenByDescending(preview => preview.Metrics.WorstXPSNR)
+            .ThenByDescending(preview => preview.Plan.AudioPlan.Rank)
+            .ThenByDescending(preview => preview.Plan.HeuristicScore)
+            .ToArray();
+        if (ranked.Length == 0)
+            return AdaptiveMetricDecision.Fallback("xpsnr-evaluation-failed");
+
+        CompressionPlan winner = ranked[0].Plan;
+        double? margin = ranked.Length >= 2
+            ? ranked[0].Metrics.XPSNR!.Value - ranked[1].Metrics.XPSNR!.Value
+            : null;
+        bool sameGeometryAndPreprocess = ranked.Length < 2 ||
+            SameGeometryAndPreprocess(winner, ranked[1].Plan);
+        double? luminance = winner.ContentAnalysis?.Features.LuminanceMean;
+        string contentClass = winner.ContentClass;
+
+        AdaptiveMetricDecision Decision(bool fallback, string reason)
+        {
+            return new AdaptiveMetricDecision(
+                Enabled: true,
+                UseVmafFallback: fallback,
+                Reason: reason,
+                ContentClass: contentClass,
+                LuminanceMean: luminance,
+                XpsnrMargin: margin,
+                SameGeometryAndPreprocess: sameGeometryAndPreprocess);
+        }
+
+        if (contentClass == "anime" || winner.Preprocess == "deband")
+            return Decision(true, "cambi-sensitive-content");
+
+        bool naturalContent = contentClass is not ("screen" or "gameplay" or "anime");
+        if (naturalContent &&
+            luminance.HasValue &&
+            luminance.Value <= ContentAnalyzer.DarkLuminanceThreshold)
+            return Decision(true, "dark-natural-content");
+
+        if (contentClass is "screen" or "gameplay")
+        {
+            bool confident = sameGeometryAndPreprocess ||
+                margin is >= AdaptiveXpsnrConfidenceMargin;
+            return Decision(!confident, confident
+                ? "screen-or-gameplay-fast-path"
+                : "low-confidence-geometry-change");
+        }
+
+        if (contentClass == "general")
+        {
+            if (!luminance.HasValue)
+                return Decision(true, "luminance-unavailable");
+            bool confident = margin is >= AdaptiveXpsnrConfidenceMargin;
+            return Decision(!confident, confident
+                ? "high-confidence-general-content"
+                : "low-confidence-general-content");
+        }
+
+        return Decision(true, "conservative-content-class");
+    }
+
+    private static bool SameGeometryAndPreprocess(CompressionPlan left, CompressionPlan right)
+    {
+        return left.Width == right.Width &&
+            left.Height == right.Height &&
+            Math.Abs(left.Fps - right.Fps) < 0.001 &&
+            left.Preprocess == right.Preprocess;
+    }
+
+    private static MetricEnsemble CombineMetricModes(MetricEnsemble vmaf, MetricEnsemble xpsnr)
+    {
+        int count = Math.Max(vmaf.Windows.Count, xpsnr.Windows.Count);
+        List<MetricWindow> windows = [];
+        for (int index = 0; index < count; index++)
+        {
+            MetricWindow? vmafWindow = index < vmaf.Windows.Count ? vmaf.Windows[index] : null;
+            MetricWindow? xpsnrWindow = index < xpsnr.Windows.Count ? xpsnr.Windows[index] : null;
+            MetricWindow basis = vmafWindow ?? xpsnrWindow!;
+            windows.Add(new MetricWindow(
+                index,
+                basis.StartSeconds,
+                basis.EndSeconds,
+                vmafWindow?.VMAFNeg,
+                xpsnrWindow?.XPSNR,
+                vmafWindow?.CAMBI));
+        }
+
+        double? primary = vmaf.VMAFNeg ?? xpsnr.XPSNR;
+        string? error = primary.HasValue
+            ? null
+            : vmaf.Error ?? xpsnr.Error;
+        return new MetricEnsemble
+        {
+            Available = primary.HasValue,
+            Mode = "ensemble",
+            PrimaryScore = primary,
+            WorstWindowScore = vmaf.WorstVMAFNeg ?? xpsnr.WorstXPSNR,
+            VMAFNeg = vmaf.VMAFNeg,
+            WorstVMAFNeg = vmaf.WorstVMAFNeg,
+            StandardVMAF = vmaf.StandardVMAF,
+            XPSNR = xpsnr.XPSNR,
+            WorstXPSNR = xpsnr.WorstXPSNR,
+            CAMBI = vmaf.CAMBI,
+            WorstCAMBI = vmaf.WorstCAMBI,
+            Windows = windows,
+            Error = error
+        };
     }
 
     private static CompressionPlan SelectPlan(IReadOnlyList<CompressionPlan> candidates, IReadOnlyList<PlanPreview> previews)
@@ -1104,6 +1354,52 @@ public sealed class CompressionWorker
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(destination))!);
         if (!Path.GetFullPath(source).Equals(Path.GetFullPath(destination), StringComparison.OrdinalIgnoreCase))
             File.Copy(source, destination, overwrite: true);
+    }
+
+    private sealed record PreviewEvaluation(
+        IReadOnlyList<PlanPreview> Previews,
+        MetricMode FinalMetricMode,
+        AdaptiveMetricDecision Decision);
+
+    private sealed record AdaptiveMetricDecision(
+        bool Enabled,
+        bool UseVmafFallback,
+        string Reason,
+        string ContentClass,
+        double? LuminanceMean,
+        double? XpsnrMargin,
+        bool? SameGeometryAndPreprocess)
+    {
+        public static AdaptiveMetricDecision Disabled(string reason) =>
+            new(false, false, reason, "", null, null, null);
+
+        public static AdaptiveMetricDecision Fast(string reason) =>
+            new(true, false, reason, "", null, null, null);
+
+        public static AdaptiveMetricDecision Fallback(string reason) =>
+            new(true, true, reason, "", null, null, null);
+    }
+
+    private sealed class PreviewSample(
+        SampleWindow window,
+        string path,
+        MetricEnsemble metrics)
+    {
+        public SampleWindow Window { get; } = window;
+        public string Path { get; } = path;
+        public MetricEnsemble Metrics { get; set; } = metrics;
+    }
+
+    private sealed class PreviewWork(
+        CompressionPlan plan,
+        IReadOnlyList<PreviewSample> samples,
+        long bytes,
+        double runtimeSeconds)
+    {
+        public CompressionPlan Plan { get; } = plan;
+        public IReadOnlyList<PreviewSample> Samples { get; } = samples;
+        public long Bytes { get; } = bytes;
+        public double RuntimeSeconds { get; set; } = runtimeSeconds;
     }
 
     private sealed record ViablePolicy(
