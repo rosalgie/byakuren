@@ -1,6 +1,6 @@
 # byakuren
 
-[![.NET](https://img.shields.io/badge/.NET-8.0-512BD4)](https://dotnet.microsoft.com/download/dotnet/8.0)
+[![.NET](https://img.shields.io/badge/.NET-10.0-512BD4)](https://dotnet.microsoft.com/download/dotnet/10.0)
 
 A command-line video compressor that uses FFmpeg to compress videos perfectly under any file size, while squeezing out the most quality possible
 
@@ -18,7 +18,7 @@ A command-line video compressor that uses FFmpeg to compress videos perfectly un
 
 Install the following:
 
-- [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
+- [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0)
 - [FFmpeg](https://ffmpeg.org/download.html), including `ffmpeg` and `ffprobe`
 - [Git](https://git-scm.com/downloads)
 
