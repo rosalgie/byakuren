@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Globalization;
 using Byakuren.Analysis;
 using Byakuren.Encoding;
 using Byakuren.Execution;
@@ -1046,8 +1047,13 @@ public sealed class CompressionWorker
         {
             string input = Path.GetFullPath(request.InputPath);
             string mode = request.Mode.ToString().ToLowerInvariant();
+            double bytesPerMegabyte = request.TargetUnit == TargetUnit.BinaryMiB
+                ? 1024.0 * 1024.0
+                : 1_000_000.0;
+            string targetMegabytes = (request.TargetBytes / bytesPerMegabyte)
+                .ToString("0.##", CultureInfo.InvariantCulture);
             string fileName = $"{Path.GetFileNameWithoutExtension(input)}_" +
-                $"{request.TargetBytes}_{profile.Backend}_{mode}{profile.Extension}";
+                $"{targetMegabytes}mb_{profile.Backend}_{mode}{profile.Extension}";
             output = Path.Combine(Path.GetDirectoryName(input)!, fileName);
         }
         output = Path.GetFullPath(output);
