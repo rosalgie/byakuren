@@ -209,15 +209,22 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 tempDirectory,
                 cancellationToken)
             .ConfigureAwait(false);
-        string contentClass = scores[0].ContentClass;
-        return new ContentAnalysis(contentClass, features)
+        ContentFusionResult fusion = ContentScoreFusion.Fuse(scores, samples, animeModel);
+        return new ContentAnalysis(fusion.ContentClass, features)
         {
             Traits = ClassifyTraits(traitScores),
             Samples = samples,
             HeuristicScores = scores,
             HeuristicConfidenceMargin = ScoreMargin(scores),
             TraitScores = traitScores,
-            AnimeModel = animeModel
+            AnimeModel = animeModel,
+            Scores = fusion.Scores,
+            Confidence = fusion.Confidence,
+            ConfidenceMargin = fusion.ConfidenceMargin,
+            ConfidenceLevel = fusion.ConfidenceLevel,
+            Alternatives = fusion.Alternatives,
+            DecisionReason = fusion.DecisionReason,
+            Source = ContentAnalysis.HybridSource
         };
     }
 

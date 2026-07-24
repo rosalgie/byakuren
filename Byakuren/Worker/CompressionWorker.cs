@@ -367,7 +367,12 @@ public sealed class CompressionWorker
                 content = content with
                 {
                     ContentClass = requestedContentClass,
-                    Source = ContentAnalysis.ManualSource
+                    Source = ContentAnalysis.ManualSource,
+                    Confidence = 1,
+                    ConfidenceMargin = 1,
+                    ConfidenceLevel = "manual",
+                    Alternatives = [],
+                    DecisionReason = "manual-override"
                 };
             }
         }
@@ -377,12 +382,16 @@ public sealed class CompressionWorker
             string traits = content.Traits.Count == 0
                 ? ""
                 : $" [{string.Join(", ", content.Traits)}]";
-            string margin = content.Source == ContentAnalysis.ManualSource
+            string confidence = content.Source == ContentAnalysis.ManualSource
                 ? ""
-                : $", margin {content.HeuristicConfidenceMargin:0.000}";
+                : $", confidence {content.ConfidenceLevel} {content.Confidence:0.000}, " +
+                  $"margin {content.ConfidenceMargin:0.000}";
+            string alternatives = content.Alternatives.Count == 0
+                ? ""
+                : $", alternatives {string.Join("/", content.Alternatives)}";
             progress?.Report(
                 $"Content classification: {content.ContentClass}{traits} " +
-                $"({content.Source}{margin})");
+                $"({content.Source}{confidence}{alternatives})");
             if (content.AnimeModel?.Available == true)
             {
                 progress?.Report(

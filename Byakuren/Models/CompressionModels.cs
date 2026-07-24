@@ -328,6 +328,7 @@ public sealed record ContentSampleEvidence(
 public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
 {
     public const string ManualSource = "manual";
+    public const string HybridSource = "kasumi-hybrid-v1";
     public IReadOnlyList<string> Traits { get; init; } = [];
     public string Source { get; init; } = ContentFeatures.ClassifierVersion;
     public IReadOnlyList<ContentSampleEvidence> Samples { get; init; } = [];
@@ -335,6 +336,12 @@ public sealed record ContentAnalysis(string ContentClass, ContentFeatures Featur
     public double HeuristicConfidenceMargin { get; init; }
     public IReadOnlyList<ContentTraitScore> TraitScores { get; init; } = [];
     public AnimeModelEvidence? AnimeModel { get; init; }
+    public IReadOnlyList<ContentClassScore> Scores { get; init; } = [];
+    public double Confidence { get; init; }
+    public double ConfidenceMargin { get; init; }
+    public string ConfidenceLevel { get; init; } = "low";
+    public IReadOnlyList<string> Alternatives { get; init; } = [];
+    public string DecisionReason { get; init; } = "";
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);
