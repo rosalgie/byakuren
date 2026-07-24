@@ -355,7 +355,12 @@ public sealed class CompressionWorker
         if (requestedContentClass != ContentClassSelection.Off)
         {
             content = await _contentAnalyzer
-                .AnalyzeAsync(request, media, sampleWindows, cancellationToken)
+                .AnalyzeAsync(
+                    request,
+                    media,
+                    sampleWindows,
+                    tempDirectory,
+                    cancellationToken)
                 .ConfigureAwait(false);
             if (ContentClassSelection.IsExplicit(requestedContentClass))
             {
@@ -378,6 +383,12 @@ public sealed class CompressionWorker
             progress?.Report(
                 $"Content classification: {content.ContentClass}{traits} " +
                 $"({content.Source}{margin})");
+            if (content.AnimeModel?.Available == true)
+            {
+                progress?.Report(
+                    $"Anime model signal: {content.AnimeModel.AnimeProbability:P1} anime " +
+                    $"({content.AnimeModel.Model})");
+            }
         }
 
         progress?.Report(

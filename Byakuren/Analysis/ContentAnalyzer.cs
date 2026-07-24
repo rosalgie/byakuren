@@ -8,11 +8,13 @@ namespace Byakuren.Analysis;
 public sealed class ContentAnalyzer(ProcessRunner runner)
 {
     public const double DarkLuminanceThreshold = 0.18;
+    private readonly AnimeModelClassifier _animeModelClassifier = new(runner);
 
     public async Task<ContentAnalysis> AnalyzeAsync(
         CompressionRequest request,
         MediaInfo media,
         IReadOnlyList<SampleWindow> representativeWindows,
+        string tempDirectory,
         CancellationToken cancellationToken)
     {
         List<ContentSampleEvidence> samples = [];
@@ -199,6 +201,14 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         };
         IReadOnlyList<ContentClassScore> scores = ScoreClasses(media, features);
         IReadOnlyList<ContentTraitScore> traitScores = ScoreTraits(features);
+        AnimeModelEvidence animeModel = await _animeModelClassifier
+            .AnalyzeAsync(
+                request,
+                media,
+                samples,
+                tempDirectory,
+                cancellationToken)
+            .ConfigureAwait(false);
         string contentClass = scores[0].ContentClass;
         return new ContentAnalysis(contentClass, features)
         {
@@ -206,7 +216,8 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             Samples = samples,
             HeuristicScores = scores,
             HeuristicConfidenceMargin = ScoreMargin(scores),
-            TraitScores = traitScores
+            TraitScores = traitScores,
+            AnimeModel = animeModel
         };
     }
 

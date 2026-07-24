@@ -296,6 +296,23 @@ public sealed record ContentTraitScore(
     double Score,
     IReadOnlyList<string> Evidence);
 
+public sealed record AnimeModelFrameEvidence(
+    int SampleIndex,
+    double OffsetSeconds,
+    double AnimeProbability,
+    double RealProbability);
+
+public sealed record AnimeModelEvidence
+{
+    public bool Available { get; init; }
+    public string Model { get; init; } = "";
+    public string Revision { get; init; } = "";
+    public double? AnimeProbability { get; init; }
+    public double? RealProbability { get; init; }
+    public IReadOnlyList<AnimeModelFrameEvidence> Frames { get; init; } = [];
+    public string? Error { get; init; }
+}
+
 public sealed record ContentSampleEvidence(
     int Index,
     double StartSeconds,
@@ -317,6 +334,7 @@ public sealed record ContentAnalysis(string ContentClass, ContentFeatures Featur
     public IReadOnlyList<ContentClassScore> HeuristicScores { get; init; } = [];
     public double HeuristicConfidenceMargin { get; init; }
     public IReadOnlyList<ContentTraitScore> TraitScores { get; init; } = [];
+    public AnimeModelEvidence? AnimeModel { get; init; }
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);

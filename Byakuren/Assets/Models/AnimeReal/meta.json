@@ -1,0 +1,13 @@
+{
+  "labels": [
+    "anime",
+    "real"
+  ],
+  "name": "mobilenetv3_large_100",
+  "pretrained": true,
+  "input_size": 384,
+  "normalization": {
+    "mean": 0.5,
+    "standard_deviation": 0.5
+  }
+}
