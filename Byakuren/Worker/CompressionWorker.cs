@@ -1017,6 +1017,8 @@ public sealed class CompressionWorker
             SameGeometryAndPreprocess(winner, ranked[1].Plan);
         double? luminance = winner.ContentAnalysis?.Features.LuminanceMean;
         string contentClass = winner.ContentClass;
+        bool flatColor = HasTrait(winner.ContentAnalysis, "flat_color");
+        bool dark = HasTrait(winner.ContentAnalysis, "dark");
 
         AdaptiveMetricDecision Decision(bool fallback, string reason)
         {
@@ -1030,13 +1032,14 @@ public sealed class CompressionWorker
                 SameGeometryAndPreprocess: sameGeometryAndPreprocess);
         }
 
-        if (contentClass == "anime" || winner.Preprocess == "deband")
+        if (flatColor || winner.Preprocess == "deband")
             return Decision(true, "cambi-sensitive-content");
 
         bool naturalContent = contentClass is not ("screen" or "gameplay" or "anime");
         if (naturalContent &&
-            luminance.HasValue &&
-            luminance.Value <= ContentAnalyzer.DarkLuminanceThreshold)
+            (dark ||
+             luminance.HasValue &&
+             luminance.Value <= ContentAnalyzer.DarkLuminanceThreshold))
             return Decision(true, "dark-natural-content");
 
         if (contentClass is "screen" or "gameplay")
@@ -1059,6 +1062,11 @@ public sealed class CompressionWorker
         }
 
         return Decision(true, "conservative-content-class");
+    }
+
+    private static bool HasTrait(ContentAnalysis? analysis, string trait)
+    {
+        return analysis?.Traits.Contains(trait, StringComparer.Ordinal) == true;
     }
 
     private static bool SameGeometryAndPreprocess(CompressionPlan left, CompressionPlan right)

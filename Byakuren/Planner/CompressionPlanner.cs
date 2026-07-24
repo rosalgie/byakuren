@@ -152,7 +152,12 @@ public sealed class CompressionPlanner
             profile);
         List<CompressionPlan> plans = [];
 
-        foreach (EncoderProfile tunedProfile in TuningProfiles(profile, request.Mode, contentClass, totalKbps))
+        foreach (EncoderProfile tunedProfile in TuningProfiles(
+                     profile,
+                     request.Mode,
+                     contentClass,
+                     totalKbps,
+                     contentAnalysis))
         {
             foreach (double fps in fpsCandidates)
             {
@@ -174,7 +179,8 @@ public sealed class CompressionPlanner
                             request.Mode,
                             contentClass,
                             totalKbps,
-                            bpppf);
+                            bpppf,
+                            contentAnalysis);
                     foreach ((string preprocess, string preprocessFilter) in preprocessCandidates)
                     {
                         string pixelFormat = PixelFormat(request.OutputBitDepth, media, tunedProfile);
@@ -775,7 +781,8 @@ public sealed class CompressionPlanner
         CompressionMode mode,
         string contentClass,
         double totalKbps,
-        double bpppf)
+        double bpppf,
+        ContentAnalysis? contentAnalysis)
     {
         if (requested == PreprocessMode.Off)
             return [("none", "")];
@@ -784,21 +791,28 @@ public sealed class CompressionPlanner
         List<(string, string)> candidates = [("none", "")];
         if (mode == CompressionMode.Fast)
             return candidates;
-        if (contentClass == "noisy_camera" && (totalKbps < 1100 || bpppf < 0.055))
+        bool grainOrNoise = HasTrait(contentAnalysis, "grain_or_noise") ||
+            contentClass == "noisy_camera";
+        bool flatColor = HasTrait(contentAnalysis, "flat_color") ||
+            contentClass == "anime";
+        bool screenDetail = contentClass == "screen" ||
+            (HasTrait(contentAnalysis, "persistent_ui") &&
+             HasTrait(contentAnalysis, "text_heavy"));
+        if (grainOrNoise && (totalKbps < 1100 || bpppf < 0.055))
             candidates.Add(("temporal-denoise", "hqdn3d=1.8:1.4:4.5:4.5"));
-        else if (contentClass is not ("screen" or "anime" or "gameplay") &&
+        else if (!screenDetail && !flatColor && contentClass != "gameplay" &&
             (totalKbps < 700 || bpppf < 0.028))
             candidates.Add(("mild-denoise", "hqdn3d=1.2:1.0:3.0:3.0"));
-        if (contentClass is "anime" or "noisy_camera" && (totalKbps < 950 || bpppf < 0.040))
+        if (flatColor && (totalKbps < 950 || bpppf < 0.040))
         {
             candidates.Add((
                 "deband",
                 "deband=1thr=0.02:2thr=0.02:3thr=0.02:" +
                 "4thr=0.02:range=12:blur=1"));
         }
-        if (contentClass == "screen" && totalKbps >= 350)
+        if (screenDetail && totalKbps >= 350)
             candidates.Add(("screen-sharpen", "unsharp=3:3:0.25:3:3:0.00"));
-        if (contentClass is "anime" or "noisy_camera" && totalKbps < 700)
+        if ((flatColor || grainOrNoise) && totalKbps < 700)
             candidates.Add(("ringing-reduction", "hqdn3d=0.8:0.6:2.0:2.0,smartblur=1.0:-0.25"));
         return candidates;
     }
@@ -807,19 +821,25 @@ public sealed class CompressionPlanner
         EncoderProfile profile,
         CompressionMode mode,
         string contentClass,
-        double totalKbps)
+        double totalKbps,
+        ContentAnalysis? contentAnalysis)
     {
         List<EncoderProfile> profiles = [profile];
         if (mode == CompressionMode.Fast || profile.IsHardware)
             return profiles;
+        bool screenDetail = contentClass == "screen" ||
+            (HasTrait(contentAnalysis, "persistent_ui") &&
+             HasTrait(contentAnalysis, "text_heavy"));
+        bool grainOrNoise = HasTrait(contentAnalysis, "grain_or_noise") ||
+            contentClass == "noisy_camera";
         switch (profile.Backend)
         {
             case "libx264":
-                string x264Parameters = contentClass switch
+                string x264Parameters = (screenDetail, grainOrNoise, totalKbps) switch
                 {
-                    "screen" => "aq-mode=2:aq-strength=0.70:deblock=0,0",
-                    "noisy_camera" => "aq-mode=3:aq-strength=0.90:deblock=-1,-1",
-                    _ when totalKbps < 1200 => "aq-mode=3:aq-strength=0.85:deblock=-1,-1",
+                    (true, _, _) => "aq-mode=2:aq-strength=0.70:deblock=0,0",
+                    (_, true, _) => "aq-mode=3:aq-strength=0.90:deblock=-1,-1",
+                    (_, _, < 1200) => "aq-mode=3:aq-strength=0.85:deblock=-1,-1",
                     _ => ""
                 };
                 if (!string.IsNullOrWhiteSpace(x264Parameters))
@@ -848,7 +868,7 @@ public sealed class CompressionPlanner
                 break;
             case "svtav1":
                 profiles.Add(profile with { PrivateArguments = ["-svtav1-params", "tune=0:enable-variance-boost=1"] });
-                if (mode == CompressionMode.ExtraQuality && contentClass == "noisy_camera")
+                if (mode == CompressionMode.ExtraQuality && grainOrNoise)
                 {
                     profiles.Add(profile with
                     {
@@ -875,11 +895,16 @@ public sealed class CompressionPlanner
                         "-row-mt", "1"
                     ]
                 });
-                if (contentClass == "screen")
+                if (screenDetail)
                     profiles.Add(profile with { PrivateArguments = ["-aq-mode", "1", "-tune-content", "screen", "-row-mt", "1"] });
                 break;
         }
         return profiles;
+    }
+
+    private static bool HasTrait(ContentAnalysis? analysis, string trait)
+    {
+        return analysis?.Traits.Contains(trait, StringComparer.Ordinal) == true;
     }
 
     private static string PixelFormat(string requested, MediaInfo media, EncoderProfile profile)

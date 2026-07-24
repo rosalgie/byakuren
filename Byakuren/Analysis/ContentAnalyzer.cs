@@ -132,6 +132,7 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             };
             string? exclusionReason = SampleExclusionReason(sampleFeatures, window.Tag);
             IReadOnlyList<ContentClassScore> sampleScores = ScoreClasses(media, sampleFeatures);
+            IReadOnlyList<ContentTraitScore> sampleTraits = ScoreTraits(sampleFeatures);
             samples.Add(new ContentSampleEvidence(
                 sampleIndex++,
                 Math.Round(startSeconds, 3),
@@ -141,8 +142,8 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 exclusionReason is null,
                 exclusionReason,
                 sampleFeatures,
-                MatchRules(media, sampleFeatures),
-                sampleScores));
+                sampleScores,
+                sampleTraits));
         }
 
         ContentSampleEvidence[] includedSamples = samples
@@ -197,28 +198,64 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             Error = errors.Count == 0 ? null : LastUsefulError(errors)
         };
         IReadOnlyList<ContentClassScore> scores = ScoreClasses(media, features);
+        IReadOnlyList<ContentTraitScore> traitScores = ScoreTraits(features);
         string contentClass = scores[0].ContentClass;
         return new ContentAnalysis(contentClass, features)
         {
-            Traits = ClassifyTraits(features),
+            Traits = ClassifyTraits(traitScores),
             Samples = samples,
-            MatchedRules = MatchRules(media, features),
             HeuristicScores = scores,
-            HeuristicConfidenceMargin = ScoreMargin(scores)
+            HeuristicConfidenceMargin = ScoreMargin(scores),
+            TraitScores = traitScores
         };
     }
 
-    public static IReadOnlyList<string> ClassifyTraits(ContentFeatures features)
+    public static IReadOnlyList<ContentTraitScore> ScoreTraits(ContentFeatures features)
     {
-        List<string> traits = [];
-        if (AtMost(features.LuminanceMean, DarkLuminanceThreshold))
-            traits.Add("dark");
-        return traits;
-    }
+        if (!features.Available)
+            return [];
 
-    public static string Classify(MediaInfo media, ContentFeatures features)
-    {
-        return ScoreClasses(media, features)[0].ContentClass;
+        List<ContentTraitScore> scores =
+        [
+            WeightedTrait("dark",
+                ("low-luminance", 1.00, Falling(features.LuminanceMean, 0.08, 0.28))),
+            WeightedTrait("flat_color",
+                ("large-flat-regions", 0.80, Rising(features.FlatAreaRatio, 0.78, 0.96)),
+                ("bounded-entropy", 0.20, Falling(features.Entropy, 0.50, 0.82))),
+            WeightedTrait("line_art",
+                ("defined-edges", 0.55, Rising(features.EdgeDensity, 0.018, 0.060)),
+                ("flat-backgrounds", 0.30, Rising(features.FlatAreaRatio, 0.72, 0.94)),
+                ("clean-temporal-signal", 0.15, Falling(features.TemporalOutlierRatio, 0.010, 0.030))),
+            WeightedTrait("persistent_ui",
+                ("persistent-layout", 0.45, Rising(features.UIPersistence, 0.48, 0.72)),
+                ("defined-edges", 0.25, Rising(features.EdgeDensity, 0.025, 0.065)),
+                ("limited-motion", 0.20, Falling(features.TemporalDifference, 0.008, 0.040)),
+                ("stable-scenes", 0.10, Falling(features.SceneCut, 0.010, 0.060))),
+            WeightedTrait("text_heavy",
+                ("dense-edges", 0.35, Rising(features.EdgeDensity, 0.030, 0.075)),
+                ("very-flat-regions", 0.25, Rising(features.FlatAreaRatio, 0.92, 0.985)),
+                ("low-entropy-layout", 0.25, Falling(features.Entropy, 0.35, 0.68)),
+                ("static-layout", 0.15, Falling(features.TemporalDifference, 0.006, 0.025))),
+            WeightedTrait("grain_or_noise",
+                ("temporal-outliers", 0.45, Rising(features.TemporalOutlierRatio, 0.008, 0.035)),
+                ("texture-entropy", 0.25, Rising(features.Entropy, 0.45, 0.82)),
+                ("temporal-variation", 0.20, Rising(features.TemporalDifference, 0.012, 0.060)),
+                ("non-flat-surface", 0.10, Falling(features.FlatAreaRatio, 0.75, 0.95))),
+            WeightedTrait("high_motion",
+                ("temporal-difference", 0.70, Rising(features.TemporalDifference, 0.015, 0.060)),
+                ("scene-change", 0.30, Rising(features.SceneCut, 0.010, 0.070))),
+            WeightedTrait("high_scene_change",
+                ("scene-change", 0.70, Rising(features.SceneCut, 0.010, 0.070)),
+                ("temporal-difference", 0.30, Rising(features.TemporalDifference, 0.020, 0.070))),
+            WeightedTrait("compressed_source",
+                ("source-bpppf", 0.75, Rising(features.SourceCompression, 0.35, 0.85)),
+                ("texture-entropy", 0.25, Rising(features.Entropy, 0.45, 0.82)))
+        ];
+
+        return scores
+            .OrderByDescending(score => score.Score)
+            .ThenBy(score => score.Trait, StringComparer.Ordinal)
+            .ToArray();
     }
 
     public static IReadOnlyList<ContentClassScore> ScoreClasses(
@@ -291,60 +328,6 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             .ToArray();
     }
 
-    public static IReadOnlyList<ContentRuleMatch> MatchRules(
-        MediaInfo media,
-        ContentFeatures features)
-    {
-        if (!features.Available)
-            return [];
-
-        List<ContentRuleMatch> matches = [];
-        bool localizedHighFpsGameplay = media.Fps >= 50.0 && media.HasAudio &&
-            AtLeast(features.EdgeDensity, 0.018) &&
-            AtLeast(features.UIPersistence, 0.58) &&
-            AtMost(features.TemporalDifference, 0.020) &&
-            AtMost(features.SceneCut, 0.010) &&
-            AtMost(features.TemporalOutlierRatio, 0.018) &&
-            (AtLeast(features.TemporalDifference, 0.002) ||
-             AtMost(features.FlatAreaRatio, 0.930));
-        bool conventionalGameplay = media.Fps >= 50.0 && AtLeast(features.EdgeDensity, 0.045) &&
-            AtMost(features.FlatAreaRatio, 0.910) &&
-            AtLeast(features.UIPersistence, 0.45);
-        if (localizedHighFpsGameplay)
-            matches.Add(new ContentRuleMatch("localized-high-fps-gameplay", "gameplay"));
-        if (conventionalGameplay)
-            matches.Add(new ContentRuleMatch("conventional-gameplay", "gameplay"));
-
-        bool screenMotion = AtMost(features.TemporalDifference, 0.030) &&
-            AtLeast(features.TemporalOutlierRatio, 0.012) &&
-            AtLeast(features.EdgeDensity, 0.025);
-        bool screenStatic = AtMost(features.TemporalDifference, 0.012) &&
-            AtLeast(features.FlatAreaRatio, 0.940) &&
-            AtMost(features.Entropy, 0.650);
-        if (screenMotion)
-            matches.Add(new ContentRuleMatch("screen-motion", "screen"));
-        if (screenStatic)
-            matches.Add(new ContentRuleMatch("screen-static", "screen"));
-
-        if (AtLeast(features.TemporalOutlierRatio, 0.015) &&
-            AtLeast(features.TemporalDifference, 0.035))
-        {
-            matches.Add(new ContentRuleMatch("temporal-outlier-camera", "noisy_camera"));
-        }
-
-        if (AtLeast(features.FlatAreaRatio, 0.86) && AtLeast(features.EdgeDensity, 0.025) &&
-            AtMost(features.TemporalOutlierRatio, 0.012))
-        {
-            matches.Add(new ContentRuleMatch("flat-line-art", "anime"));
-        }
-
-        if (media.HasAudio && AtMost(features.TemporalDifference, 0.012) &&
-            AtMost(features.TemporalOutlierRatio, 0.010))
-            matches.Add(new ContentRuleMatch("static-audio-video", "talking_head"));
-
-        return matches;
-    }
-
     private static double? MetadataAverage(string text, string key)
     {
         string pattern = "(?m)^" + Regex.Escape(key) + @"=(?<value>-?\d+(?:\.\d+)?)\s*$";
@@ -411,6 +394,30 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         return new ContentClassScore(contentClass, Math.Round(Math.Clamp(score, 0, 1), 3), evidence);
     }
 
+    private static ContentTraitScore WeightedTrait(
+        string trait,
+        params (string Name, double Weight, double Signal)[] components)
+    {
+        double score = components.Sum(component =>
+            component.Weight * Math.Clamp(component.Signal, 0, 1));
+        string[] evidence = components
+            .Where(component => component.Signal >= 0.55)
+            .OrderByDescending(component => component.Weight * component.Signal)
+            .Select(component => component.Name)
+            .ToArray();
+        return new ContentTraitScore(trait, Math.Round(Math.Clamp(score, 0, 1), 3), evidence);
+    }
+
+    private static IReadOnlyList<string> ClassifyTraits(
+        IReadOnlyList<ContentTraitScore> scores)
+    {
+        return scores
+            .Where(score => score.Score >= 0.65)
+            .Select(score => score.Trait)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+    }
+
     private static double ScoreMargin(IReadOnlyList<ContentClassScore> scores)
     {
         return scores.Count < 2 ? scores.FirstOrDefault()?.Score ?? 0 : Math.Round(
@@ -427,6 +434,8 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
 
     private static double Falling(double? value, double low, double high)
     {
+        if (!value.HasValue)
+            return 0;
         return 1 - Rising(value, low, high);
     }
 

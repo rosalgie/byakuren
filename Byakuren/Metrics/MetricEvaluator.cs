@@ -75,8 +75,11 @@ public sealed class MetricEvaluator(ProcessRunner runner, FFmpegProbe probe)
         MetricMode mode = await ResolveModeAsync(request, cancellationToken).ConfigureAwait(false);
         if (mode == MetricMode.Off)
             return new MetricEnsemble { Mode = "off" };
+        bool flatColor = plan.ContentAnalysis?.Traits.Contains(
+            "flat_color",
+            StringComparer.Ordinal) == true;
         bool collectCAMBI = !distortedIsPreview &&
-            (plan.ContentClass is "anime" or "noisy_camera" || plan.Preprocess == "deband");
+            (flatColor || plan.Preprocess == "deband");
         List<MetricWindow> metricWindows = [];
         List<double> standardScores = [];
         List<string> errors = [];

@@ -286,10 +286,13 @@ public sealed record ContentFeatures
     public string? Error { get; init; }
 }
 
-public sealed record ContentRuleMatch(string Name, string ContentClass);
-
 public sealed record ContentClassScore(
     string ContentClass,
+    double Score,
+    IReadOnlyList<string> Evidence);
+
+public sealed record ContentTraitScore(
+    string Trait,
     double Score,
     IReadOnlyList<string> Evidence);
 
@@ -302,8 +305,8 @@ public sealed record ContentSampleEvidence(
     bool IncludedInAggregate,
     string? ExclusionReason,
     ContentFeatures Features,
-    IReadOnlyList<ContentRuleMatch> MatchedRules,
-    IReadOnlyList<ContentClassScore> HeuristicScores);
+    IReadOnlyList<ContentClassScore> HeuristicScores,
+    IReadOnlyList<ContentTraitScore> TraitScores);
 
 public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
 {
@@ -311,9 +314,9 @@ public sealed record ContentAnalysis(string ContentClass, ContentFeatures Featur
     public IReadOnlyList<string> Traits { get; init; } = [];
     public string Source { get; init; } = ContentFeatures.ClassifierVersion;
     public IReadOnlyList<ContentSampleEvidence> Samples { get; init; } = [];
-    public IReadOnlyList<ContentRuleMatch> MatchedRules { get; init; } = [];
     public IReadOnlyList<ContentClassScore> HeuristicScores { get; init; } = [];
     public double HeuristicConfidenceMargin { get; init; }
+    public IReadOnlyList<ContentTraitScore> TraitScores { get; init; } = [];
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);
