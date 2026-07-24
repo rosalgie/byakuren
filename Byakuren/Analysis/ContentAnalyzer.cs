@@ -17,17 +17,27 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         List<double> entropyValues = [];
         List<double> luminanceValues = [];
         List<double> temporalValues = [];
-        List<double> noiseValues = [];
+        List<double> temporalOutlierValues = [];
         List<double> edgeValues = [];
         List<double> flatValues = [];
         List<double> sceneValues = [];
+        List<ContentSampleEvidence> samples = [];
         List<string> errors = [];
 
+        int sampleIndex = 0;
         foreach (double startSeconds in SampleStarts(media.DurationSeconds))
         {
             double durationSeconds = Math.Min(1.5, media.DurationSeconds - startSeconds);
             if (durationSeconds <= 0)
                 continue;
+            List<string> sampleErrors = [];
+            double? luminance = null;
+            double? entropy = null;
+            double? temporalDifference = null;
+            double? temporalOutlierRatio = null;
+            double? edgeDensity = null;
+            double? flatAreaRatio = null;
+            double? sceneCut = null;
             string start = startSeconds.ToString("0.###", CultureInfo.InvariantCulture);
             string duration = durationSeconds.ToString("0.###", CultureInfo.InvariantCulture);
             IReadOnlyList<string> commonArguments =
@@ -44,26 +54,34 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             ], cancellationToken).ConfigureAwait(false);
             if (baseProbe.ExitCode == 0)
             {
-                double? luminance = MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.YAVG");
+                luminance = MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.YAVG");
                 if (luminance.HasValue)
-                    luminanceValues.Add(luminance.Value / 255.0);
+                {
+                    luminance /= 255.0;
+                    luminanceValues.Add(luminance.Value);
+                }
 
-                AddIfAvailable(
-                    entropyValues,
-                    MetadataAverage(
-                        baseProbe.CombinedOutput,
-                        "lavfi.entropy.normalized_entropy.normal.Y"));
+                entropy = MetadataAverage(
+                    baseProbe.CombinedOutput,
+                    "lavfi.entropy.normalized_entropy.normal.Y");
+                AddIfAvailable(entropyValues, entropy);
 
-                double? temporal = MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.YDIF");
-                if (temporal.HasValue)
-                    temporalValues.Add(temporal.Value / 255.0);
+                temporalDifference = MetadataAverage(
+                    baseProbe.CombinedOutput,
+                    "lavfi.signalstats.YDIF");
+                if (temporalDifference.HasValue)
+                {
+                    temporalDifference /= 255.0;
+                    temporalValues.Add(temporalDifference.Value);
+                }
 
-                AddIfAvailable(
-                    noiseValues,
-                    MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.TOUT"));
+                temporalOutlierRatio = MetadataAverage(
+                    baseProbe.CombinedOutput,
+                    "lavfi.signalstats.TOUT");
+                AddIfAvailable(temporalOutlierValues, temporalOutlierRatio);
             }
             else
-                errors.Add(baseProbe.StandardError);
+                sampleErrors.Add(baseProbe.StandardError);
 
             ProcessResult shapeProbe = await runner.RunAsync(request.FFmpegPath,
             [
@@ -76,16 +94,22 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             ], cancellationToken).ConfigureAwait(false);
             if (shapeProbe.ExitCode == 0)
             {
-                double? edge = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.signalstats.YAVG");
-                double? flat = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.blackframe.pblack");
-                if (edge.HasValue)
-                    edgeValues.Add(edge.Value / 255.0);
+                edgeDensity = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.signalstats.YAVG");
+                flatAreaRatio = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.blackframe.pblack");
+                if (edgeDensity.HasValue)
+                {
+                    edgeDensity /= 255.0;
+                    edgeValues.Add(edgeDensity.Value);
+                }
 
-                if (flat.HasValue)
-                    flatValues.Add(flat.Value / 100.0);
+                if (flatAreaRatio.HasValue)
+                {
+                    flatAreaRatio /= 100.0;
+                    flatValues.Add(flatAreaRatio.Value);
+                }
             }
             else
-                errors.Add(shapeProbe.StandardError);
+                sampleErrors.Add(shapeProbe.StandardError);
 
             ProcessResult sceneProbe = await runner.RunAsync(request.FFmpegPath,
             [
@@ -95,45 +119,69 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             ], cancellationToken).ConfigureAwait(false);
             if (sceneProbe.ExitCode == 0)
             {
-                double? scene = MetadataAverage(sceneProbe.CombinedOutput, "lavfi.scd.score");
-                sceneValues.Add((scene ?? 0) / 100.0);
+                sceneCut = (MetadataAverage(
+                    sceneProbe.CombinedOutput,
+                    "lavfi.scd.score") ?? 0) / 100.0;
+                sceneValues.Add(sceneCut.Value);
             }
             else
-                errors.Add(sceneProbe.StandardError);
+                sampleErrors.Add(sceneProbe.StandardError);
+
+            errors.AddRange(sampleErrors);
+            double? uiPersistence = UIPersistence(edgeDensity, temporalDifference);
+            ContentFeatures sampleFeatures = new()
+            {
+                Available = edgeDensity.HasValue && flatAreaRatio.HasValue &&
+                    entropy.HasValue && temporalDifference.HasValue &&
+                    temporalOutlierRatio.HasValue && sceneCut.HasValue,
+                LuminanceMean = Rounded(luminance),
+                EdgeDensity = Rounded(edgeDensity),
+                FlatAreaRatio = Rounded(flatAreaRatio),
+                Entropy = Rounded(entropy),
+                SceneCut = Rounded(sceneCut),
+                TemporalDifference = Rounded(temporalDifference),
+                TemporalOutlierRatio = Rounded(temporalOutlierRatio),
+                SourceCompression = Rounded(SourceCompression(media)),
+                UIPersistence = Rounded(uiPersistence),
+                Error = sampleErrors.Count == 0 ? null : LastUsefulError(sampleErrors)
+            };
+            samples.Add(new ContentSampleEvidence(
+                sampleIndex++,
+                Math.Round(startSeconds, 3),
+                Math.Round(durationSeconds, 3),
+                sampleFeatures,
+                MatchRules(media, sampleFeatures)));
         }
 
-        double? edgeDensity = Average(edgeValues);
-        double? temporalDifference = Average(temporalValues);
+        double? aggregateEdgeDensity = Average(edgeValues);
+        double? aggregateTemporalDifference = Average(temporalValues);
         double? sourceCompression = SourceCompression(media);
-        double? uiPersistence = null;
-        if (edgeDensity.HasValue && temporalDifference.HasValue)
-        {
-            uiPersistence = Math.Clamp(
-                (1.0 - Math.Min(1.0, temporalDifference.Value * 4.0)) * 0.60 +
-                edgeDensity.Value * 0.40,
-                0.0,
-                1.0);
-        }
+        double? aggregateUiPersistence = UIPersistence(
+            aggregateEdgeDensity,
+            aggregateTemporalDifference);
 
         ContentFeatures features = new()
         {
             Available = edgeValues.Count > 0 && flatValues.Count > 0 && entropyValues.Count > 0 &&
-                        temporalValues.Count > 0 && noiseValues.Count > 0 && sceneValues.Count > 0,
+                        temporalValues.Count > 0 && temporalOutlierValues.Count > 0 &&
+                        sceneValues.Count > 0,
             LuminanceMean = Rounded(Average(luminanceValues)),
-            EdgeDensity = Rounded(edgeDensity),
+            EdgeDensity = Rounded(aggregateEdgeDensity),
             FlatAreaRatio = Rounded(Average(flatValues)),
             Entropy = Rounded(Average(entropyValues)),
             SceneCut = Rounded(Average(sceneValues)),
-            TemporalDifference = Rounded(temporalDifference),
-            Noise = Rounded(Average(noiseValues)),
+            TemporalDifference = Rounded(aggregateTemporalDifference),
+            TemporalOutlierRatio = Rounded(Average(temporalOutlierValues)),
             SourceCompression = Rounded(sourceCompression),
-            UIPersistence = Rounded(uiPersistence),
+            UIPersistence = Rounded(aggregateUiPersistence),
             Error = errors.Count == 0 ? null : LastUsefulError(errors)
         };
         string contentClass = Classify(media, features);
         return new ContentAnalysis(contentClass, features)
         {
-            Traits = ClassifyTraits(features)
+            Traits = ClassifyTraits(features),
+            Samples = samples,
+            MatchedRules = MatchRules(media, features)
         };
     }
 
@@ -150,40 +198,69 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         if (!features.Available)
             return "general";
 
+        IReadOnlyList<ContentRuleMatch> matches = MatchRules(media, features);
+        foreach (string contentClass in
+                 new[] { "gameplay", "screen", "noisy_camera", "anime", "talking_head" })
+        {
+            if (matches.Any(match => match.ContentClass == contentClass))
+                return contentClass;
+        }
+
+        return "general";
+    }
+
+    public static IReadOnlyList<ContentRuleMatch> MatchRules(
+        MediaInfo media,
+        ContentFeatures features)
+    {
+        if (!features.Available)
+            return [];
+
+        List<ContentRuleMatch> matches = [];
         bool localizedHighFpsGameplay = media.Fps >= 50.0 && media.HasAudio &&
             AtLeast(features.EdgeDensity, 0.018) &&
             AtLeast(features.UIPersistence, 0.58) &&
             AtMost(features.TemporalDifference, 0.020) &&
             AtMost(features.SceneCut, 0.010) &&
-            AtMost(features.Noise, 0.018) &&
+            AtMost(features.TemporalOutlierRatio, 0.018) &&
             (AtLeast(features.TemporalDifference, 0.002) ||
              AtMost(features.FlatAreaRatio, 0.930));
         bool conventionalGameplay = media.Fps >= 50.0 && AtLeast(features.EdgeDensity, 0.045) &&
             AtMost(features.FlatAreaRatio, 0.910) &&
             AtLeast(features.UIPersistence, 0.45);
-        if (localizedHighFpsGameplay || conventionalGameplay)
-            return "gameplay";
+        if (localizedHighFpsGameplay)
+            matches.Add(new ContentRuleMatch("localized-high-fps-gameplay", "gameplay"));
+        if (conventionalGameplay)
+            matches.Add(new ContentRuleMatch("conventional-gameplay", "gameplay"));
 
         bool screenMotion = AtMost(features.TemporalDifference, 0.030) &&
-            AtLeast(features.Noise, 0.012) &&
+            AtLeast(features.TemporalOutlierRatio, 0.012) &&
             AtLeast(features.EdgeDensity, 0.025);
         bool screenStatic = AtMost(features.TemporalDifference, 0.012) &&
             AtLeast(features.FlatAreaRatio, 0.940) &&
             AtMost(features.Entropy, 0.650);
-        if (screenMotion || screenStatic)
-            return "screen";
+        if (screenMotion)
+            matches.Add(new ContentRuleMatch("screen-motion", "screen"));
+        if (screenStatic)
+            matches.Add(new ContentRuleMatch("screen-static", "screen"));
 
-        if (AtLeast(features.Noise, 0.015) && AtLeast(features.TemporalDifference, 0.035))
-            return "noisy_camera";
+        if (AtLeast(features.TemporalOutlierRatio, 0.015) &&
+            AtLeast(features.TemporalDifference, 0.035))
+        {
+            matches.Add(new ContentRuleMatch("temporal-outlier-camera", "noisy_camera"));
+        }
 
         if (AtLeast(features.FlatAreaRatio, 0.86) && AtLeast(features.EdgeDensity, 0.025) &&
-            AtMost(features.Noise, 0.012))
-            return "anime";
+            AtMost(features.TemporalOutlierRatio, 0.012))
+        {
+            matches.Add(new ContentRuleMatch("flat-line-art", "anime"));
+        }
 
-        if (media.HasAudio && AtMost(features.TemporalDifference, 0.012) && AtMost(features.Noise, 0.010))
-            return "talking_head";
+        if (media.HasAudio && AtMost(features.TemporalDifference, 0.012) &&
+            AtMost(features.TemporalOutlierRatio, 0.010))
+            matches.Add(new ContentRuleMatch("static-audio-video", "talking_head"));
 
-        return "general";
+        return matches;
     }
 
     private static IReadOnlyList<double> SampleStarts(double durationSeconds)
@@ -224,6 +301,16 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
 
     private static double? Average(IReadOnlyList<double> values) => values.Count == 0 ? null : values.Average();
     private static double? Rounded(double? value) => value.HasValue ? Math.Round(value.Value, 3) : null;
+    private static double? UIPersistence(double? edgeDensity, double? temporalDifference)
+    {
+        if (!edgeDensity.HasValue || !temporalDifference.HasValue)
+            return null;
+        return Math.Clamp(
+            (1.0 - Math.Min(1.0, temporalDifference.Value * 4.0)) * 0.60 +
+            edgeDensity.Value * 0.40,
+            0.0,
+            1.0);
+    }
     private static bool AtLeast(double? value, double threshold) => value.HasValue && value.Value >= threshold;
     private static bool AtMost(double? value, double threshold) => value.HasValue && value.Value <= threshold;
     private static string? LastUsefulError(IEnumerable<string> errors)

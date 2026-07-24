@@ -280,17 +280,28 @@ public sealed record ContentFeatures
     public double? Entropy { get; init; }
     public double? SceneCut { get; init; }
     public double? TemporalDifference { get; init; }
-    public double? Noise { get; init; }
+    public double? TemporalOutlierRatio { get; init; }
     public double? SourceCompression { get; init; }
     public double? UIPersistence { get; init; }
     public string? Error { get; init; }
 }
+
+public sealed record ContentRuleMatch(string Name, string ContentClass);
+
+public sealed record ContentSampleEvidence(
+    int Index,
+    double StartSeconds,
+    double DurationSeconds,
+    ContentFeatures Features,
+    IReadOnlyList<ContentRuleMatch> MatchedRules);
 
 public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
 {
     public const string ManualSource = "manual";
     public IReadOnlyList<string> Traits { get; init; } = [];
     public string Source { get; init; } = ContentFeatures.ClassifierVersion;
+    public IReadOnlyList<ContentSampleEvidence> Samples { get; init; } = [];
+    public IReadOnlyList<ContentRuleMatch> MatchedRules { get; init; } = [];
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);
