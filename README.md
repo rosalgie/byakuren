@@ -115,7 +115,7 @@ Press <kbd>Ctrl</kbd>+<kbd>C</kbd> to cancel an active job cleanly.
 | `--encoder-backend <name>` | FFmpeg encoder backend | `auto` |
 | `--container <mp4\|webm\|auto>` | Output container | `auto` |
 | `--result-json <path>` | Write the result contract as JSON | Disabled |
-| `-v`, `--verbose` | Print external commands and stream their output | Disabled |
+| `-v`, `--verbose [0\|1\|2]` | Shows output of commands being run by byakuren | Disabled |
 
 Run the built-in help to view every option:
 

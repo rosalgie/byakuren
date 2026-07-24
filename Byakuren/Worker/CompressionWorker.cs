@@ -56,11 +56,10 @@ public sealed class CompressionWorker
 
         _runner.WarningObserver = progress is null ? null : progress.Report;
 
-        if (request.Verbose)
-        {
-            _runner.CommandObserver = command => progress?.Report(command);
+        if (request.Verbosity >= 1)
+            _runner.CommandObserver = command => progress?.Report(HighlightCommand(command));
+        if (request.Verbosity >= 2)
             _runner.OutputObserver = output => progress?.Report(output);
-        }
 
         try
         {
@@ -143,6 +142,11 @@ public sealed class CompressionWorker
             _runner.WarningObserver = null;
         }
     }
+
+    private static string HighlightCommand(string command) =>
+        Console.IsOutputRedirected
+            ? command
+            : $"\u001b[93m{command}\u001b[0m";
 
     private async Task<CompressionOutcome> CopyInputAsync(
         DateTimeOffset started,

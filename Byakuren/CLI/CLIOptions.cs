@@ -1,4 +1,5 @@
 using System.CommandLine;
+using System.CommandLine.Parsing;
 using Byakuren.Models;
 
 namespace Byakuren.CLI;
@@ -178,9 +179,10 @@ public sealed class CLIOptions
         Description = "Path for the planning event log"
     };
 
-    private readonly Option<bool> _verbose = new("--verbose", "-v")
+    private readonly Option<int> _verbose = new("--verbose", "-v")
     {
-        Description = "Print external commands and stream their output"
+        Description = "Shows output of commands being run by byakuren",
+        Arity = ArgumentArity.ZeroOrOne
     };
 
     private readonly Option<string?> _ffmpeg = new("--ffmpeg", "-FFmpeg")
@@ -300,7 +302,7 @@ public sealed class CLIOptions
             MetricMaxSamples = GetNonNegativeValue(parseResult.GetValue(_metricMaxSamples), 0, 0, "--metric-max-samples"),
             EnablePlanLogging = parseResult.GetValue(_enablePlanLogging),
             PlanLogPath = parseResult.GetValue(_planLogPath),
-            Verbose = parseResult.GetValue(_verbose),
+            Verbosity = GetVerbosity(parseResult),
             FFmpegPath = parseResult.GetValue(_ffmpeg) ?? "ffmpeg",
             FFprobePath = parseResult.GetValue(_ffprobe) ?? "ffprobe"
         };
@@ -437,6 +439,26 @@ public sealed class CLIOptions
         }
 
         return value.Value;
+    }
+
+    private int GetVerbosity(ParseResult parseResult)
+    {
+        OptionResult? optionResult = parseResult.GetResult(_verbose);
+        if (optionResult is null || optionResult.Implicit)
+            return 0;
+
+        if (optionResult.Tokens.Count == 0)
+            return 1;
+
+        int verbosity = parseResult.GetValue(_verbose);
+        if (verbosity is < 0 or > 2)
+        {
+            throw new ArgumentOutOfRangeException(
+                "--verbose",
+                "Verbosity must be 0, 1, or 2.");
+        }
+
+        return verbosity;
     }
 
 }
