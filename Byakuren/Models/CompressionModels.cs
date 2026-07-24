@@ -292,6 +292,10 @@ public sealed record ContentSampleEvidence(
     int Index,
     double StartSeconds,
     double DurationSeconds,
+    string Source,
+    string Tag,
+    bool IncludedInAggregate,
+    string? ExclusionReason,
     ContentFeatures Features,
     IReadOnlyList<ContentRuleMatch> MatchedRules);
 

@@ -81,6 +81,69 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
             .ToArray();
     }
 
+    public static IReadOnlyList<SampleWindow> ContentWindows(
+        double durationSeconds,
+        IReadOnlyList<SampleWindow> representativeWindows)
+    {
+        const double preferredSampleSeconds = 1.5;
+        double sampleLength = Math.Min(preferredSampleSeconds, Math.Max(0.25, durationSeconds));
+        if (durationSeconds <= sampleLength + 0.25)
+            return [new SampleWindow(0, sampleLength, "content-fixed", Tag: "whole")];
+
+        int sampleCount = durationSeconds switch
+        {
+            <= 15 => 3,
+            <= 45 => 5,
+            <= 180 => 6,
+            <= 600 => 8,
+            <= 1800 => 10,
+            _ => 12
+        };
+        double usableEnd = Math.Max(0, durationSeconds - sampleLength - 0.05);
+        List<SampleWindow> windows = Enumerable.Range(0, sampleCount)
+            .Select(index =>
+            {
+                double fraction = (index + 0.5) / sampleCount;
+                double start = Math.Round(usableEnd * fraction, 3);
+                return new SampleWindow(
+                    start,
+                    sampleLength,
+                    "content-fixed",
+                    Tag: ContentWindowTag(index, sampleCount));
+            })
+            .ToList();
+
+        HashSet<int> replacedAnchors = [];
+        foreach (SampleWindow representative in representativeWindows
+                     .OrderByDescending(window => window.SceneScore * 150 + window.DifficultyScore))
+        {
+            double center = representative.StartSeconds + representative.DurationSeconds / 2.0;
+            double start = Math.Round(Math.Clamp(center - sampleLength / 2.0, 0, usableEnd), 3);
+            int closestIndex = Enumerable.Range(0, windows.Count)
+                .Where(index => !replacedAnchors.Contains(index))
+                .OrderBy(index => Math.Abs(windows[index].StartSeconds - start))
+                .FirstOrDefault(-1);
+            if (closestIndex < 0)
+                break;
+            SampleWindow anchor = windows[closestIndex];
+            windows[closestIndex] = new SampleWindow(
+                start,
+                sampleLength,
+                representative.Source,
+                representative.SceneScore,
+                representative.DifficultyScore,
+                string.IsNullOrWhiteSpace(representative.Tag)
+                    ? anchor.Tag
+                    : $"{anchor.Tag}+{representative.Tag}");
+            replacedAnchors.Add(closestIndex);
+        }
+
+        return windows
+            .OrderBy(window => window.StartSeconds)
+            .DistinctBy(window => window.StartSeconds)
+            .ToArray();
+    }
+
     private async Task<IReadOnlyList<SampleWindow>> SceneWindowsAsync(
         CompressionRequest request,
         MediaInfo media,
@@ -211,6 +274,19 @@ public sealed class SampleWindowPlanner(ProcessRunner runner)
     {
         if (selected.All(window => Math.Abs(window.StartSeconds - candidate.StartSeconds) >= sampleSeconds * 0.50))
             selected.Add(candidate);
+    }
+
+    private static string ContentWindowTag(int index, int count)
+    {
+        if (index == 0)
+            return "opening";
+        if (index == count - 1)
+            return "ending";
+        if (index < count / 3)
+            return "early";
+        if (index >= count * 2 / 3)
+            return "late";
+        return "middle";
     }
 
     private static string Number(double value) => value.ToString("0.###", CultureInfo.InvariantCulture);

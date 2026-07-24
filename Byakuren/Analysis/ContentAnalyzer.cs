@@ -12,22 +12,22 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
     public async Task<ContentAnalysis> AnalyzeAsync(
         CompressionRequest request,
         MediaInfo media,
+        IReadOnlyList<SampleWindow> representativeWindows,
         CancellationToken cancellationToken)
     {
-        List<double> entropyValues = [];
-        List<double> luminanceValues = [];
-        List<double> temporalValues = [];
-        List<double> temporalOutlierValues = [];
-        List<double> edgeValues = [];
-        List<double> flatValues = [];
-        List<double> sceneValues = [];
         List<ContentSampleEvidence> samples = [];
         List<string> errors = [];
+        IReadOnlyList<SampleWindow> contentWindows = SampleWindowPlanner.ContentWindows(
+            media.DurationSeconds,
+            representativeWindows);
 
         int sampleIndex = 0;
-        foreach (double startSeconds in SampleStarts(media.DurationSeconds))
+        foreach (SampleWindow window in contentWindows)
         {
-            double durationSeconds = Math.Min(1.5, media.DurationSeconds - startSeconds);
+            double startSeconds = window.StartSeconds;
+            double durationSeconds = Math.Min(
+                window.DurationSeconds,
+                media.DurationSeconds - startSeconds);
             if (durationSeconds <= 0)
                 continue;
             List<string> sampleErrors = [];
@@ -56,29 +56,21 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             {
                 luminance = MetadataAverage(baseProbe.CombinedOutput, "lavfi.signalstats.YAVG");
                 if (luminance.HasValue)
-                {
                     luminance /= 255.0;
-                    luminanceValues.Add(luminance.Value);
-                }
 
                 entropy = MetadataAverage(
                     baseProbe.CombinedOutput,
                     "lavfi.entropy.normalized_entropy.normal.Y");
-                AddIfAvailable(entropyValues, entropy);
 
                 temporalDifference = MetadataAverage(
                     baseProbe.CombinedOutput,
                     "lavfi.signalstats.YDIF");
                 if (temporalDifference.HasValue)
-                {
                     temporalDifference /= 255.0;
-                    temporalValues.Add(temporalDifference.Value);
-                }
 
                 temporalOutlierRatio = MetadataAverage(
                     baseProbe.CombinedOutput,
                     "lavfi.signalstats.TOUT");
-                AddIfAvailable(temporalOutlierValues, temporalOutlierRatio);
             }
             else
                 sampleErrors.Add(baseProbe.StandardError);
@@ -97,16 +89,10 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 edgeDensity = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.signalstats.YAVG");
                 flatAreaRatio = MetadataAverage(shapeProbe.CombinedOutput, "lavfi.blackframe.pblack");
                 if (edgeDensity.HasValue)
-                {
                     edgeDensity /= 255.0;
-                    edgeValues.Add(edgeDensity.Value);
-                }
 
                 if (flatAreaRatio.HasValue)
-                {
                     flatAreaRatio /= 100.0;
-                    flatValues.Add(flatAreaRatio.Value);
-                }
             }
             else
                 sampleErrors.Add(shapeProbe.StandardError);
@@ -122,7 +108,6 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 sceneCut = (MetadataAverage(
                     sceneProbe.CombinedOutput,
                     "lavfi.scd.score") ?? 0) / 100.0;
-                sceneValues.Add(sceneCut.Value);
             }
             else
                 sampleErrors.Add(sceneProbe.StandardError);
@@ -145,16 +130,40 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 UIPersistence = Rounded(uiPersistence),
                 Error = sampleErrors.Count == 0 ? null : LastUsefulError(sampleErrors)
             };
+            string? exclusionReason = SampleExclusionReason(sampleFeatures, window.Tag);
             samples.Add(new ContentSampleEvidence(
                 sampleIndex++,
                 Math.Round(startSeconds, 3),
                 Math.Round(durationSeconds, 3),
+                window.Source,
+                window.Tag,
+                exclusionReason is null,
+                exclusionReason,
                 sampleFeatures,
                 MatchRules(media, sampleFeatures)));
         }
 
-        double? aggregateEdgeDensity = Average(edgeValues);
-        double? aggregateTemporalDifference = Average(temporalValues);
+        ContentSampleEvidence[] includedSamples = samples
+            .Where(sample => sample.IncludedInAggregate)
+            .ToArray();
+        if (includedSamples.Length == 0)
+        {
+            samples = samples
+                .Select(sample => sample.Features.Available
+                    ? sample with { IncludedInAggregate = true, ExclusionReason = null }
+                    : sample)
+                .ToList();
+            includedSamples = samples
+                .Where(sample => sample.IncludedInAggregate)
+                .ToArray();
+        }
+
+        double? aggregateEdgeDensity = Aggregate(
+            includedSamples,
+            features => features.EdgeDensity);
+        double? aggregateTemporalDifference = Aggregate(
+            includedSamples,
+            features => features.TemporalDifference);
         double? sourceCompression = SourceCompression(media);
         double? aggregateUiPersistence = UIPersistence(
             aggregateEdgeDensity,
@@ -162,16 +171,25 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
 
         ContentFeatures features = new()
         {
-            Available = edgeValues.Count > 0 && flatValues.Count > 0 && entropyValues.Count > 0 &&
-                        temporalValues.Count > 0 && temporalOutlierValues.Count > 0 &&
-                        sceneValues.Count > 0,
-            LuminanceMean = Rounded(Average(luminanceValues)),
+            Available = includedSamples.Length > 0,
+            LuminanceMean = Rounded(Aggregate(
+                includedSamples,
+                sampleFeatures => sampleFeatures.LuminanceMean)),
             EdgeDensity = Rounded(aggregateEdgeDensity),
-            FlatAreaRatio = Rounded(Average(flatValues)),
-            Entropy = Rounded(Average(entropyValues)),
-            SceneCut = Rounded(Average(sceneValues)),
+            FlatAreaRatio = Rounded(Aggregate(
+                includedSamples,
+                sampleFeatures => sampleFeatures.FlatAreaRatio)),
+            Entropy = Rounded(Aggregate(
+                includedSamples,
+                sampleFeatures => sampleFeatures.Entropy)),
+            SceneCut = Rounded(Aggregate(
+                includedSamples,
+                sampleFeatures => sampleFeatures.SceneCut,
+                0.75)),
             TemporalDifference = Rounded(aggregateTemporalDifference),
-            TemporalOutlierRatio = Rounded(Average(temporalOutlierValues)),
+            TemporalOutlierRatio = Rounded(Aggregate(
+                includedSamples,
+                sampleFeatures => sampleFeatures.TemporalOutlierRatio)),
             SourceCompression = Rounded(sourceCompression),
             UIPersistence = Rounded(aggregateUiPersistence),
             Error = errors.Count == 0 ? null : LastUsefulError(errors)
@@ -263,14 +281,6 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         return matches;
     }
 
-    private static IReadOnlyList<double> SampleStarts(double durationSeconds)
-    {
-        if (durationSeconds <= 2.0)
-            return [0.0];
-        double middle = Math.Max(0.0, durationSeconds / 2.0 - 0.75);
-        return middle < 0.25 ? [0.0] : [0.0, middle];
-    }
-
     private static double? MetadataAverage(string text, string key)
     {
         string pattern = "(?m)^" + Regex.Escape(key) + @"=(?<value>-?\d+(?:\.\d+)?)\s*$";
@@ -293,13 +303,28 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
         return Math.Clamp(1.0 - bitsPerPixelPerFrame / 0.12, 0.0, 1.0);
     }
 
-    private static void AddIfAvailable(List<double> values, double? value)
+    private static double? Aggregate(
+        IReadOnlyList<ContentSampleEvidence> samples,
+        Func<ContentFeatures, double?> selector,
+        double percentile = 0.5)
     {
-        if (value.HasValue)
-            values.Add(value.Value);
+        double[] values = samples
+            .Select(sample => selector(sample.Features))
+            .Where(value => value.HasValue)
+            .Select(value => value!.Value)
+            .Order()
+            .ToArray();
+        if (values.Length == 0)
+            return null;
+        double position = Math.Clamp(percentile, 0, 1) * (values.Length - 1);
+        int lower = (int)Math.Floor(position);
+        int upper = (int)Math.Ceiling(position);
+        if (lower == upper)
+            return values[lower];
+        double fraction = position - lower;
+        return values[lower] + (values[upper] - values[lower]) * fraction;
     }
 
-    private static double? Average(IReadOnlyList<double> values) => values.Count == 0 ? null : values.Average();
     private static double? Rounded(double? value) => value.HasValue ? Math.Round(value.Value, 3) : null;
     private static double? UIPersistence(double? edgeDensity, double? temporalDifference)
     {
@@ -310,6 +335,26 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             edgeDensity.Value * 0.40,
             0.0,
             1.0);
+    }
+    private static string? SampleExclusionReason(ContentFeatures features, string tag)
+    {
+        if (!features.Available)
+            return "probe-unavailable";
+        bool lowInformation = AtMost(features.Entropy, 0.30);
+        if (lowInformation && AtMost(features.LuminanceMean, 0.04))
+            return "black-or-fade";
+        if (lowInformation && AtLeast(features.LuminanceMean, 0.96))
+            return "white-or-fade";
+        if (AtLeast(features.SceneCut, 0.08))
+            return "transition-heavy";
+        bool endingWindow = tag.Contains("ending", StringComparison.Ordinal);
+        if (endingWindow &&
+            AtMost(features.TemporalDifference, 0.004) &&
+            AtLeast(features.EdgeDensity, 0.045))
+        {
+            return "static-ending-card";
+        }
+        return null;
     }
     private static bool AtLeast(double? value, double threshold) => value.HasValue && value.Value >= threshold;
     private static bool AtMost(double? value, double threshold) => value.HasValue && value.Value <= threshold;

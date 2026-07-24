@@ -355,7 +355,7 @@ public sealed class CompressionWorker
         if (requestedContentClass != ContentClassSelection.Off)
         {
             content = await _contentAnalyzer
-                .AnalyzeAsync(request, media, cancellationToken)
+                .AnalyzeAsync(request, media, sampleWindows, cancellationToken)
                 .ConfigureAwait(false);
             if (ContentClassSelection.IsExplicit(requestedContentClass))
             {
