@@ -22,10 +22,11 @@ public sealed class ResultContract
         EncodeAttempt? attempt,
         IReadOnlyList<CorrectionPoint> corrections,
         MetricEnsemble metrics,
+        string artifactPath,
         string outputPath,
         CancellationToken cancellationToken)
     {
-        FileInfo output = new(outputPath);
+        FileInfo output = new(artifactPath);
         double fill = output.Length / (double)request.TargetBytes;
         ModeStrategy strategy = CompressionPlanner.Strategy(request.Mode);
         CanonicalCanvas canvas = plan?.CanonicalCanvas ?? new CompressionPlanner().GetCanonicalCanvas(media);
@@ -44,7 +45,7 @@ public sealed class ResultContract
                 $"{reservedMuxBytes} bytes; short-file/container overhead may limit fill");
         }
 
-        string hash = await Sha256Async(outputPath, cancellationToken).ConfigureAwait(false);
+        string hash = await Sha256Async(artifactPath, cancellationToken).ConfigureAwait(false);
         DateTimeOffset completed = DateTimeOffset.UtcNow;
         string hostText = $"{RuntimeInformation.OSDescription}|" +
             $"{RuntimeInformation.OSArchitecture}|{Environment.ProcessorCount}|" +
@@ -225,7 +226,7 @@ public sealed class ResultContract
             },
             Output = new
             {
-                Path = output.FullName,
+                Path = Path.GetFullPath(outputPath),
                 Bytes = output.Length,
                 FillRatio = fill,
                 Sha256 = hash,
@@ -240,9 +241,20 @@ public sealed class ResultContract
         string fullPath = Path.GetFullPath(path);
         Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
         string temporary = fullPath + $".{Guid.NewGuid():N}.tmp";
-        await using (FileStream stream = File.Create(temporary))
-            await JsonSerializer.SerializeAsync(stream, result, JsonOptions, cancellationToken).ConfigureAwait(false);
-        File.Move(temporary, fullPath, overwrite: true);
+        try
+        {
+            await using (FileStream stream = File.Create(temporary))
+            {
+                await JsonSerializer
+                    .SerializeAsync(stream, result, JsonOptions, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            File.Move(temporary, fullPath, overwrite: true);
+        }
+        finally
+        {
+            File.Delete(temporary);
+        }
     }
 
     private static async Task<string> Sha256Async(string path, CancellationToken cancellationToken)

@@ -29,8 +29,9 @@ public sealed class PlanLogger(CompressionRequest request)
         await _gate.WaitAsync(cancellationToken).ConfigureAwait(false);
         try
         {
+            cancellationToken.ThrowIfCancellationRequested();
             await File
-                .AppendAllTextAsync(path, line, cancellationToken)
+                .AppendAllTextAsync(path, line, CancellationToken.None)
                 .ConfigureAwait(false);
         }
         finally

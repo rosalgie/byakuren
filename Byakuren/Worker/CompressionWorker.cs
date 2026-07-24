@@ -158,7 +158,9 @@ public sealed class CompressionWorker
     {
         string outputPath = ResolveOutputPath(request, copyPolicy.Profile);
         progress?.Report("Input is under cap and matches policy; copying without transcoding.");
-        CopyExact(media.Path, outputPath);
+        using FilePublication publication = new(_runner.ReportWarning);
+        string stagedOutputPath = publication.Add(outputPath);
+        CopyExact(media.Path, stagedOutputPath);
 
         object result = await _results.BuildAsync(
             started,
@@ -171,16 +173,20 @@ public sealed class CompressionWorker
             attempt: null,
             corrections: [],
             metrics: new MetricEnsemble(),
+            stagedOutputPath,
             outputPath,
             cancellationToken).ConfigureAwait(false);
 
         if (!string.IsNullOrWhiteSpace(request.ResultJsonPath))
         {
+            string stagedResultPath = publication.Add(request.ResultJsonPath);
             await _results
-                .WriteAsync(result, request.ResultJsonPath, cancellationToken)
+                .WriteAsync(result, stagedResultPath, cancellationToken)
                 .ConfigureAwait(false);
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
+        publication.Publish();
         return new CompressionOutcome(outputPath, result);
     }
 
@@ -713,21 +719,22 @@ public sealed class CompressionWorker
             item => item.Policy.Profile.Backend == finalPlan.Profile.Backend);
         ResolvedPolicy finalPolicy = viablePolicy.Policy with { Profile = finalPlan.Profile };
         string outputPath = ResolveOutputPath(request, finalPlan.Profile);
+        using FilePublication publication = new(_runner.ReportWarning);
+        string stagedOutputPath = publication.Add(outputPath);
 
-        CopyExact(encoding.Best.OutputPath!, outputPath);
-        if (new FileInfo(outputPath).Length > request.TargetBytes)
+        CopyExact(encoding.Best.OutputPath!, stagedOutputPath);
+        if (new FileInfo(stagedOutputPath).Length > request.TargetBytes)
         {
-            FileSystemCleanup.DeleteFile(outputPath, _runner.ReportWarning);
             throw new InvalidOperationException("Final mux exceeded the requested hard byte cap.");
         }
 
-        await VerifyOutputAsync(request, outputPath, cancellationToken).ConfigureAwait(false);
+        await VerifyOutputAsync(request, stagedOutputPath, cancellationToken).ConfigureAwait(false);
 
         MetricEnsemble metrics = await _metrics.EvaluateAsync(
             request with { MetricMode = finalMetricMode },
             media,
             finalPlan,
-            outputPath,
+            stagedOutputPath,
             tempDirectory,
             cancellationToken).ConfigureAwait(false);
 
@@ -742,25 +749,30 @@ public sealed class CompressionWorker
             encoding.Best,
             encoding.Corrections,
             metrics,
+            stagedOutputPath,
             outputPath,
             cancellationToken).ConfigureAwait(false);
 
         if (!string.IsNullOrWhiteSpace(request.ResultJsonPath))
         {
+            string stagedResultPath = publication.Add(request.ResultJsonPath);
             await _results
-                .WriteAsync(result, request.ResultJsonPath, cancellationToken)
+                .WriteAsync(result, stagedResultPath, cancellationToken)
                 .ConfigureAwait(false);
         }
 
         object completionLog = new
         {
             OutputPath = outputPath,
-            Bytes = new FileInfo(outputPath).Length,
+            Bytes = new FileInfo(stagedOutputPath).Length,
             Metrics = metrics
         };
 
+        cancellationToken.ThrowIfCancellationRequested();
+        publication.Publish();
+
         await planLogger
-            .WriteAsync("completed", completionLog, cancellationToken)
+            .WriteAsync("completed", completionLog, CancellationToken.None)
             .ConfigureAwait(false);
 
         return new CompressionOutcome(outputPath, result);

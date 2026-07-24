@@ -60,10 +60,21 @@ public sealed class ProcessRunner
         }
         catch (OperationCanceledException cancellationException)
         {
+            bool terminationRequested = false;
             try
             {
                 if (!process.HasExited)
+                {
                     process.Kill(entireProcessTree: true);
+                    terminationRequested = true;
+                }
+
+                if (terminationRequested || process.HasExited)
+                {
+                    await process
+                        .WaitForExitAsync(CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
             }
             catch (Exception terminationException) when (
                 terminationException is InvalidOperationException or
@@ -76,12 +87,33 @@ public sealed class ProcessRunner
                     terminationException);
             }
 
+            await ObserveOutputTasksAsync(stdoutTask, stderrTask).ConfigureAwait(false);
             throw;
         }
 
         string standardOutput = await stdoutTask.ConfigureAwait(false);
         string standardError = await stderrTask.ConfigureAwait(false);
         return new ProcessResult(process.ExitCode, standardOutput, standardError);
+    }
+
+    private static async Task ObserveOutputTasksAsync(params Task<string>[] tasks)
+    {
+        try
+        {
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Preserve the cancellation exception from the process wait.
+        }
+        catch (IOException)
+        {
+            // Process termination can close redirected streams while they are being read.
+        }
+        catch (ObjectDisposedException)
+        {
+            // Process termination can dispose redirected streams while they are being read.
+        }
     }
 
     private static async Task<string> ReadOutputAsync(
