@@ -75,7 +75,7 @@ public sealed class CompressionWorker
 
             if (media.IsHdr)
                 throw new NotSupportedException(
-                    "HDR input is rejected until an explicit color-management policy is selected " +
+                    "HDR input is unsupported at this time " +
                     $"({media.HDRClassification}: {media.HDRReason}).");
 
             IReadOnlyList<ResolvedPolicy> policyCandidates = FilterByOutputExtension(
