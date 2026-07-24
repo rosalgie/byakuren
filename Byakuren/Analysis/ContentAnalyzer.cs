@@ -131,6 +131,7 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 Error = sampleErrors.Count == 0 ? null : LastUsefulError(sampleErrors)
             };
             string? exclusionReason = SampleExclusionReason(sampleFeatures, window.Tag);
+            IReadOnlyList<ContentClassScore> sampleScores = ScoreClasses(media, sampleFeatures);
             samples.Add(new ContentSampleEvidence(
                 sampleIndex++,
                 Math.Round(startSeconds, 3),
@@ -140,7 +141,8 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
                 exclusionReason is null,
                 exclusionReason,
                 sampleFeatures,
-                MatchRules(media, sampleFeatures)));
+                MatchRules(media, sampleFeatures),
+                sampleScores));
         }
 
         ContentSampleEvidence[] includedSamples = samples
@@ -194,12 +196,15 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             UIPersistence = Rounded(aggregateUiPersistence),
             Error = errors.Count == 0 ? null : LastUsefulError(errors)
         };
-        string contentClass = Classify(media, features);
+        IReadOnlyList<ContentClassScore> scores = ScoreClasses(media, features);
+        string contentClass = scores[0].ContentClass;
         return new ContentAnalysis(contentClass, features)
         {
             Traits = ClassifyTraits(features),
             Samples = samples,
-            MatchedRules = MatchRules(media, features)
+            MatchedRules = MatchRules(media, features),
+            HeuristicScores = scores,
+            HeuristicConfidenceMargin = ScoreMargin(scores)
         };
     }
 
@@ -213,18 +218,77 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
 
     public static string Classify(MediaInfo media, ContentFeatures features)
     {
-        if (!features.Available)
-            return "general";
+        return ScoreClasses(media, features)[0].ContentClass;
+    }
 
-        IReadOnlyList<ContentRuleMatch> matches = MatchRules(media, features);
-        foreach (string contentClass in
-                 new[] { "gameplay", "screen", "noisy_camera", "anime", "talking_head" })
+    public static IReadOnlyList<ContentClassScore> ScoreClasses(
+        MediaInfo media,
+        ContentFeatures features)
+    {
+        if (!features.Available)
         {
-            if (matches.Any(match => match.ContentClass == contentClass))
-                return contentClass;
+            return
+            [
+                new ContentClassScore("general", 1, ["features-unavailable"])
+            ];
         }
 
-        return "general";
+        double staticScreenPattern = AverageSignals(
+            Rising(features.FlatAreaRatio, 0.95, 0.985),
+            Falling(features.Entropy, 0.35, 0.62),
+            Falling(features.TemporalDifference, 0.004, 0.015));
+        double motionScreenPattern = AverageSignals(
+            Rising(features.TemporalOutlierRatio, 0.010, 0.028),
+            Rising(features.EdgeDensity, 0.022, 0.060),
+            Falling(features.TemporalDifference, 0.012, 0.045));
+        double screenSpecificPattern = Math.Max(staticScreenPattern, motionScreenPattern);
+
+        List<ContentClassScore> scores =
+        [
+            WeightedScore("gameplay",
+                ("high-frame-rate", 0.30, Rising(media.Fps, 45, 60)),
+                ("persistent-ui", 0.20, Rising(features.UIPersistence, 0.48, 0.70)),
+                ("strong-edges", 0.18, Rising(features.EdgeDensity, 0.025, 0.065)),
+                ("active-motion", 0.14, Rising(features.TemporalDifference, 0.003, 0.030)),
+                ("stable-scenes", 0.08, Falling(features.SceneCut, 0.010, 0.060)),
+                ("audio-present", 0.10, media.HasAudio ? 1 : 0)),
+            WeightedScore("screen",
+                ("screen-specific-pattern", 0.30, screenSpecificPattern),
+                ("persistent-layout", 0.22, Rising(features.UIPersistence, 0.48, 0.72)),
+                ("defined-edges", 0.18, Rising(features.EdgeDensity, 0.022, 0.060)),
+                ("limited-motion", 0.15, Falling(features.TemporalDifference, 0.008, 0.040)),
+                ("stable-scenes", 0.15, Falling(features.SceneCut, 0.010, 0.060))),
+            WeightedScore("noisy_camera",
+                ("temporal-outliers", 0.32, Rising(features.TemporalOutlierRatio, 0.010, 0.040)),
+                ("camera-motion", 0.28, Rising(features.TemporalDifference, 0.020, 0.080)),
+                ("texture-entropy", 0.15, Rising(features.Entropy, 0.45, 0.80)),
+                ("non-flat-surface", 0.15, Falling(features.FlatAreaRatio, 0.75, 0.95)),
+                ("scene-variation", 0.10, Rising(features.SceneCut, 0.005, 0.050))),
+            WeightedScore("anime",
+                ("flat-color-regions", 0.26, Rising(features.FlatAreaRatio, 0.82, 0.95)),
+                ("line-art-edges", 0.18, Rising(features.EdgeDensity, 0.018, 0.055)),
+                ("clean-temporal-signal", 0.18, Falling(features.TemporalOutlierRatio, 0.008, 0.025)),
+                ("stable-drawing", 0.10, Falling(features.TemporalDifference, 0.004, 0.025)),
+                ("bounded-entropy", 0.10, Centered(features.Entropy, 0.48, 0.30)),
+                ("not-static-layout", 0.18, 1 - staticScreenPattern)),
+            WeightedScore("talking_head",
+                ("audio-present", 0.25, media.HasAudio ? 1 : 0),
+                ("limited-motion", 0.27, Falling(features.TemporalDifference, 0.006, 0.030)),
+                ("clean-temporal-signal", 0.18, Falling(features.TemporalOutlierRatio, 0.008, 0.025)),
+                ("natural-surface", 0.18, Falling(features.FlatAreaRatio, 0.80, 0.96)),
+                ("moderate-edges", 0.12, Centered(features.EdgeDensity, 0.035, 0.030))),
+            WeightedScore("general", 0.22,
+                ("natural-surface", 0.22, Falling(features.FlatAreaRatio, 0.80, 0.97)),
+                ("texture-entropy", 0.18, Rising(features.Entropy, 0.35, 0.75)),
+                ("visible-motion", 0.16, Rising(features.TemporalDifference, 0.010, 0.060)),
+                ("non-persistent-layout", 0.12, Falling(features.UIPersistence, 0.40, 0.75)),
+                ("conventional-frame-rate", 0.10, Falling(media.Fps, 45, 60)))
+        ];
+
+        return scores
+            .OrderByDescending(score => score.Score)
+            .ThenBy(score => score.ContentClass, StringComparer.Ordinal)
+            .ToArray();
     }
 
     public static IReadOnlyList<ContentRuleMatch> MatchRules(
@@ -323,6 +387,59 @@ public sealed class ContentAnalyzer(ProcessRunner runner)
             return values[lower];
         double fraction = position - lower;
         return values[lower] + (values[upper] - values[lower]) * fraction;
+    }
+
+    private static ContentClassScore WeightedScore(
+        string contentClass,
+        params (string Name, double Weight, double Signal)[] components)
+    {
+        return WeightedScore(contentClass, 0, components);
+    }
+
+    private static ContentClassScore WeightedScore(
+        string contentClass,
+        double bias,
+        params (string Name, double Weight, double Signal)[] components)
+    {
+        double score = bias + components.Sum(component =>
+            component.Weight * Math.Clamp(component.Signal, 0, 1));
+        string[] evidence = components
+            .Where(component => component.Signal >= 0.55)
+            .OrderByDescending(component => component.Weight * component.Signal)
+            .Select(component => component.Name)
+            .ToArray();
+        return new ContentClassScore(contentClass, Math.Round(Math.Clamp(score, 0, 1), 3), evidence);
+    }
+
+    private static double ScoreMargin(IReadOnlyList<ContentClassScore> scores)
+    {
+        return scores.Count < 2 ? scores.FirstOrDefault()?.Score ?? 0 : Math.Round(
+            scores[0].Score - scores[1].Score,
+            3);
+    }
+
+    private static double Rising(double? value, double low, double high)
+    {
+        if (!value.HasValue)
+            return 0;
+        return Math.Clamp((value.Value - low) / Math.Max(0.000001, high - low), 0, 1);
+    }
+
+    private static double Falling(double? value, double low, double high)
+    {
+        return 1 - Rising(value, low, high);
+    }
+
+    private static double Centered(double? value, double center, double radius)
+    {
+        if (!value.HasValue)
+            return 0;
+        return Math.Clamp(1 - Math.Abs(value.Value - center) / Math.Max(0.000001, radius), 0, 1);
+    }
+
+    private static double AverageSignals(params double[] values)
+    {
+        return values.Length == 0 ? 0 : values.Average();
     }
 
     private static double? Rounded(double? value) => value.HasValue ? Math.Round(value.Value, 3) : null;

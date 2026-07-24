@@ -272,7 +272,7 @@ public sealed record MetricWindow(
 
 public sealed record ContentFeatures
 {
-    public const string ClassifierVersion = "kasumi-core-v2";
+    public const string ClassifierVersion = "kasumi-core-v3";
     public bool Available { get; init; }
     public double? LuminanceMean { get; init; }
     public double? EdgeDensity { get; init; }
@@ -288,6 +288,11 @@ public sealed record ContentFeatures
 
 public sealed record ContentRuleMatch(string Name, string ContentClass);
 
+public sealed record ContentClassScore(
+    string ContentClass,
+    double Score,
+    IReadOnlyList<string> Evidence);
+
 public sealed record ContentSampleEvidence(
     int Index,
     double StartSeconds,
@@ -297,7 +302,8 @@ public sealed record ContentSampleEvidence(
     bool IncludedInAggregate,
     string? ExclusionReason,
     ContentFeatures Features,
-    IReadOnlyList<ContentRuleMatch> MatchedRules);
+    IReadOnlyList<ContentRuleMatch> MatchedRules,
+    IReadOnlyList<ContentClassScore> HeuristicScores);
 
 public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
 {
@@ -306,6 +312,8 @@ public sealed record ContentAnalysis(string ContentClass, ContentFeatures Featur
     public string Source { get; init; } = ContentFeatures.ClassifierVersion;
     public IReadOnlyList<ContentSampleEvidence> Samples { get; init; } = [];
     public IReadOnlyList<ContentRuleMatch> MatchedRules { get; init; } = [];
+    public IReadOnlyList<ContentClassScore> HeuristicScores { get; init; } = [];
+    public double HeuristicConfidenceMargin { get; init; }
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);

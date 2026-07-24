@@ -372,9 +372,12 @@ public sealed class CompressionWorker
             string traits = content.Traits.Count == 0
                 ? ""
                 : $" [{string.Join(", ", content.Traits)}]";
+            string margin = content.Source == ContentAnalysis.ManualSource
+                ? ""
+                : $", margin {content.HeuristicConfidenceMargin:0.000}";
             progress?.Report(
                 $"Content classification: {content.ContentClass}{traits} " +
-                $"({content.Source})");
+                $"({content.Source}{margin})");
         }
 
         progress?.Report(
