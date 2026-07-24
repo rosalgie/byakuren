@@ -62,7 +62,13 @@ public sealed class CLIOptions
 
     private readonly Option<string?> _contentClassMode = new("--content-class-mode", "-ContentClassMode")
     {
-        Description = "Content classification mode: auto or off"
+        Description = "Legacy content classification mode: auto or off"
+    };
+
+    private readonly Option<string?> _contentClass = new("--content-class", "-ContentClass")
+    {
+        Description =
+            "Content class: auto, general, screen, gameplay, anime, noisy_camera, talking_head, or off"
     };
 
     private readonly Option<SampleMode?> _sampleMode = new("--sample-mode", "-SampleMode")
@@ -223,6 +229,7 @@ public sealed class CLIOptions
         command.Options.Add(_encoderBackend);
         command.Options.Add(_container);
         command.Options.Add(_compatibilityMode);
+        command.Options.Add(_contentClass);
         command.Options.Add(_contentClassMode);
         command.Options.Add(_sampleMode);
         command.Options.Add(_audioPriority);
@@ -275,7 +282,7 @@ public sealed class CLIOptions
             EncoderBackend = parseResult.GetValue(_encoderBackend) ?? "auto",
             Container = parseResult.GetValue(_container) ?? "auto",
             CompatibilityMode = parseResult.GetValue(_compatibilityMode) ?? "widest",
-            ContentClassMode = parseResult.GetValue(_contentClassMode) ?? "auto",
+            ContentClassMode = GetContentClass(parseResult),
             SampleMode = parseResult.GetValue(_sampleMode) ?? SampleMode.Auto,
             AudioPriority = parseResult.GetValue(_audioPriority) ?? AudioPriority.Balanced,
             PreprocessMode = parseResult.GetValue(_preprocessMode) ?? PreprocessMode.Auto,
@@ -383,6 +390,32 @@ public sealed class CLIOptions
         throw new ArgumentOutOfRangeException(
             "--safety-margin-percent",
             "Safety margin must be a ratio from 0 to 1 or a percent below 100.");
+    }
+
+    private string GetContentClass(ParseResult parseResult)
+    {
+        string? contentClass = parseResult.GetValue(_contentClass);
+        string? legacyMode = parseResult.GetValue(_contentClassMode);
+        if (contentClass is not null && legacyMode is not null)
+        {
+            throw new ArgumentException(
+                "Specify either --content-class or --content-class-mode, not both.");
+        }
+
+        if (legacyMode is not null)
+        {
+            string normalizedLegacyMode = ContentClassSelection.Normalize(legacyMode);
+            if (normalizedLegacyMode is not (
+                ContentClassSelection.Auto or ContentClassSelection.Off))
+            {
+                throw new ArgumentException(
+                    "Legacy --content-class-mode accepts only auto or off.");
+            }
+
+            return normalizedLegacyMode;
+        }
+
+        return ContentClassSelection.Normalize(contentClass);
     }
 
     private static int GetNonNegativeValue(

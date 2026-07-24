@@ -350,12 +350,21 @@ public sealed class CompressionWorker
             .AnalyzeAsync(request, media, sampleWindows, tempDirectory, cancellationToken)
             .ConfigureAwait(false);
 
+        string requestedContentClass = ContentClassSelection.Normalize(request.ContentClassMode);
         ContentAnalysis? content = null;
-        if (!request.ContentClassMode.Equals("off", StringComparison.OrdinalIgnoreCase))
+        if (requestedContentClass != ContentClassSelection.Off)
         {
             content = await _contentAnalyzer
                 .AnalyzeAsync(request, media, cancellationToken)
                 .ConfigureAwait(false);
+            if (ContentClassSelection.IsExplicit(requestedContentClass))
+            {
+                content = content with
+                {
+                    ContentClass = requestedContentClass,
+                    Source = ContentAnalysis.ManualSource
+                };
+            }
         }
 
         if (content is not null)
@@ -365,7 +374,7 @@ public sealed class CompressionWorker
                 : $" [{string.Join(", ", content.Traits)}]";
             progress?.Report(
                 $"Content classification: {content.ContentClass}{traits} " +
-                $"({ContentFeatures.ClassifierVersion})");
+                $"({content.Source})");
         }
 
         progress?.Report(
@@ -1284,12 +1293,7 @@ public sealed class CompressionWorker
             throw new ArgumentOutOfRangeException(nameof(request.WorkingTargetRatio));
         if (request.ProbeSampleSeconds <= 0)
             throw new ArgumentOutOfRangeException(nameof(request.ProbeSampleSeconds));
-        bool validContentClassMode = request.ContentClassMode.Equals(
-                "auto",
-                StringComparison.OrdinalIgnoreCase) ||
-            request.ContentClassMode.Equals("off", StringComparison.OrdinalIgnoreCase);
-        if (!validContentClassMode)
-            throw new ArgumentException("Content class mode must be 'auto' or 'off'.", nameof(request.ContentClassMode));
+        _ = ContentClassSelection.Normalize(request.ContentClassMode);
     }
 
     private static string ResolveOutputPath(CompressionRequest request, EncoderProfile profile)

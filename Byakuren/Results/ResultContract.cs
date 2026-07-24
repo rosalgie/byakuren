@@ -97,6 +97,7 @@ public sealed class ResultContract
                 RequestedEncoderBackend = request.EncoderBackend,
                 RequestedContainer = request.Container,
                 CompatibilityMode = request.CompatibilityMode,
+                ContentClass = request.ContentClassMode,
                 ContentClassMode = request.ContentClassMode,
                 SampleMode = request.SampleMode.ToString(),
                 AudioPriority = request.AudioPriority.ToString(),

@@ -288,7 +288,9 @@ public sealed record ContentFeatures
 
 public sealed record ContentAnalysis(string ContentClass, ContentFeatures Features)
 {
+    public const string ManualSource = "manual";
     public IReadOnlyList<string> Traits { get; init; } = [];
+    public string Source { get; init; } = ContentFeatures.ClassifierVersion;
 }
 
 public sealed record CropSample(double OffsetSeconds, int Width, int Height, int X, int Y);
