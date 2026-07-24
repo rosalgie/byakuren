@@ -395,7 +395,7 @@ public sealed class CompressionWorker
             if (content.AnimeModel?.Available == true)
             {
                 progress?.Report(
-                    $"Anime model signal: {content.AnimeModel.AnimeProbability:P1} anime " +
+                    $"Anime probability: {content.AnimeModel.AnimeProbability:P1} " +
                     $"({content.AnimeModel.Model})");
             }
         }
@@ -430,17 +430,21 @@ public sealed class CompressionWorker
     {
         Dictionary<string, AudioArtifact> audioArtifacts = new(StringComparer.Ordinal);
         List<CompressionPlan> candidates = [];
+        IReadOnlyList<ContentAnalysis?> contentAnalyses = CandidateContentAnalyses(
+            analysis.Content);
 
         foreach (ViablePolicy viablePolicy in viablePolicies)
         {
             EncoderProfile profile = viablePolicy.Policy.Profile;
-            string contentClass = analysis.Content?.ContentClass ?? "general";
-            IReadOnlyList<AudioPlan> audioPlans = _planner.CreateAudioPlans(
-                request,
-                media,
-                profile,
-                analysis.Complexity,
-                contentClass);
+            IReadOnlyList<AudioPlan> audioPlans = contentAnalyses
+                .SelectMany(content => _planner.CreateAudioPlans(
+                    request,
+                    media,
+                    profile,
+                    analysis.Complexity,
+                    content?.ContentClass ?? "general"))
+                .DistinctBy(plan => plan.Identity)
+                .ToArray();
 
             foreach (AudioPlan audioPlan in audioPlans)
             {
@@ -461,28 +465,76 @@ public sealed class CompressionWorker
                         .ConfigureAwait(false);
                 }
 
-                IReadOnlyList<CompressionPlan> plans = _planner.CreateCandidatePlans(
-                    request,
-                    media,
-                    profile,
-                    artifact,
-                    analysis.Content,
-                    analysis.Complexity,
-                    analysis.Crop,
-                    analysis.SampleWindows);
+                foreach (ContentAnalysis? content in contentAnalyses)
+                {
+                    IReadOnlyList<CompressionPlan> plans = _planner.CreateCandidatePlans(
+                        request,
+                        media,
+                        profile,
+                        artifact,
+                        content,
+                        analysis.Complexity,
+                        analysis.Crop,
+                        analysis.SampleWindows);
 
-                candidates.AddRange(plans);
+                    candidates.AddRange(plans);
+                }
             }
         }
 
         if (candidates.Count == 0)
             throw new InvalidOperationException("Planning produced no eligible compression plans.");
 
+        string primaryContentClass = analysis.Content?.ContentClass ?? "general";
+        candidates = candidates
+            .OrderByDescending(plan => plan.ContentClass == primaryContentClass)
+            .ThenByDescending(plan => plan.HeuristicScore)
+            .DistinctBy(PlanKey)
+            .ToList();
+
         await planLogger
             .WriteAsync("candidates-created", candidates, cancellationToken)
             .ConfigureAwait(false);
 
         return new CandidateSet(candidates, audioArtifacts);
+    }
+
+    private static IReadOnlyList<ContentAnalysis?> CandidateContentAnalyses(
+        ContentAnalysis? content)
+    {
+        if (content is null)
+            return [null];
+        if (content.Source == ContentAnalysis.ManualSource)
+            return [content];
+
+        List<string> alternativeClasses = content.Alternatives.ToList();
+        if (content.ConfidenceLevel == "low" && alternativeClasses.Count == 0)
+        {
+            string? runnerUp = content.Scores
+                .Skip(1)
+                .Select(score => score.ContentClass)
+                .FirstOrDefault();
+            if (runnerUp is not null)
+                alternativeClasses.Add(runnerUp);
+        }
+
+        List<ContentAnalysis?> analyses = [content];
+        foreach (string alternativeClass in alternativeClasses
+                     .Where(alternative => alternative != content.ContentClass)
+                     .Distinct(StringComparer.Ordinal))
+        {
+            analyses.Add(content with
+            {
+                ContentClass = alternativeClass,
+                Alternatives = content.Alternatives
+                    .Where(alternative => alternative != alternativeClass)
+                    .Prepend(content.ContentClass)
+                    .Distinct(StringComparer.Ordinal)
+                    .ToArray(),
+                DecisionReason = $"ambiguous-candidate:{content.ContentClass}->{alternativeClass}"
+            });
+        }
+        return analyses;
     }
 
     private async Task<EncodingResult> EncodeAsync(
@@ -829,7 +881,8 @@ public sealed class CompressionWorker
             int previewCount = Math.Min(strategy.PreviewTop, previewPlans.Count);
             progress?.Report(
                 $"Preview {previewNumber}/{previewCount}: {plan.Profile.Backend} " +
-                $"{plan.Width}x{plan.Height}@{plan.Fps:0.###} {plan.Preprocess}");
+                $"{plan.Width}x{plan.Height}@{plan.Fps:0.###} {plan.Preprocess} " +
+                $"[{plan.ContentClass}]");
             DateTimeOffset started = DateTimeOffset.UtcNow;
             List<PreviewSample> samples = [];
             long bytes = 0;

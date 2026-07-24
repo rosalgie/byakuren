@@ -90,12 +90,14 @@ public static class ContentScoreFusion
             (0.55 + 0.45 * Math.Clamp(margin / 0.25, 0, 1)),
             3);
         string confidenceLevel = ConfidenceLevel(confidence, margin);
-        string[] alternatives = ranked
+        List<string> alternatives = ranked
             .Skip(1)
             .Where(score => ranked[0].Score - score.Score <= AlternativeMargin)
             .Take(2)
             .Select(score => score.ContentClass)
-            .ToArray();
+            .ToList();
+        if (confidenceLevel == "low" && alternatives.Count == 0 && ranked.Length > 1)
+            alternatives.Add(ranked[1].ContentClass);
         string decisionReason = modelAvailable
             ? "heuristic+window+anime-model"
             : "heuristic+window:model-unavailable";

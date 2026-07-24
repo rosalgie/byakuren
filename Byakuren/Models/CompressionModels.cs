@@ -204,6 +204,7 @@ public sealed record CompressionPlan
     public string MetricReferenceFilter { get; init; } = "";
     public double BitsPerPixelPerFrame { get; init; }
     public double HeuristicScore { get; init; }
+    public double ClassificationScore { get; init; } = 1;
     public string WidthOrigin { get; init; } = "heuristic";
     public long MuxReserveBytes { get; init; }
     public IReadOnlyList<string> ColorArguments { get; init; } = [];

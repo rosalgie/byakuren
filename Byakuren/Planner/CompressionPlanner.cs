@@ -139,6 +139,9 @@ public sealed class CompressionPlanner
         int videoKbps = Math.Max(35, (int)Math.Floor(videoBytes * 8.0 / media.DurationSeconds / 1000.0));
         double totalKbps = request.TargetBytes * 8.0 / media.DurationSeconds / 1000.0;
         string contentClass = contentAnalysis?.ContentClass ?? "general";
+        double classificationScore = contentAnalysis?.Scores
+            .FirstOrDefault(score => score.ContentClass == contentClass)
+            ?.Score ?? 1;
         (int sourceWidth, int sourceHeight) = DisplayGeometry(media, crop);
         double aspect = sourceWidth / (double)sourceHeight;
         CanonicalCanvas canvas = GetCanonicalCanvas(media, crop);
@@ -219,7 +222,8 @@ public sealed class CompressionPlanner
                             spatialQuality +
                             gameplayMotionBonus +
                             audio.Plan.Rank * audioWeight +
-                            TuningBonus(tunedProfile, profile);
+                            TuningBonus(tunedProfile, profile) +
+                            classificationScore * 4;
                         plans.Add(new CompressionPlan
                         {
                             Profile = tunedProfile,
@@ -246,6 +250,7 @@ public sealed class CompressionPlanner
                             CropAnalysis = crop,
                             BitsPerPixelPerFrame = bpppf,
                             HeuristicScore = heuristic,
+                            ClassificationScore = classificationScore,
                             WidthOrigin = origin,
                             MuxReserveBytes = muxReserve,
                             ColorArguments = colorArguments,
@@ -314,16 +319,44 @@ public sealed class CompressionPlanner
         if (limit <= 0 || candidates.Count == 0)
             return [];
         CompressionPlan[] ordered = candidates.OrderByDescending(plan => plan.HeuristicScore).ToArray();
-        List<CompressionPlan> selected = [ordered[0]];
-        HashSet<string> identities = new(StringComparer.Ordinal) { ordered[0].Identity };
+        string? primaryContentClass = candidates
+            .Select(plan => plan.ContentAnalysis)
+            .Where(analysis => analysis is not null)
+            .SelectMany(analysis => analysis!.Scores.Take(1))
+            .Select(score => score.ContentClass)
+            .FirstOrDefault();
+        CompressionPlan primary = ordered
+            .FirstOrDefault(plan => plan.ContentClass == primaryContentClass) ??
+            ordered[0];
+        List<CompressionPlan> selected = [primary];
+        HashSet<string> identities = new(StringComparer.Ordinal) { primary.Identity };
 
-        if (limit > 1 && IsSpatiallyAtRisk(ordered[0]))
+        IEnumerable<string> alternativeClasses = ordered
+            .Select(plan => plan.ContentClass)
+            .Where(contentClass => contentClass != primary.ContentClass)
+            .Distinct(StringComparer.Ordinal);
+        foreach (string alternativeClass in alternativeClasses)
         {
-            long primaryPixels = (long)ordered[0].Width * ordered[0].Height;
+            if (selected.Count >= limit)
+                break;
+            CompressionPlan? classCandidate = ordered
+                .Where(candidate => candidate.ContentClass == alternativeClass)
+                .Where(candidate => !identities.Contains(candidate.Identity))
+                .OrderByDescending(candidate => candidate.HeuristicScore)
+                .FirstOrDefault();
+            if (classCandidate is null)
+                continue;
+            selected.Add(classCandidate);
+            identities.Add(classCandidate.Identity);
+        }
+
+        if (selected.Count < limit && IsSpatiallyAtRisk(primary))
+        {
+            long primaryPixels = (long)primary.Width * primary.Height;
             CompressionPlan? spatialSafety = ordered
                 .Where(candidate => !identities.Contains(candidate.Identity))
-                .Where(candidate => candidate.Profile.Backend == ordered[0].Profile.Backend)
-                .Where(candidate => Math.Abs(candidate.Fps - ordered[0].Fps) < 0.1)
+                .Where(candidate => candidate.Profile.Backend == primary.Profile.Backend)
+                .Where(candidate => Math.Abs(candidate.Fps - primary.Fps) < 0.1)
                 .Where(candidate => (long)candidate.Width * candidate.Height <= primaryPixels * 0.75)
                 .OrderByDescending(candidate => candidate.HeuristicScore)
                 .FirstOrDefault();
@@ -338,7 +371,7 @@ public sealed class CompressionPlanner
         {
             CompressionPlan? meaningfulChallenger = ordered
                 .Where(candidate => !identities.Contains(candidate.Identity))
-                .Where(candidate => IsMeaningfullyDifferent(candidate, ordered[0]))
+                .Where(candidate => IsMeaningfullyDifferent(candidate, primary))
                 .OrderByDescending(candidate => candidate.HeuristicScore)
                 .FirstOrDefault();
             if (meaningfulChallenger is not null)
